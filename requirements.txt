@@ -1,0 +1,24 @@
+# --- LLM / embeddings gateway client ---
+openai>=1.40.0            # OpenAI-compatible client, pointed at the internal gateway
+
+# --- Vector store ---
+chromadb>=0.5.0
+
+# --- AWS ---
+boto3>=1.34.0
+
+# --- App plumbing ---
+pydantic>=2.7.0
+pydantic-settings>=2.3.0  # typed settings loaded from .env
+typer>=0.12.0             # CLI framework
+rich>=13.7.0               # pretty CLI output
+python-dotenv>=1.0.1
+tenacity>=8.3.0            # retry/backoff for gateway calls
+tiktoken>=0.7.0             # token counting for chunking
+
+# --- Validation of generated ASL ---
+jsonschema>=4.22.0
+
+# --- Dev / test ---
+pytest>=8.2.0
+pytest-mock>=3.14.0
