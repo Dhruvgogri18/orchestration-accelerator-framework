@@ -12,7 +12,7 @@ system architecture diagram showing components and integrations.
 
 ## System architecture
 
-![System architecture](diagrams/00-system-architecture.svg)
+![System architecture](diagrams/system_architecture.jpeg)
 
 ```
                     User
@@ -48,7 +48,7 @@ only after the human checkpoint in Diagram 3 (final review).
 
 ## Diagram 1 — Main flow (prompt → validated ASL)
 
-![Main flow](diagrams/01-main-flow.svg)
+![Main flow](diagrams/main-flow.jpeg)
 
 ```
 User prompt
@@ -194,7 +194,7 @@ If it fails, this feeds into the repair loop — see Diagram 2.
 
 ## Diagram 2 — ASL validation repair loop
 
-![ASL validation repair loop](diagrams/02-asl-repair-loop.svg)
+![ASL validation repair loop](diagrams/asl-repair-loop.jpeg)
 
 ```
 Generate ASL (attempt N)
@@ -243,7 +243,7 @@ failure too — same repair loop, same cap — rather than crashing.
 
 ## Diagram 3 — Final review and deployment outcomes
 
-![Final review and deployment outcomes](diagrams/03-deployment-outcomes.svg)
+![Final review and deployment outcomes](diagrams/deployment-outcome.jpeg)
 
 ```
 Validated ASL
