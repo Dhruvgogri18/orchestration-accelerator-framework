@@ -14,25 +14,6 @@ system architecture diagram showing components and integrations.
 
 ![System architecture](diagrams/system_architecture.jpeg)
 
-```
-                    User
-                     │ prompt & answers
-                     ▼
-┌─────────────────────────────────────────────────────┐
-│  Orchestrator application (CLI, local process)       │
-│                                                       │
-│  ┌───────────┐   ┌────────────┐   ┌───────────┐      │
-│  │ Extractor │──▶│ Synthesis  │──▶│ Deployer  │       │
-│  │ Q&A loop  │   │ plan → ASL │   │ via boto3 │       │
-│  └───────────┘   └────────────┘   └───────────┘      │
-└──────────┬───────────────────────────────┬───────────┘
-           │ prompts ⇄ responses           │ deploy ⇄ ARN/errors
-           ▼                               ▼
-   ┌───────────────┐               ┌───────────────┐
-   │  LLM gateway   │               │ Step Functions │
-   │ OpenAI-compat  │               │ AWS, boto3     │
-   └───────────────┘               └───────────────┘
-```
 
 Three internal components, one external LLM dependency, one external
 AWS dependency. **Extractor** and **Synthesis** call the gateway for
@@ -50,27 +31,6 @@ only after the human checkpoint in Diagram 3 (final review).
 
 ![Main flow](diagrams/main-flow.jpeg)
 
-```
-User prompt
-    │
-    ▼
-Extract requirements (LLM)  ◄──┐ asks follow-up questions
-    │                          │ (loops back with fuller context)
-    ▼                          │
-Clear enough? ──── No ─────────┘
-    │ Yes
-    ▼
-Plan confirmation (user approves)
-    │
-    ▼
-Generate ASL (LLM)  ◄──┐ repair loop, see Diagram 2
-    │                  │
-    ▼                  │
-Structurally valid? ── No, retry (max 3x)
-    │ Yes
-    ▼
-Final review  →  see Diagram 3
-```
 
 ### Stage 1 — Prompt intake
 User runs `orchestrator generate "<prompt>"` (or an interactive mode).
@@ -196,21 +156,6 @@ If it fails, this feeds into the repair loop — see Diagram 2.
 
 ![ASL validation repair loop](diagrams/asl-repair-loop.jpeg)
 
-```
-Generate ASL (attempt N)
-    │
-    ▼
-Valid? ── Yes ──► Proceed to review (Stage 6 / Diagram 3)
-    │
-    No, attempt < 3
-    │
-    ▼
-Feed error to LLM ──► regenerate (attempt N+1, loop to top)
-    │
-    No, attempt = 3
-    ▼
-Ask user: edit or abort
-```
 
 **Why regenerate-with-context instead of "just try again"**: feeding the
 exact validation error back lets the model patch the specific problem
@@ -245,35 +190,6 @@ failure too — same repair loop, same cap — rather than crashing.
 
 ![Final review and deployment outcomes](diagrams/deployment-outcome.jpeg)
 
-```
-Validated ASL
-    │
-    ▼
-Final review ──── Save only ────► Saved locally (exit, deploy later)
-    │
-    ├──── Cancel ────► Cancelled (exit, nothing saved)
-    │
-    │ Approve & deploy
-    ▼
-Pre-flight checks ── No ──► Fix & retry ──► (loop back to checks)
-    │ Yes
-    ▼
-Deploy via boto3
-    │
-    ▼
-Deployed? ── Yes ──► Success: ARN printed, definition saved
-    │
-    No
-    ▼
-AWS rejected it (permission / throttle / invalid definition)
-    │
-    ▼
-Retryable (throttled)? ── Yes ──► retry w/ backoff (loop back to deploy)
-    │
-    No
-    ▼
-Stop: fix IAM/definition, exit
-```
 
 ### Stage 6 — Final review
 Why this stage exists: structural validity ≠ correctness. The validator

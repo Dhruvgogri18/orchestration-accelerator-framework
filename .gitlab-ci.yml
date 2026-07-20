@@ -1,0 +1,8 @@
+## Placeholder pipeline — exists only to stop GitLab from falling back to
+## Auto DevOps (which was failing since this project isn't set up for it).
+## Replace with real jobs (lint, pytest, etc.) when Phase 1 lands.
+
+placeholder:
+  stage: .pre
+  script:
+    - echo "No pipeline configured yet — placeholder job to override Auto DevOps."
