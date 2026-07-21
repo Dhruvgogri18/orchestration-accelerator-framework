@@ -29,7 +29,7 @@ only after the human checkpoint in Diagram 3 (final review).
 
 ## Diagram 1 — Main flow (prompt → validated ASL)
 
-![Main flow](diagrams/main-flow.jpeg)
+![Main flow](diagrams/main_flow.jpeg)
 
 
 ### Stage 1 — Prompt intake
@@ -129,26 +129,83 @@ CLI displays the structured plan. User: **approve** / **request
 changes** / **cancel**. Changes or cancel loop back into Stage 2 with
 feedback appended to the conversation.
 
+### Stage 3.5 — Workflow specification file
+Approval doesn't just move the plan into memory — it's written to disk
+as `workflow_spec.json`, a schema-validated, versioned document. This
+becomes the single source of truth for every stage downstream, and is
+the main lever against hallucination in ASL generation:
+
+- **Why a file, not just the in-memory plan.** The plan object from
+  Stage 2 is intentionally light — name, steps, per-step service +
+  description. The specification is the same shape plus everything
+  Stage 4 needs to stop guessing: per-step `Parameters`, retry/catch
+  policies, `Choice` conditions and branch targets, timeout values
+  (explicit, or the extractor's stated default carried over verbatim).
+  One unambiguous document to translate, instead of a conversation to
+  reinterpret.
+- **Schema-validated on write.** Same category of check Stage 5 runs on
+  ASL — required fields present, step names unique, every referenced
+  next-step resolves to a real step — run *before* the spec is
+  considered locked. Catching a broken spec here is cheaper than
+  catching the same problem after ASL generation.
+- **Why this cuts hallucination.** Stage 4 stops being "regenerate the
+  workflow from scratch" and becomes "translate this fixed document
+  into ASL syntax." The Stage 4 system prompt should explicitly forbid
+  inventing steps, services, or branching logic not present in the
+  spec — anything missing belongs back in Stage 2's clarification loop,
+  not filled in silently at generation time.
+- **Reused at Stage 6.** The "save only" bundle already wants to
+  persist exactly this document — see below, the bundle stores `spec`,
+  not `plan`.
+
 ### Stage 4 — ASL generation (LLM call)
-Approved plan + repo context → LLM generates raw ASL JSON. Instruct it
-explicitly: *"Output ONLY a JSON object, no prose, no markdown fences."*
+Approved workflow specification (Stage 3.5) → LLM generates raw ASL
+JSON. No repo context here — Phase 1 has no vector store or embeddings
+dependency (see System architecture above); the specification is what
+the model is grounded on, not the repo. Instruct it explicitly:
+*"Output ONLY a JSON object, no prose, no markdown fences. Implement
+the specification exactly — do not add, remove, or reinterpret steps."*
 Strip fences in code as a safety net regardless — models add them by
 default surprisingly often.
 
-### Stage 5 — Structural validation
-Pure Python, no AI. Recurses rather than only checking the top level,
-since a `Parallel` branch or `Map`'s `ItemProcessor` is its own nested
-`StartAt`/`States` state machine:
-1. `StartAt` exists and names a real state.
-2. Every state has an allowed `Type` (Task/Choice/Wait/Parallel/**Map**/Succeed/Fail).
-3. Every non-terminal state has `Next` (pointing to a real state) or
-   `End: true`.
-4. Checks 1–3 apply again inside every `Parallel` branch and every
-   `Map`'s `ItemProcessor`. `Choice` states don't nest a full state
-   machine, but each `Choices` entry's own `Next` is validated the
-   same way a plain `Next` is.
+### Stage 5 — ASL validation (three layers)
+Three checks, cheapest first, each feeding the same repair loop on
+failure (Diagram 2):
 
-If it fails, this feeds into the repair loop — see Diagram 2.
+1. **JSON parse validation.** The LLM's response has to be valid JSON
+   before anything else can run. This is the "malformed-JSON case"
+   already noted under Diagram 2 — treated as a validation failure,
+   same repair loop, same cap.
+2. **Structural validation.** Pure Python, no AI. Recurses rather than
+   only checking the top level, since a `Parallel` branch or `Map`'s
+   `ItemProcessor` is its own nested `StartAt`/`States` state machine:
+   1. `StartAt` exists and names a real state.
+   2. Every state has an allowed `Type`
+      (Task/Choice/Wait/Parallel/**Map**/Succeed/Fail).
+   3. Every non-terminal state has `Next` (pointing to a real state) or
+      `End: true`.
+   4. Checks 1–3 apply again inside every `Parallel` branch and every
+      `Map`'s `ItemProcessor`. `Choice` states don't nest a full state
+      machine, but each `Choices` entry's own `Next` is validated the
+      same way a plain `Next` is.
+3. **AWS `ValidateStateMachineDefinition`.** A dry-run call to AWS's
+   own validator — catches what the local structural check doesn't
+   attempt (state-specific field requirements, per-service `Parameters`
+   shape, ARN format issues) without creating anything. This costs a
+   network round-trip, which is why it runs last, after the free local
+   checks have already caught the cheap failures.
+
+**This full three-layer pass runs twice, not once:**
+- **Before Stage 6** — the user reviews a definition that's already
+  known-valid, not something that might still fail at deploy time.
+- **Again immediately before Stage 8's `create_state_machine` call** —
+  covers drift introduced by a "request changes" loop back through
+  Stage 4, or a user hand-edit during Stage 6 review. Re-validating
+  right before the irreversible call is cheap insurance against
+  deploying something that changed since it was last checked.
+
+Any failure at any layer, on either pass, feeds into the repair loop —
+see Diagram 2.
 
 ---
 
@@ -198,14 +255,16 @@ nothing about whether it's the *right* workflow. A human has to look at
 it. Options: **approve & deploy** / **save only** / **request changes**
 (loop back to Stage 3 or 4) / **cancel**.
 
-**Save only** writes a workflow bundle, not bare ASL — `{"plan": ...,
+**Save only** writes a workflow bundle, not bare ASL — `{"spec": ...,
 "asl": ..., "conversation": ..., "created_at": ...}`. `deploy` reads
-`asl` from it; keeping the plan and conversation alongside it means a
-saved bundle can be reopened and fed back into the extractor/generator
-for edits later, instead of starting over from a context-less ASL file.
+`asl` from it; keeping the specification and conversation alongside it
+means a saved bundle can be reopened and fed back into the
+extractor/generator for edits later, instead of starting over from a
+context-less ASL file.
 
 ### Stage 7 — Pre-flight checks
-Four checks before any deployment call is made:
+Stage 5's three validation layers re-run first (see above), then four
+further checks before any deployment call is made:
 1. **Credentials resolvable** — can `boto3.Session()` find credentials
    at all (env vars, `~/.aws/credentials`, named profile)? Catching
    this here avoids a cryptic auth exception mid-deploy.
@@ -234,11 +293,13 @@ isn't the right answer for everything:
 - **Throttling** (`TooManyRequestsException`) — transient, safe to
   retry with backoff (the same `tenacity` pattern already used in
   `gateway_client.py`).
-- **AWS's own ASL validation rejects it** (`InvalidDefinition`) — this
-  means AWS caught something the local `validator.py` missed (it's a
-  simpler structural check, not a full ASL schema validator). Route
-  this back into **Diagram 2's repair loop** with AWS's specific error
-  message — don't just dump it on the user as a dead end.
+- **AWS's own ASL validation rejects it** (`InvalidDefinition`) — should
+  be rare now that Stage 7 re-runs `ValidateStateMachineDefinition`
+  immediately before this call, but `create_state_machine` isn't
+  guaranteed to agree with the dry-run validator in every edge case, so
+  handle it as a belt-and-suspenders case: route back into **Diagram
+  2's repair loop** with AWS's specific error message — don't just dump
+  it on the user as a dead end.
 
 ---
 
