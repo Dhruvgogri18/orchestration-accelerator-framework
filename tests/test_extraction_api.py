@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from orchestrator.api.main import app
-from orchestrator.extraction.extractor import ExtractionError, extract_turn
+from orchestrator.api.services.extraction_service import ExtractionError, extract_turn
 
 client = TestClient(app)
 
@@ -33,10 +33,10 @@ CLARIFY_RESPONSE = json.dumps({
 })
 
 
-# ---- extractor.py unit tests -------------------------------------
+# ---- extraction_service.py unit tests ------------------------------
 
 def test_extract_turn_ready():
-    with patch("orchestrator.extraction.extractor.chat_completion", return_value=READY_RESPONSE):
+    with patch("orchestrator.api.services.extraction_service.chat_completion", return_value=READY_RESPONSE):
         result = extract_turn([{"role": "user", "content": "read a file and validate it"}])
     assert result.status == "ready"
     assert result.plan.name == "process-uploaded-file"
@@ -44,7 +44,7 @@ def test_extract_turn_ready():
 
 
 def test_extract_turn_needs_clarification():
-    with patch("orchestrator.extraction.extractor.chat_completion", return_value=CLARIFY_RESPONSE):
+    with patch("orchestrator.api.services.extraction_service.chat_completion", return_value=CLARIFY_RESPONSE):
         result = extract_turn([{"role": "user", "content": "process my file somehow"}])
     assert result.status == "needs_clarification"
     assert result.clarifying_question
@@ -52,36 +52,41 @@ def test_extract_turn_needs_clarification():
 
 def test_extract_turn_strips_markdown_fences():
     fenced = f"```json\n{READY_RESPONSE}\n```"
-    with patch("orchestrator.extraction.extractor.chat_completion", return_value=fenced):
+    with patch("orchestrator.api.services.extraction_service.chat_completion", return_value=fenced):
         result = extract_turn([{"role": "user", "content": "..."}])
     assert result.status == "ready"
 
 
 def test_extract_turn_rejects_malformed_json():
-    with patch("orchestrator.extraction.extractor.chat_completion", return_value="not json at all"):
+    with patch("orchestrator.api.services.extraction_service.chat_completion", return_value="not json at all"):
         with pytest.raises(ExtractionError):
             extract_turn([{"role": "user", "content": "..."}])
 
 
 def test_extract_turn_rejects_ready_with_no_plan():
     """Guards the exact hallucination-adjacent bug the Pydantic
-    validator in models.py exists for: LLM says 'ready' but forgets
-    to actually include a plan."""
+    validator in schemas/common.py exists for: LLM says 'ready' but
+    forgets to actually include a plan."""
     bad = json.dumps({"status": "ready"})
-    with patch("orchestrator.extraction.extractor.chat_completion", return_value=bad):
+    with patch("orchestrator.api.services.extraction_service.chat_completion", return_value=bad):
         with pytest.raises(ExtractionError):
             extract_turn([{"role": "user", "content": "..."}])
 
 
 # ---- API integration tests -----------------------------------------
+# NOTE: the router (session_router.py) delegates the actual extraction
+# call to session_service.py -- that's where `extract_turn` lives in
+# the call chain, so that's what must be patched for these to actually
+# exercise the mock instead of silently falling through to the real
+# extraction_service.extract_turn (and from there, a real network call).
 
 def test_full_flow_ready():
     session_resp = client.post("/session")
     assert session_resp.status_code == 200
     session_id = session_resp.json()["session_id"]
 
-    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
-        from orchestrator.extraction.models import ExtractionResult
+    with patch("orchestrator.api.services.session_service.extract_turn") as mock_extract:
+        from orchestrator.api.schemas.common import ExtractionResult
         mock_extract.return_value = ExtractionResult.model_validate(json.loads(READY_RESPONSE))
 
         msg_resp = client.post(
@@ -98,8 +103,8 @@ def test_full_flow_ready():
 def test_full_flow_needs_clarification():
     session_id = client.post("/session").json()["session_id"]
 
-    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
-        from orchestrator.extraction.models import ExtractionResult
+    with patch("orchestrator.api.services.session_service.extract_turn") as mock_extract:
+        from orchestrator.api.schemas.common import ExtractionResult
         mock_extract.return_value = ExtractionResult.model_validate(json.loads(CLARIFY_RESPONSE))
 
         msg_resp = client.post(
@@ -119,7 +124,7 @@ def test_message_unknown_session_returns_404():
 
 def test_extraction_error_returns_502_not_500_traceback():
     session_id = client.post("/session").json()["session_id"]
-    with patch("orchestrator.api.routers.session_router.extract_turn", side_effect=ExtractionError("boom")):
+    with patch("orchestrator.api.services.session_service.extract_turn", side_effect=ExtractionError("boom")):
         resp = client.post(f"/session/{session_id}/message", json={"message": "hi"})
     assert resp.status_code == 502
 
@@ -130,13 +135,13 @@ def test_conversation_history_accumulates():
     """
     session_id = client.post("/session").json()["session_id"]
 
-    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
-        from orchestrator.extraction.models import ExtractionResult
+    with patch("orchestrator.api.services.session_service.extract_turn") as mock_extract:
+        from orchestrator.api.schemas.common import ExtractionResult
         mock_extract.return_value = ExtractionResult.model_validate(json.loads(CLARIFY_RESPONSE))
         client.post(f"/session/{session_id}/message", json={"message": "first message"})
 
-    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
-        from orchestrator.extraction.models import ExtractionResult
+    with patch("orchestrator.api.services.session_service.extract_turn") as mock_extract:
+        from orchestrator.api.schemas.common import ExtractionResult
         mock_extract.return_value = ExtractionResult.model_validate(json.loads(READY_RESPONSE))
         client.post(f"/session/{session_id}/message", json={"message": "second message"})
 
