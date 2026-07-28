@@ -27,3 +27,7 @@ jsonschema>=4.22.0
 # --- Dev / test ---
 pytest>=8.2.0
 pytest-mock>=3.14.0
+
+# --UI / visualization ---
+streamlit==1.48.0 # for the UI
+graphviz          # for showing the graphs in the UI
