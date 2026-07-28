@@ -4,7 +4,8 @@ Kept separate from extractor.py deliberately -- this is the piece
 that gets tuned/iterated on most, and it shouldn't require touching
 parsing/validation logic to edit wording.
 
-Every rule in here maps to a specific failure:
+Every rule in here maps to a specific failure mode discussed in
+design (see docs/phase1_architecture.md, Stage 1-2):
   - "never invent a value the user didn't state" -> stops the LLM
     from hallucinating ARNs, bucket names, topic names, etc.
   - "use TODO_ placeholders" -> makes hallucination-by-omission

@@ -97,7 +97,7 @@ def test_message_ready_response_includes_render_and_placeholders():
     session_id = client.post("/session").json()["session_id"]
     ready_json = json.dumps({"status": "ready", "plan": GLUE_PLAN_DICT})
 
-    with patch("orchestrator.api.main.extract_turn") as mock_extract:
+    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
         mock_extract.return_value = ExtractionResult.model_validate(json.loads(ready_json))
         resp = client.post(f"/session/{session_id}/message", json={"message": "..."})
 
@@ -113,7 +113,7 @@ def test_message_ready_response_includes_render_and_placeholders():
 
 def _get_session_to_ready(session_id: str):
     ready_json = json.dumps({"status": "ready", "plan": GLUE_PLAN_DICT})
-    with patch("orchestrator.api.main.extract_turn") as mock_extract:
+    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
         mock_extract.return_value = ExtractionResult.model_validate(json.loads(ready_json))
         client.post(f"/session/{session_id}/message", json={"message": "..."})
 
@@ -183,7 +183,7 @@ def test_reject_reopens_conversation_and_clears_latest_plan():
         "status": "needs_clarification",
         "clarifying_question": "What notification service would you like instead?",
     })
-    with patch("orchestrator.api.main.extract_turn") as mock_extract:
+    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
         mock_extract.return_value = ExtractionResult.model_validate(json.loads(clarify_json))
         resp = client.post(
             f"/session/{session_id}/reject",
@@ -202,7 +202,7 @@ def test_reject_feedback_is_recorded_in_history():
     session_id = client.post("/session").json()["session_id"]
     _get_session_to_ready(session_id)
 
-    with patch("orchestrator.api.main.extract_turn") as mock_extract:
+    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
         mock_extract.return_value = ExtractionResult.model_validate(
             json.loads(json.dumps({"status": "ready", "plan": GLUE_PLAN_DICT}))
         )

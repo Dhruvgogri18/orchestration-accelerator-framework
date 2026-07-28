@@ -80,7 +80,7 @@ def test_full_flow_ready():
     assert session_resp.status_code == 200
     session_id = session_resp.json()["session_id"]
 
-    with patch("orchestrator.api.main.extract_turn") as mock_extract:
+    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
         from orchestrator.extraction.models import ExtractionResult
         mock_extract.return_value = ExtractionResult.model_validate(json.loads(READY_RESPONSE))
 
@@ -98,7 +98,7 @@ def test_full_flow_ready():
 def test_full_flow_needs_clarification():
     session_id = client.post("/session").json()["session_id"]
 
-    with patch("orchestrator.api.main.extract_turn") as mock_extract:
+    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
         from orchestrator.extraction.models import ExtractionResult
         mock_extract.return_value = ExtractionResult.model_validate(json.loads(CLARIFY_RESPONSE))
 
@@ -119,7 +119,7 @@ def test_message_unknown_session_returns_404():
 
 def test_extraction_error_returns_502_not_500_traceback():
     session_id = client.post("/session").json()["session_id"]
-    with patch("orchestrator.api.main.extract_turn", side_effect=ExtractionError("boom")):
+    with patch("orchestrator.api.routers.session_router.extract_turn", side_effect=ExtractionError("boom")):
         resp = client.post(f"/session/{session_id}/message", json={"message": "hi"})
     assert resp.status_code == 502
 
@@ -130,12 +130,12 @@ def test_conversation_history_accumulates():
     """
     session_id = client.post("/session").json()["session_id"]
 
-    with patch("orchestrator.api.main.extract_turn") as mock_extract:
+    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
         from orchestrator.extraction.models import ExtractionResult
         mock_extract.return_value = ExtractionResult.model_validate(json.loads(CLARIFY_RESPONSE))
         client.post(f"/session/{session_id}/message", json={"message": "first message"})
 
-    with patch("orchestrator.api.main.extract_turn") as mock_extract:
+    with patch("orchestrator.api.routers.session_router.extract_turn") as mock_extract:
         from orchestrator.extraction.models import ExtractionResult
         mock_extract.return_value = ExtractionResult.model_validate(json.loads(READY_RESPONSE))
         client.post(f"/session/{session_id}/message", json={"message": "second message"})
