@@ -16,6 +16,11 @@ python-dotenv>=1.0.1
 tenacity>=8.3.0            # retry/backoff for gateway calls
 tiktoken>=0.7.0             # token counting for chunking
 
+# --- API ---
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0  # ASGI server to run the FastAPI app
+httpx>=0.27.0              # required by FastAPI's TestClient in tests
+
 # --- Validation of generated ASL ---
 jsonschema>=4.22.0
 
