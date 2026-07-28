@@ -31,14 +31,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from orchestrator.api.schemas.common import Plan
-
+from orchestrator.api.config.settings import get_api_settings
 
 def _db_path() -> str:
-    """Read fresh on every call (not cached at import time) so tests
-    can point this at a temp file via env var without needing to
-    control import order -- see tests/conftest.py.
-    """
-    return os.environ.get("ORCHESTRATOR_DB_PATH", "data/sessions.db")
+    return get_api_settings().orchestrator_db_path
 
 
 @contextmanager
