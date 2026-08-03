@@ -637,7 +637,20 @@ a, a:visited {
 [data-testid="stChatInput"] textarea {
   font-size: 1rem;
   background: transparent !important;
+  max-height: 12rem;
+  overflow-y: auto;
+  resize: none;
 }
+
+/* Empty state: undo leftover auto-grow height without forcing a tiny box. */
+[data-testid="stChatInput"] textarea:placeholder-shown {
+  height: auto !important;
+  min-height: 1.75rem !important;
+  max-height: none !important;
+  overflow-y: hidden !important;
+}
+
+
 
 /* Remove the INNER rounded red border completely */
 [data-testid="stChatInput"] > div,
@@ -1894,51 +1907,80 @@ def process_user_prompt(active_chat_id, user_prompt, region, env):
         )
 
 
-def focus_chat_input(active_chat_id):
-    if not st.session_state.pop("focus_chat_input", False):
-        return
+def _chat_input_resize_script(nonce: str, *, focus: bool) -> str:
+    """After send, clear leftover expanded height on an empty chat textarea.
 
-    st.session_state._focus_tick = st.session_state.get("_focus_tick", 0) + 1
-    nonce = f"{active_chat_id}-{st.session_state.get('_focus_tick', 0)}"
-
-    components.html(
-        f"""
+    Does not force a tiny fixed height (that made the box look distorted and
+    scrollable). Only removes inline height Streamlit left behind, and
+    optionally focuses the input. No MutationObserver.
+    """
+    focus_js = "true" if focus else "false"
+    return f"""
         <script>
         (function() {{
-          const nonce = {json.dumps(nonce)};
+          const shouldFocus = {focus_js};
           const doc = window.parent.document;
           let attempts = 0;
 
-          function tryFocus() {{
+          function findInput() {{
             const root = doc.querySelector('[data-testid="stChatInput"]');
-            const input = root && (root.querySelector("textarea") || root.querySelector("input"));
-            if (input) {{
-              try {{
-                input.focus({{ preventScroll: true }});
-              }} catch (e) {{
-                input.focus();
-              }}
-              // Nudge browsers that ignore focus without a selection change
-              const value = input.value;
-              input.value = "";
-              input.value = value;
-              try {{
-                const len = input.value.length;
-                input.setSelectionRange(len, len);
-              }} catch (e) {{}}
-              return;
-            }}
-            attempts += 1;
-            if (attempts < 60) setTimeout(tryFocus, 50);
+            if (!root) return null;
+            return root.querySelector("textarea") || root.querySelector("input");
           }}
 
-          // Run immediately and again after layout settles
-          setTimeout(tryFocus, 0);
-          setTimeout(tryFocus, 150);
-          setTimeout(tryFocus, 400);
+          function resetIfEmpty(input) {{
+            if (!input) return;
+            const empty = !input.value || !String(input.value).trim();
+            if (!empty) return;
+            try {{
+              // Remove Streamlit auto-grow inline height; let CSS/layout size it.
+              input.style.removeProperty("height");
+              input.style.removeProperty("min-height");
+              input.style.removeProperty("max-height");
+              input.rows = 1;
+              // Clear expanded height on immediate wrappers only.
+              let el = input.parentElement;
+              for (let i = 0; i < 3 && el; i++) {{
+                if (el.style) {{
+                  el.style.removeProperty("height");
+                  el.style.removeProperty("min-height");
+                }}
+                el = el.parentElement;
+              }}
+            }} catch (e) {{}}
+          }}
+
+          function run() {{
+            const input = findInput();
+            if (!input) {{
+              attempts += 1;
+              if (attempts < 40) setTimeout(run, 50);
+              return;
+            }}
+            resetIfEmpty(input);
+            if (shouldFocus) {{
+              try {{ input.focus({{ preventScroll: true }}); }}
+              catch (e) {{ try {{ input.focus(); }} catch (e2) {{}} }}
+            }}
+          }}
+
+          setTimeout(run, 0);
+          setTimeout(run, 150);
+          setTimeout(run, 400);
+          setTimeout(run, 800);
         }})();
         </script>
-        """,
+        """
+
+
+def focus_chat_input(active_chat_id):
+    """Focus the chat box when requested; collapse expanded empty height after send."""
+    want_focus = bool(st.session_state.pop("focus_chat_input", False))
+    st.session_state._focus_tick = st.session_state.get("_focus_tick", 0) + 1
+    nonce = f"{active_chat_id}-{st.session_state.get('_focus_tick', 0)}-{int(want_focus)}"
+
+    components.html(
+        _chat_input_resize_script(nonce, focus=want_focus),
         height=0,
     )
 
