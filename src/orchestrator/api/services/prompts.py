@@ -3,17 +3,6 @@
 Kept separate from extraction_service.py deliberately -- this is the piece
 that gets tuned/iterated on most, and it shouldn't require touching
 parsing/validation logic to edit wording.
-
-Every rule in here maps to a specific failure mode discussed in
-design (see docs/phase1_architecture.md, Stage 1-2):
-- "never invent a value the user didn't state" -> stops the LLM
-  from hallucinating ARNs, bucket names, topic names, etc.
-- "use TODO_ placeholders" -> makes hallucination-by-omission
-  impossible to miss later; Stage 7 pre-flight checks are the
-  designated place these get resolved, not extraction.
-- "don't re-ask what's already answered" -> uses conversation
-  history correctly instead of drifting turn to turn.
-- "output ONLY JSON" -> keeps the response machine-parseable.
 """
 
 EXTRACTION_SYSTEM_PROMPT = """\
@@ -53,6 +42,39 @@ conversation.
 5. Output ONLY a single JSON object. No prose before or after it, no \
 markdown code fences, no explanation of your reasoning.
 
+6. PLAN REVISION (reject / request-changes): When the latest user \
+message is feedback rejecting or changing a previous plan, you MUST \
+produce a revised plan that reflects that feedback. Do NOT return \
+the same steps, same order, or same wording as the prior plan. \
+Incorporate structural requests (sequence, failure paths, \
+compensation, parallel vs sequential) into the new step list AND \
+into the control-flow fields (next / on_failure / on_timeout / \
+branches).
+
+7. SERVICE FIELD: Use a concrete AWS service the task would call \
+(e.g. "Lambda", "DynamoDB", "SNS", "SQS", "S3", "EventBridge", \
+"Glue"). Do NOT put "AWS Step Functions" as the service for every \
+step -- the whole plan already runs inside Step Functions.
+
+8. CONTROL FLOW (required on every ready plan): The diagram is drawn \
+ONLY from these fields, so they MUST match the step descriptions.
+   - "next": id of the single success successor (omit on terminals).
+   - "on_failure": list of step ids that run when THIS step fails.
+   - "on_timeout": list of step ids that run when THIS wait/callback \
+times out (use on wait/approval steps only).
+   - "branches": exclusive arms for a decision step, each \
+{"condition": "...", "next": "StepId"} (e.g. approved vs rejected). \
+When branches is non-empty, do not also set "next" on that step.
+   - Every step id referenced by next / on_failure / on_timeout / \
+branches.next MUST exist in the steps array.
+   - Happy-path steps form a chain via "next".
+   - Compensation / notify / manual-review steps are targets of \
+on_failure or on_timeout (or of a branch), not extra "next" links \
+on the success path.
+   - Descriptions must agree with the links (e.g. if description \
+says "On ProcessPayment failure: release inventory", then \
+ProcessPayment.on_failure must include that release step id).
+
 Respond with JSON matching exactly one of these two shapes:
 
 When you have enough to propose a plan:
@@ -62,7 +84,89 @@ When you have enough to propose a plan:
     "name": "short-kebab-case-name",
     "summary": "One or two sentence description of the whole workflow.",
     "steps": [
-      {"id": "ShortId", "service": "AWS service name", "description": "what this step does"}
+      {
+        "id": "ShortId",
+        "service": "Lambda",
+        "description": "what this step does",
+        "next": "OptionalNextId",
+        "on_failure": ["OptionalHandlerId"],
+        "on_timeout": [],
+        "branches": []
+      }
+    ]
+  }
+}
+
+Example (order fulfillment fragment — follow this linking style):
+{
+  "status": "ready",
+  "plan": {
+    "name": "order-fulfillment",
+    "summary": "Reserve inventory, charge payment, create shipment; compensate on failure.",
+    "steps": [
+      {
+        "id": "ReserveInventory",
+        "service": "Lambda",
+        "description": "Reserve stock. On failure stop without payment or shipping.",
+        "next": "ProcessPayment",
+        "on_failure": [],
+        "on_timeout": [],
+        "branches": []
+      },
+      {
+        "id": "ProcessPayment",
+        "service": "Lambda",
+        "description": "Charge the customer after a successful reservation.",
+        "next": "CreateShipment",
+        "on_failure": ["ReleaseInventoryOnPaymentFailure"],
+        "on_timeout": [],
+        "branches": []
+      },
+      {
+        "id": "CreateShipment",
+        "service": "Lambda",
+        "description": "Create the shipment after successful payment.",
+        "next": null,
+        "on_failure": ["CompensateInventoryOnShippingFailure", "NotifyOperations", "MarkOrderForManualFollowUp"],
+        "on_timeout": [],
+        "branches": []
+      },
+      {
+        "id": "ReleaseInventoryOnPaymentFailure",
+        "service": "Lambda",
+        "description": "On ProcessPayment failure, release the reservation and stop.",
+        "next": null,
+        "on_failure": [],
+        "on_timeout": [],
+        "branches": []
+      },
+      {
+        "id": "CompensateInventoryOnShippingFailure",
+        "service": "Lambda",
+        "description": "On CreateShipment failure, release or adjust inventory.",
+        "next": null,
+        "on_failure": [],
+        "on_timeout": [],
+        "branches": []
+      },
+      {
+        "id": "NotifyOperations",
+        "service": "SNS",
+        "description": "On CreateShipment failure, notify operations via TODO_SNS_TOPIC_ARN.",
+        "next": null,
+        "on_failure": [],
+        "on_timeout": [],
+        "branches": []
+      },
+      {
+        "id": "MarkOrderForManualFollowUp",
+        "service": "DynamoDB",
+        "description": "On CreateShipment failure, mark the order for manual follow-up in TODO_ORDER_TABLE_NAME.",
+        "next": null,
+        "on_failure": [],
+        "on_timeout": [],
+        "branches": []
+      }
     ]
   }
 }

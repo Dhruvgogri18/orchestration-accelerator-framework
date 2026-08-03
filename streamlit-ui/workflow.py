@@ -231,6 +231,7 @@ def reject_plan(
 
 def approve_plan(run_id: str, overrides: dict[str, str] | None = None) -> dict:
     if USE_MOCK:
+        _mock_pause()
         # Mock: jump to a simple "approved" artifact (no ASL API).
         return {
             **_empty_artifact(run_id, "spec_approved", "Mock plan approved."),
@@ -282,10 +283,22 @@ def build_graphviz_dot(asl_definition: dict) -> str:
 
 _MOCK_RUNS: dict[str, dict] = {}
 
+# Artificial delay so the typing indicator is visible in mock mode.
+# Set to 0 to disable.
+_MOCK_LATENCY_SEC = 3
+
+
+def _mock_pause() -> None:
+    import time
+
+    if _MOCK_LATENCY_SEC > 0:
+        time.sleep(_MOCK_LATENCY_SEC)
+
 
 def _mock_send_message(message: str, run_id: str | None = None) -> dict:
     import uuid
 
+    _mock_pause()
     text = (message or "").strip()
     if not run_id or run_id not in _MOCK_RUNS:
         sid = run_id or str(uuid.uuid4())

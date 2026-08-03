@@ -95,17 +95,25 @@ def send_message(session_id: str, message: str) -> MessageResponse:
 
 
 def reject_plan(session_id: str, feedback: str) -> MessageResponse:
-    """User wants changes to the current plan. Not a separate flow --
-    the feedback is just appended as the next user turn, same as
-    /message. Reuses the identical extraction/rendering logic so the
-    two code paths can't drift apart.
+    """User wants changes to the current plan.
+
+    Feedback is still one more user turn in the same extraction loop,
+    but it is wrapped with an explicit revision instruction so the
+    model cannot treat it as a soft comment and re-emit the previous
+    plan unchanged (common with temperature=0 and the prior plan JSON
+    still in history).
     """
     session = get_session_or_raise(session_id)
     if session.latest_plan is None:
         raise NoApprovablePlanError(
             "No plan to reject -- conversation still needs clarification."
         )
-    return run_extraction_turn(session_id, session, feedback)
+    revision_message = (
+        "REJECTED — revise the previous plan. Do not return the same "
+        "plan, steps, or structure. Apply this feedback:\n\n"
+        f"{feedback.strip()}"
+    )
+    return run_extraction_turn(session_id, session, revision_message)
 
 
 def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
