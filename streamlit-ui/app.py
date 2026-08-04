@@ -18,6 +18,7 @@ from database import (
 from workflow import (
     USE_MOCK,
     OrchestrationApiError,
+    answer_enrichment,
     api_get_session,
     approve_plan,
     reject_plan,
@@ -1509,6 +1510,8 @@ def typing_label_for_chat(chat_id) -> str:
     """Short, context-aware label while the backend works."""
     if st.session_state.get("pending_approve"):
         return "Approving…"
+    if st.session_state.get("pending_enrichment"):
+        return "Enriching…"
     chat = get_chat(chat_id)
     stage = (chat or {}).get("stage")
     if stage == "plan_review":
@@ -1539,13 +1542,16 @@ def _pending_prompts() -> dict:
 
 
 def is_chat_busy(chat_id) -> bool:
-    """True while a message, approve, or reject is in flight for this chat only."""
+    """True while a message, approve, enrichment, or reject is in flight for this chat only."""
     if chat_id is None:
         return False
     if chat_id in _pending_prompts():
         return True
     pending_approve = st.session_state.get("pending_approve")
     if pending_approve and pending_approve.get("chat_id") == chat_id:
+        return True
+    pending_enrichment = st.session_state.get("pending_enrichment")
+    if pending_enrichment and pending_enrichment.get("chat_id") == chat_id:
         return True
     return False
 
@@ -1554,7 +1560,9 @@ def is_ui_busy() -> bool:
     """True while any chat has a request in flight (legacy / global checks)."""
     if _pending_prompts():
         return True
-    return bool(st.session_state.get("pending_approve"))
+    if st.session_state.get("pending_approve"):
+        return True
+    return bool(st.session_state.get("pending_enrichment"))
 
 
 def clear_in_flight(chat_id=None):
@@ -1562,6 +1570,7 @@ def clear_in_flight(chat_id=None):
     if chat_id is None:
         st.session_state.pending_prompts = {}
         st.session_state.pending_approve = None
+        st.session_state.pending_enrichment = None
         # Legacy keys (older runs / partial upgrades)
         st.session_state.pending_prompt = None
         st.session_state.pending_chat_id = None
@@ -1573,6 +1582,9 @@ def clear_in_flight(chat_id=None):
     pending_approve = st.session_state.get("pending_approve")
     if pending_approve and pending_approve.get("chat_id") == chat_id:
         st.session_state.pending_approve = None
+    pending_enrichment = st.session_state.get("pending_enrichment")
+    if pending_enrichment and pending_enrichment.get("chat_id") == chat_id:
+        st.session_state.pending_enrichment = None
     if st.session_state.get("pending_chat_id") == chat_id:
         st.session_state.pending_prompt = None
         st.session_state.pending_chat_id = None
@@ -1770,14 +1782,110 @@ def render_plan_review(message_id, artifact, chat_id):
                 queue_user_prompt(chat_id, feedback.strip())
 
 
-def render_spec_approved(artifact):
+def _latest_spec_approved_message_id(chat_id):
+    """Return the message id of the newest spec_approved artifact in this chat."""
+    messages = get_messages(chat_id)
+    for m in reversed(messages):
+        art = m.get("artifact") or {}
+        if art.get("stage") == "spec_approved":
+            return m["id"]
+    return None
+
+
+def render_enrichment_question(message_id, artifact, chat_id, controls_enabled: bool):
+    """UI for Stage 3.5 enrichment clarification (pause during /approve)."""
+    question = (artifact.get("enrichment_question") or "").strip()
+    if not question:
+        return
+
+    session_id = artifact.get("session_id") or artifact.get("run_id")
+
+    st.warning("Enrichment needs a clarification before the workflow spec can be completed.")
+    st.markdown(question)
+
+    if not controls_enabled:
+        st.caption("This enrichment question is no longer active — answer on the latest approved card.")
+        return
+
+    answer = st.text_area(
+        "Your answer",
+        key=f"enrich_ans_{message_id}",
+        placeholder="Describe the structural decision enrichment is asking about…",
+        height=100,
+        disabled=not controls_enabled,
+    )
+
+    st.markdown(
+        '<div class="approve-btn-marker plan-actions-marker"></div>',
+        unsafe_allow_html=True,
+    )
+    if st.button(
+        "Submit enrichment answer",
+        key=f"enrich_submit_{message_id}",
+        type="primary",
+        use_container_width=True,
+        disabled=not controls_enabled or not session_id,
+    ):
+        if not (answer or "").strip():
+            st.warning("Enter an answer first.")
+        else:
+            st.session_state.pending_enrichment = {
+                "chat_id": chat_id,
+                "session_id": session_id,
+                "answer": answer.strip(),
+            }
+            st.rerun()
+
+
+def render_spec_approved(message_id, artifact, chat_id):
     st.success("Plan approved and locked on the server.")
     remaining = artifact.get("remaining_placeholders") or artifact.get("placeholders") or []
     if remaining:
         st.warning("Unresolved placeholders:")
         for p in remaining:
             st.markdown(f"- `{p}`")
-    # Plan / ASL JSON is intentionally withheld until the ASL API stage exists.
+
+    enrichment_question = artifact.get("enrichment_question")
+    enrichment_error = artifact.get("enrichment_error")
+    workflow_spec = artifact.get("workflow_spec")
+    session_id = artifact.get("session_id") or artifact.get("run_id")
+    busy = is_chat_busy(chat_id)
+
+    # Only the latest approved card is interactive for enrichment answers.
+    is_active = message_id == _latest_spec_approved_message_id(chat_id)
+    controls_enabled = is_active and not busy and bool(session_id)
+
+    # --- Enrichment question section (Stage 3.5 pause) ---
+    if enrichment_question:
+        render_enrichment_question(message_id, artifact, chat_id, controls_enabled)
+        if busy:
+            st.caption("Working on your answer… actions are paused until it finishes.")
+        st.info("ASL generation and deploy will appear here when those APIs are available.")
+        return
+
+    if enrichment_error:
+        st.error(f"Enrichment failed: {enrichment_error}")
+        st.caption(
+            "The plan is still locked. You can continue from this approved plan "
+            "once enrichment is fixed; ASL generation is not available yet."
+        )
+    elif workflow_spec:
+        tabs = st.tabs(["Workflow spec", "Resolved plan"])
+        with tabs[0]:
+            st.json(workflow_spec)
+        with tabs[1]:
+            plan = artifact.get("plan")
+            if plan:
+                st.json(plan)
+            else:
+                st.info("No separate resolved plan payload.")
+    else:
+        plan = artifact.get("plan")
+        if plan:
+            with st.expander("Resolved plan", expanded=False):
+                st.json(plan)
+
+    # ASL generation / deploy reserved for later API stages.
     st.info("ASL generation and deploy will appear here when those APIs are available.")
 
 
@@ -1791,7 +1899,7 @@ def render_artifact(message_id, artifact, chat_id):
     elif stage == "plan_review":
         render_plan_review(message_id, artifact, chat_id)
     elif stage == "spec_approved":
-        render_spec_approved(artifact)
+        render_spec_approved(message_id, artifact, chat_id)
     elif stage == "failed":
         st.error(artifact.get("assistant_text") or "Something failed.")
     else:
@@ -1853,6 +1961,32 @@ def process_pending_approve(region, env):
         st.rerun()
     except OrchestrationApiError as exc:
         fail_in_flight(f"Could not approve the plan. {exc}", chat_id=chat_id)
+
+
+def process_pending_enrichment(region, env):
+    """Run a queued enrichment answer exactly once (guards double-submit)."""
+    _ = region, env
+    pending = st.session_state.get("pending_enrichment")
+    if not pending:
+        return
+
+    chat_id = pending["chat_id"]
+    session_id = pending["session_id"]
+    answer = pending.get("answer") or ""
+
+    add_message(chat_id, "user", answer)
+
+    try:
+        with st.spinner("Enriching…"):
+            result = answer_enrichment(session_id, answer)
+        apply_run_result(chat_id, result)
+        for key in list(st.session_state.keys()):
+            if isinstance(key, str) and key.startswith(f"reconciled_{chat_id}_"):
+                st.session_state.pop(key, None)
+        clear_in_flight(chat_id)
+        st.rerun()
+    except OrchestrationApiError as exc:
+        fail_in_flight(f"Could not answer enrichment. {exc}", chat_id=chat_id)
 
 
 def process_user_prompt(active_chat_id, user_prompt, region, env):
@@ -2011,6 +2145,8 @@ if st.session_state.get("pending_prompt") and st.session_state.get("pending_chat
     st.session_state.pending_chat_id = None
 if "pending_approve" not in st.session_state:
     st.session_state.pending_approve = None
+if "pending_enrichment" not in st.session_state:
+    st.session_state.pending_enrichment = None
 if "api_unreachable" not in st.session_state:
     st.session_state.api_unreachable = False
 
@@ -2122,6 +2258,11 @@ if is_chat_busy(active_chat_id):
 pending_approve = st.session_state.get("pending_approve")
 if pending_approve and pending_approve.get("chat_id") == active_chat_id:
     process_pending_approve(region=region, env=env)
+
+# Process enrichment answer for the open chat.
+pending_enrichment = st.session_state.get("pending_enrichment")
+if pending_enrichment and pending_enrichment.get("chat_id") == active_chat_id:
+    process_pending_enrichment(region=region, env=env)
 
 # Process this chat's queued prompt only — other chats keep their own queue
 # and run when the user switches back to them.

@@ -123,20 +123,45 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
     art["stage"] = "spec_approved"
     plan = data.get("resolved_plan")
     art["plan"] = plan
-    art["workflow_spec"] = plan
+    # Prefer the enriched workflow_spec when Stage 3.5 completed;
+    # fall back to the resolved plan so the UI still has something to show.
+    art["workflow_spec"] = data.get("workflow_spec") or plan
     remaining = list(data.get("remaining_placeholders") or [])
     art["placeholders"] = remaining
     art["remaining_placeholders"] = remaining
-    art["assistant_text"] = (
-        "Plan **approved**. Resolved specification is locked on the server.\n\n"
-        + (
-            "Remaining placeholders (allowed until later pre-flight):\n"
-            + "\n".join(f"- `{p}`" for p in remaining)
-            if remaining
-            else "All known placeholders were resolved (or none were present)."
+    art["enrichment_error"] = data.get("enrichment_error")
+    art["enrichment_question"] = data.get("enrichment_question")
+
+    parts = [
+        "Plan **approved**. Resolved specification is locked on the server.",
+        "",
+    ]
+    if remaining:
+        parts.append("Remaining placeholders (allowed until later pre-flight):")
+        parts.extend(f"- `{p}`" for p in remaining)
+    else:
+        parts.append("All known placeholders were resolved (or none were present).")
+
+    if data.get("enrichment_question"):
+        parts.append("")
+        parts.append(
+            "Enrichment needs a clarification before the full workflow spec "
+            "can be produced:"
         )
-        + "\n\nASL generation and deploy are not available from the API yet."
-    )
+        parts.append(data["enrichment_question"])
+    elif data.get("enrichment_error"):
+        parts.append("")
+        parts.append(f"Enrichment failed: {data['enrichment_error']}")
+    elif data.get("workflow_spec"):
+        parts.append("")
+        parts.append("Workflow specification is ready (enrichment complete).")
+    else:
+        parts.append("")
+        parts.append("Enrichment did not return a workflow_spec.")
+
+    parts.append("")
+    parts.append("ASL generation and deploy are not available from the API yet.")
+    art["assistant_text"] = "\n".join(parts)
     return art
 
 
@@ -175,6 +200,15 @@ def api_approve_plan(session_id: str, overrides: dict[str, str] | None = None) -
         "POST",
         f"/session/{session_id}/approve",
         {"overrides": overrides or {}},
+    )
+    return _normalize_approve_response(session_id, data)
+
+
+def api_answer_enrichment(session_id: str, answer: str) -> dict:
+    data = _request(
+        "POST",
+        f"/session/{session_id}/enrichment/answer",
+        {"answer": answer},
     )
     return _normalize_approve_response(session_id, data)
 
@@ -235,10 +269,40 @@ def approve_plan(run_id: str, overrides: dict[str, str] | None = None) -> dict:
         # Mock: jump to a simple "approved" artifact (no ASL API).
         return {
             **_empty_artifact(run_id, "spec_approved", "Mock plan approved."),
-            "workflow_spec": {"name": "mock-approved", "steps": []},
+            "workflow_spec": {
+                "name": "mock-approved",
+                "steps": [
+                    {"id": "Validate", "type": "Task", "service": "Lambda"},
+                    {"id": "Process", "type": "Task", "service": "Glue"},
+                    {"id": "Notify", "type": "Task", "service": "SNS"},
+                ],
+            },
             "remaining_placeholders": [],
+            "enrichment_error": None,
+            "enrichment_question": None,
         }
     return api_approve_plan(run_id, overrides or {})
+
+
+def answer_enrichment(run_id: str, answer: str) -> dict:
+    """Resume Stage 3.5 enrichment after a clarifying question."""
+    if USE_MOCK:
+        _mock_pause()
+        return {
+            **_empty_artifact(run_id, "spec_approved", "Mock enrichment answered."),
+            "workflow_spec": {
+                "name": "mock-approved",
+                "steps": [
+                    {"id": "Validate", "type": "Task", "service": "Lambda"},
+                    {"id": "Process", "type": "Task", "service": "Glue"},
+                    {"id": "Notify", "type": "Task", "service": "SNS"},
+                ],
+            },
+            "remaining_placeholders": [],
+            "enrichment_error": None,
+            "enrichment_question": None,
+        }
+    return api_answer_enrichment(run_id, answer)
 
 
 # Back-compat names (old mock UI). Prefer approve_plan / reject_plan.
