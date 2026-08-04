@@ -41,6 +41,15 @@ class ApproveResponse(BaseModel):
     status: Literal["approved"]
     resolved_plan: Plan
     remaining_placeholders: list[str]
+    workflow_spec: dict | None = None
+    enrichment_error: str | None = None
+    # Set when enrichment paused to ask the user something -- answer
+    # via POST /session/{id}/enrichment/answer.
+    enrichment_question: str | None = None
+
+
+class EnrichmentAnswerRequest(BaseModel):
+    answer: str = Field(..., min_length=1)
 
 
 class RejectRequest(BaseModel):

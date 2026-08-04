@@ -75,6 +75,18 @@ on the success path.
 says "On ProcessPayment failure: release inventory", then \
 ProcessPayment.on_failure must include that release step id).
 
+9. RETRY IS AN ATTRIBUTE, NOT A STEP. If the user describes retrying, \
+re-attempting, or trying again after a failure (e.g. "retry up to 3 \
+times", "try again on failure"), this is NEVER its own step -- it is \
+a property of the ACTION being retried. Fold it into the description \
+of the step it applies to instead (e.g. a step invoking a Lambda \
+function that should retry on failure should have a description like \
+"Invoke the target Lambda function; retry up to 3 times on failure," \
+not a separate "retry" step immediately after it). Two steps that \
+would invoke the exact same resource back-to-back is a sign this rule \
+was violated -- there should be exactly one step per distinct action, \
+with retry behavior folded into that one step's description.
+
 Respond with JSON matching exactly one of these two shapes:
 
 When you have enough to propose a plan:

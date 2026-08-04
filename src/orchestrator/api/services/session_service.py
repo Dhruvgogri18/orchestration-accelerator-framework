@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from orchestrator.api.repositories import session_repository as session_store
 from orchestrator.api.repositories.session_repository import Session
+from orchestrator.api.schemas.common import Plan
 from orchestrator.api.schemas.session import ApproveResponse, MessageResponse
+from orchestrator.api.services.enrichment_service import EnrichmentError, continue_enrichment, enrich_plan
 from orchestrator.api.services.extraction_service import ExtractionError, extract_turn
 from orchestrator.api.services.plan_render_service import (
     apply_overrides,
@@ -24,6 +26,10 @@ class SessionNotFoundError(Exception):
 
 class NoApprovablePlanError(Exception):
     """Reject/approve called while no ready plan is stored."""
+
+
+class NoEnrichmentQuestionError(Exception):
+    """answer_enrichment_question called with no clarification pending."""
 
 
 def start_session() -> Session:
@@ -123,10 +129,13 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
     purpose (see plan_render_service.apply_overrides docstring) rather
     than blocking approval.
 
-    NOTE: this does NOT yet produce a full workflow_spec.json (Stage
-    3.5 enrichment -- ASL types, resource ARNs, next_step wiring --
-    is still unbuilt). This stores the resolved plan as an
-    intermediate "approved" checkpoint.
+    Stage 3.5 enrichment (resolved plan -> full workflow_spec.json)
+    runs right after -- but a failure there does NOT fail the approve
+    call itself. Approval is a human decision about the WORKFLOW; it
+    should succeed even if the mechanical translation into ASL
+    structure needs another attempt later. enrichment_error is
+    returned so the caller knows to retry/investigate, without losing
+    the approval that already happened.
     """
     session = get_session_or_raise(session_id)
     if session.latest_plan is None:
@@ -136,16 +145,85 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
 
     resolved_plan, remaining = apply_overrides(session.latest_plan, overrides)
 
-    session_store.set_locked_spec(
-        session_id,
-        {
-            "resolved_plan": resolved_plan.model_dump(),
-            "remaining_placeholders": remaining,
-        },
-    )
+    workflow_spec: dict | None = None
+    enrichment_error: str | None = None
+    enrichment_question: str | None = None
+    try:
+        result = enrich_plan(resolved_plan)
+        if result.status == "complete":
+            workflow_spec = result.spec
+        else:  # needs_clarification -- pause, persist state for answer endpoint
+            enrichment_question = result.question
+    except EnrichmentError as exc:
+        enrichment_error = str(exc)
+
+    locked = {
+        "resolved_plan": resolved_plan.model_dump(),
+        "remaining_placeholders": remaining,
+        "workflow_spec": workflow_spec,
+        "enrichment_error": enrichment_error,
+        "enrichment_question": enrichment_question,
+    }
+    if enrichment_question is not None:
+        locked["enrichment_pending"] = {
+            "messages": result.messages,
+            "clarification_rounds": result.clarification_rounds,
+        }
+    session_store.set_locked_spec(session_id, locked)
 
     return ApproveResponse(
         status="approved",
         resolved_plan=resolved_plan,
         remaining_placeholders=remaining,
+        workflow_spec=workflow_spec,
+        enrichment_error=enrichment_error,
+        enrichment_question=enrichment_question,
+    )
+
+
+def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
+    """Resumes an enrichment conversation paused on a clarifying
+    question (see approve_plan). Reuses the persisted resolved_plan/
+    remaining_placeholders -- only the enrichment outcome changes.
+    """
+    session = get_session_or_raise(session_id)
+    locked = session.locked_spec or {}
+    pending = locked.get("enrichment_pending")
+    if not pending:
+        raise NoEnrichmentQuestionError("No enrichment clarification pending for this session.")
+
+    plan = Plan.model_validate(locked["resolved_plan"])
+    workflow_spec: dict | None = None
+    enrichment_error: str | None = None
+    enrichment_question: str | None = None
+    try:
+        result = continue_enrichment(
+            plan, pending["messages"], answer, pending["clarification_rounds"]
+        )
+        if result.status == "complete":
+            workflow_spec = result.spec
+        else:
+            enrichment_question = result.question
+    except EnrichmentError as exc:
+        enrichment_error = str(exc)
+
+    locked["workflow_spec"] = workflow_spec
+    locked["enrichment_error"] = enrichment_error
+    locked["enrichment_question"] = enrichment_question
+    if enrichment_question is not None:
+        locked["enrichment_pending"] = {
+            "messages": result.messages,
+            "clarification_rounds": result.clarification_rounds,
+        }
+    else:
+        locked.pop("enrichment_pending", None)
+    session_store.set_locked_spec(session_id, locked)
+
+    return ApproveResponse(
+        status="approved",
+        resolved_plan=plan,
+        remaining_placeholders=locked["remaining_placeholders"],
+        workflow_spec=workflow_spec,
+        enrichment_error=enrichment_error,
+        enrichment_question=enrichment_question,
     )

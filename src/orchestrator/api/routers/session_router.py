@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException
 from orchestrator.api.schemas.session import (
     ApproveRequest,
     ApproveResponse,
+    EnrichmentAnswerRequest,
     MessageRequest,
     MessageResponse,
     RejectRequest,
@@ -90,4 +91,18 @@ def approve_plan(session_id: str, request: ApproveRequest) -> ApproveResponse:
     except session_service.SessionNotFoundError:
         raise HTTPException(status_code=404, detail="Unknown session_id") from None
     except session_service.NoApprovablePlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.post("/{session_id}/enrichment/answer", response_model=ApproveResponse)
+def answer_enrichment_question(session_id: str, request: EnrichmentAnswerRequest) -> ApproveResponse:
+    """Answers a clarifying question enrichment asked during /approve
+    (see ApproveResponse.enrichment_question). May itself return
+    another enrichment_question if further clarification is needed.
+    """
+    try:
+        return session_service.answer_enrichment_question(session_id, request.answer)
+    except session_service.SessionNotFoundError:
+        raise HTTPException(status_code=404, detail="Unknown session_id") from None
+    except session_service.NoEnrichmentQuestionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
