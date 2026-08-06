@@ -96,6 +96,17 @@ def _normalize_message_response(session_id: str, data: dict) -> dict:
         art["assistant_text"] = q or "I need a bit more detail."
         return art
 
+    if status == "out_of_scope":
+        msg = data.get("message") or (
+            "This assistant is only designed to help you build AWS Step "
+            "Functions workflows from a natural-language description. "
+            "It cannot answer general or unrelated questions. Please describe "
+            "a workflow you want to orchestrate."
+        )
+        art["stage"] = "out_of_scope"
+        art["assistant_text"] = msg
+        return art
+
     if status == "ready":
         plan = data.get("plan")
         art["stage"] = "plan_review"
@@ -359,11 +370,68 @@ def _mock_pause() -> None:
         time.sleep(_MOCK_LATENCY_SEC)
 
 
+def _looks_out_of_scope(text: str) -> bool:
+    """Lightweight mock heuristic — real API relies on the extraction LLM."""
+    lower = (text or "").lower()
+    workflow_hints = (
+        "workflow",
+        "step function",
+        "stepfunctions",
+        "orchestrat",
+        "lambda",
+        "s3",
+        "sns",
+        "sqs",
+        "dynamodb",
+        "glue",
+        "eventbridge",
+        "pipeline",
+        "state machine",
+        "on failure",
+        "retry",
+    )
+    if any(h in lower for h in workflow_hints):
+        return False
+    off_topic = (
+        "distance",
+        "kashmir",
+        "kanyakumari",
+        "weather",
+        "recipe",
+        "who won",
+        "capital of",
+        "tell me a joke",
+    )
+    if any(h in lower for h in off_topic):
+        return True
+    # Short messages with no AWS/workflow vocabulary → treat as off-topic in mock.
+    return len(lower.split()) >= 4 and not any(
+        h in lower for h in ("aws", "amazon", "step", "task", "queue", "bucket")
+    )
+
+
 def _mock_send_message(message: str, run_id: str | None = None) -> dict:
     import uuid
 
     _mock_pause()
     text = (message or "").strip()
+
+    if _looks_out_of_scope(text):
+        sid = run_id or str(uuid.uuid4())
+        if sid not in _MOCK_RUNS:
+            _MOCK_RUNS[sid] = {"session_id": sid, "n": 0}
+        msg = (
+            "This assistant is only designed to help you build AWS Step Functions "
+            "workflows from a natural-language description. It cannot answer "
+            "general questions (for example travel distances or unrelated topics). "
+            "Please describe a workflow you want to orchestrate — steps, AWS "
+            "services, and what should happen on success or failure."
+        )
+        return {
+            **_empty_artifact(sid, "out_of_scope", msg),
+            "assistant_text": msg,
+        }
+
     if not run_id or run_id not in _MOCK_RUNS:
         sid = run_id or str(uuid.uuid4())
         _MOCK_RUNS[sid] = {"session_id": sid, "n": 0}

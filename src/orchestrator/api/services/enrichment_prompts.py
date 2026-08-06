@@ -94,7 +94,23 @@ STRICT RULES:
    finishing/completing successfully is Succeed. A step that only \
    sends a failure notification is still a Task (it performs an \
    action); a step that represents unconditional workflow failure \
-   itself is Fail.
+   itself is Fail. A step describing repeated action over a \
+   variable-length collection ("for each X in a list...") is a Map, \
+   with the per-item logic inside its `iterator` -- never model \
+   iteration as a manual loop of steps routing back to an earlier \
+   step id; Step Functions' native Map/iterator handles completion \
+   tracking automatically and a manual loop is never the correct \
+   translation of "for each" language.
+
+   For pure terminal steps (type Succeed or Fail): do NOT set \
+   `service`, `resource`, or `parameters`. Those fields only apply to \
+   steps that call an AWS service. Even if the input plan listed a \
+   service such as "Lambda" on a "do nothing further" / "finish" / \
+   "fail the workflow" step, drop it when the enriched type is \
+   Succeed or Fail -- inventing or copying a fake service on a pure \
+   terminal is noise, not structure. Choice / Wait / Parallel / Map \
+   control-flow steps also must not invent a Task-style resource; \
+   only Task steps require `service` and `resource`.
 
 5. Every non-terminal step must have either `next_step` (pointing to \
    another step's id in this same list) or `end: true`. Choice steps \
@@ -111,7 +127,28 @@ STRICT RULES:
    resolved with a TODO_ placeholder (rule 2) instead. Only ask when a \
    placeholder genuinely cannot substitute for the missing decision \
    (a placeholder can stand in for an unknown VALUE, it cannot stand \
-   in for an unknown STRUCTURE). In that case, respond with ONLY:
+   in for an unknown STRUCTURE).
+
+   A specific, common case of this: if the plan describes retrying \
+   WITHOUT a bound -- "retry forever", "keep trying until it \
+   succeeds", "no giving up", "never stop retrying", or similar \
+   open-ended language -- this IS a structural ambiguity requiring a \
+   clarifying question, not a value to fill in. ASL retry policies \
+   require a genuinely finite `max_attempts`; Step Functions itself \
+   also enforces execution limits (maximum state transitions, maximum \
+   execution duration) that make true infinite retry impossible \
+   regardless of what number you write. NEVER substitute an \
+   arbitrarily large number (e.g. 99999999) as a stand-in for \
+   "unlimited" -- an extremely large bound is not equivalent to \
+   unbounded, is practically meaningless (the execution will hit \
+   Step Functions' own limits long before exhausting it), and silently \
+   picking one hides a real decision the user needs to make. Ask what \
+   a reasonable attempt cap or overall time budget should be, or \
+   whether a different pattern entirely (e.g. a Wait/Task polling \
+   loop with its own exit condition) better fits "retry forever" than \
+   a bounded `retry` block does.
+
+   In any needs_clarification case, respond with ONLY:
 {
   "status": "needs_clarification",
   "clarifying_question": "Your single, specific question here."

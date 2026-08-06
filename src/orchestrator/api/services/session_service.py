@@ -89,6 +89,15 @@ def run_extraction_turn(session_id: str, session: Session, message: str) -> Mess
             diagram_dot=render_plan_diagram(result.plan),
             placeholders=find_placeholders(result.plan),
         )
+    if result.status == "out_of_scope":
+        return MessageResponse(
+            status="out_of_scope",
+            message=result.message
+            or (
+                "This assistant is only designed to help you build AWS Step "
+                "Functions workflows. Please describe a workflow to orchestrate."
+            ),
+        )
     return MessageResponse(
         status="needs_clarification",
         question=result.clarifying_question,

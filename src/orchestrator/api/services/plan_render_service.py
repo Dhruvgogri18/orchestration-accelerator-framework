@@ -140,10 +140,29 @@ def apply_overrides(plan: Plan, overrides: dict[str, str]) -> tuple[Plan, list[s
     return resolved_plan, remaining
 
 
+def _is_placeholder_service(service: str | None) -> bool:
+    """True when the plan step does not call a real AWS service."""
+    s = (service or "").strip().lower()
+    return s in ("", "none", "n/a", "na", "null", "control", "terminal")
+
+
+def _node_label(step: PlanStep) -> str:
+    """Graphviz node label: omit (service) for pure terminal placeholders."""
+    if _is_placeholder_service(step.service):
+        return step.id
+    return f"{step.id}\\n({step.service})"
+
+
+def _summary_step_line(step: PlanStep) -> str:
+    if _is_placeholder_service(step.service):
+        return f"**{step.id}** — {step.description}"
+    return f"**{step.id}** ({step.service}) — {step.description}"
+
+
 def render_plan_summary(plan: Plan) -> str:
     lines = [f"### {plan.name}", "", plan.summary, "", "**Steps:**"]
     for i, step in enumerate(plan.steps, start=1):
-        lines.append(f"{i}. **{step.id}** ({step.service}) — {step.description}")
+        lines.append(f"{i}. {_summary_step_line(step)}")
         flow_bits: list[str] = []
         if step.next:
             flow_bits.append(f"next → `{step.next}`")
@@ -198,7 +217,7 @@ def _render_structured_diagram(plan: Plan) -> str:
 
     for step in plan.steps:
         is_branch = bool(step.branches)
-        label = f"{step.id}\\n({step.service})"
+        label = _node_label(step)
         fillcolor, strokecolor, shape = _step_style(step, is_branch=is_branch)
         lines.append(
             f'  "{step.id}" [label="{_dot_escape(label)}", '
@@ -358,7 +377,7 @@ def _render_heuristic_diagram(plan: Plan) -> str:
         failure_handlers = []
 
     for step in plan.steps:
-        label = f"{step.id}\\n({step.service})"
+        label = _node_label(step)
         fillcolor, strokecolor, shape = _step_style(step, is_branch=False)
         lines.append(
             f'  "{step.id}" [label="{_dot_escape(label)}", '

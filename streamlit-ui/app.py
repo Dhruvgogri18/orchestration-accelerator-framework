@@ -1174,6 +1174,7 @@ STAGE_PREFIX = {
     "clarifying": "… ",
     "plan_review": "Plan ",
     "spec_approved": "✓ ",
+    "out_of_scope": "⊘ ",
     "failed": "! ",
 }
 
@@ -1184,10 +1185,12 @@ def create_welcome_message(chat_id):
         chat_id,
         "assistant",
         (
-            "Welcome to the Workflow Assistant. Describe an orchestration in "
-            "natural language. I may ask a clarifying question, then show a "
-            "plan (summary + diagram + placeholders). You can approve the plan "
-            f"or request changes. ({mode}.)\n\n"
+            "Welcome to the Workflow Assistant. Describe an AWS Step Functions "
+            "orchestration in natural language (steps, services, success/failure "
+            "behavior). I may ask a clarifying question, then show a plan "
+            "(summary + diagram + placeholders). You can approve the plan or "
+            f"request changes. ({mode}.)\n\n"
+            "I only help design Step Functions workflows — not general questions. "
             "ASL generation and deploy are not available until those APIs exist."
         ),
     )
@@ -1441,13 +1444,14 @@ def _escape_html(content: str) -> str:
 
 
 # Inline SVG icons for chat avatars (no external assets).
+# Desktop computer: monitor + stand + keyboard.
 _ASSISTANT_ICON = (
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
     'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-    '<rect x="5" y="3" width="14" height="12" rx="3"/>'
-    '<path d="M9 21h6"/><path d="M12 15v6"/>'
-    '<circle cx="9" cy="9" r="1" fill="currentColor" stroke="none"/>'
-    '<circle cx="15" cy="9" r="1" fill="currentColor" stroke="none"/>'
+    '<rect x="3" y="3" width="18" height="12" rx="1.5"/>'
+    '<path d="M8 21h8"/>'
+    '<path d="M12 15v6"/>'
+    '<path d="M7 18h10"/>'
     "</svg>"
 )
 
@@ -1609,6 +1613,7 @@ def apply_run_result(chat_id, result, user_text=None):
         "clarifying": "clarifying",
         "plan_review": "plan_pending",
         "spec_approved": "approved",
+        "out_of_scope": "out_of_scope",
         "failed": "failed",
     }.get(stage)
 
@@ -1889,6 +1894,14 @@ def render_spec_approved(message_id, artifact, chat_id):
     st.info("ASL generation and deploy will appear here when those APIs are available.")
 
 
+def render_out_of_scope(artifact):
+    text = artifact.get("assistant_text") or (
+        "This assistant is only designed to help you build AWS Step Functions "
+        "workflows. Please describe a workflow to orchestrate."
+    )
+    st.info(text)
+
+
 def render_artifact(message_id, artifact, chat_id):
     if not artifact:
         return
@@ -1900,6 +1913,8 @@ def render_artifact(message_id, artifact, chat_id):
         render_plan_review(message_id, artifact, chat_id)
     elif stage == "spec_approved":
         render_spec_approved(message_id, artifact, chat_id)
+    elif stage == "out_of_scope":
+        render_out_of_scope(artifact)
     elif stage == "failed":
         st.error(artifact.get("assistant_text") or "Something failed.")
     else:
@@ -1926,6 +1941,8 @@ def queue_user_prompt(active_chat_id, user_prompt):
     prompts = _pending_prompts()
     prompts[active_chat_id] = user_prompt
     st.session_state.pending_prompts = prompts
+    # Hide empty-state example chips immediately for this chat.
+    st.session_state[f"examples_dismissed_{active_chat_id}"] = True
     st.session_state.focus_chat_input = True
     st.rerun()
 
@@ -2209,7 +2226,10 @@ if st.session_state.get("api_unreachable") and not USE_MOCK:
     )
 
 messages = get_messages(active_chat_id)
+# Any user message (typed or from clicking an example) means the empty-state
+# example chips should not be shown again in this chat.
 has_user = any(m["role"] == "user" for m in messages)
+busy_early = is_chat_busy(active_chat_id)
 
 for message in messages:
     if message["role"] == "user":
@@ -2218,9 +2238,12 @@ for message in messages:
         artifact = message.get("artifact")
         stage = (artifact or {}).get("stage") if artifact else None
 
-        # Clarifying: single left-side chat bubble (no extra chrome).
+        # Clarifying / out-of-scope: single left-side chat-style reply.
         if stage == "clarifying":
             render_artifact(message["id"], artifact, active_chat_id)
+            continue
+        if stage == "out_of_scope":
+            render_assistant_message(message["content"])
             continue
 
         # Plain assistant text (welcome, generic) — chat bubble.
@@ -2240,6 +2263,23 @@ for message in messages:
         else:
             st.markdown(message["content"])
         st.markdown("</div>", unsafe_allow_html=True)
+
+# Example chips: after messages, BEFORE typing + process_user_prompt.
+# Must run before the spinner so Streamlit clears prior-run buttons and they
+# never sit under "Thinking…". Hide once the user has sent anything.
+_examples_box = st.empty()
+if not has_user and not busy_early:
+    with _examples_box.container():
+        st.markdown("##### Try an example")
+        for i, example in enumerate(EXAMPLE_PROMPTS):
+            if st.button(
+                example,
+                key=f"ex_{active_chat_id}_{i}",
+                use_container_width=True,
+            ):
+                queue_user_prompt(active_chat_id, example)
+else:
+    _examples_box.empty()
 
 region = st.session_state.get("aws_region", "ap-south-1")
 env = st.session_state.get("deploy_env", "dev")
@@ -2275,19 +2315,7 @@ if active_chat_id in pending_prompts:
         env=env,
     )
 
-# Input / example buttons are disabled only while THIS chat is waiting.
 busy = is_chat_busy(active_chat_id)
-
-if not has_user:
-    st.markdown("##### Try an example")
-    for i, example in enumerate(EXAMPLE_PROMPTS):
-        if st.button(
-            example,
-            key=f"ex_{i}",
-            use_container_width=True,
-            disabled=busy,
-        ):
-            queue_user_prompt(active_chat_id, example)
 
 chat_placeholder = (
     "Please wait…" if busy else "Describe a workflow, or answer the question…"

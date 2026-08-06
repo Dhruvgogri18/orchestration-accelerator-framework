@@ -18,9 +18,11 @@ class MessageRequest(BaseModel):
 
 
 class MessageResponse(BaseModel):
-    status: Literal["ready", "needs_clarification"]
+    status: Literal["ready", "needs_clarification", "out_of_scope"]
     plan: Plan | None = None
     question: str | None = None
+    # Set when status == "out_of_scope": refusal explaining domain limits.
+    message: str | None = None
     # Populated only when status == "ready" -- see plan_render_service.
     # Sent automatically so the client never has to make a second call
     # just to get a human-friendly view of the plan.

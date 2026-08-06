@@ -74,9 +74,12 @@ class ExtractionResult(BaseModel):
     are not enough -- models drift, so the real guarantee is here.
     """
 
-    status: Literal["ready", "needs_clarification"]
+    status: Literal["ready", "needs_clarification", "out_of_scope"]
     plan: Plan | None = Field(default=None, validate_default=True)
     clarifying_question: str | None = Field(default=None, validate_default=True)
+    # Required when status is out_of_scope -- polite refusal explaining
+    # this product only designs AWS Step Functions workflows.
+    message: str | None = Field(default=None, validate_default=True)
 
     @field_validator("plan")
     @classmethod
@@ -91,5 +94,14 @@ class ExtractionResult(BaseModel):
         if info.data.get("status") == "needs_clarification" and not v:
             raise ValueError(
                 "clarifying_question is required when status is 'needs_clarification'"
+            )
+        return v
+
+    @field_validator("message")
+    @classmethod
+    def message_required_when_out_of_scope(cls, v, info):
+        if info.data.get("status") == "out_of_scope" and not v:
+            raise ValueError(
+                "message is required when status is 'out_of_scope'"
             )
         return v
