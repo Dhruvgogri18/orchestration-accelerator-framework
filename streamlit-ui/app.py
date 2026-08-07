@@ -1276,13 +1276,32 @@ def get_active_session_id(chat_id):
 
 
 def create_new_chat():
-    """Always open an independent draft chat (new session). Reuse an existing
-    unused draft only when it is already the active one — never steal focus
-    away from a chat that is still waiting on a response."""
+    """Open a blank draft for a new conversation.
+
+    Reuse the newest empty draft (highest id, no user messages) so
+    New Chat → switch to old chat → New Chat again stays on the same
+    draft (e.g. 40) instead of creating 41. Never jump backward to an
+    older leftover draft (e.g. from 39 down to 38).
+    """
     active_id = st.session_state.get("active_chat_id")
     if active_id and get_chat(active_id) is not None and is_draft_chat(active_id):
         set_active_chat(active_id)
         return
+
+    try:
+        active_n = int(active_id) if active_id is not None else 0
+    except (TypeError, ValueError):
+        active_n = 0
+
+    drafts = [c for c in get_chats() if is_draft_chat(c["id"])]
+    if drafts:
+        newest = max(drafts, key=lambda c: int(c["id"]))
+        # Only reuse if this draft is at/after the current chat id —
+        # avoids selecting an older empty row (38) while on chat 39.
+        if int(newest["id"]) >= active_n:
+            set_active_chat(newest["id"])
+            return
+
     chat_id = create_chat()
     create_welcome_message(chat_id)
     set_active_chat(chat_id)
@@ -1444,14 +1463,18 @@ def _escape_html(content: str) -> str:
 
 
 # Inline SVG icons for chat avatars (no external assets).
-# Desktop computer: monitor + stand + keyboard.
+# Robot assistant: head, antenna, eyes, mouth, side arms.
 _ASSISTANT_ICON = (
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
     'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-    '<rect x="3" y="3" width="18" height="12" rx="1.5"/>'
-    '<path d="M8 21h8"/>'
-    '<path d="M12 15v6"/>'
-    '<path d="M7 18h10"/>'
+    '<rect x="5" y="9" width="14" height="10" rx="2"/>'
+    '<path d="M12 3v3"/>'
+    '<circle cx="12" cy="3" r="1.5" fill="currentColor" stroke="none"/>'
+    '<circle cx="9" cy="13" r="1.2" fill="currentColor" stroke="none"/>'
+    '<circle cx="15" cy="13" r="1.2" fill="currentColor" stroke="none"/>'
+    '<path d="M9 17h6"/>'
+    '<path d="M5 12H3"/>'
+    '<path d="M21 12h-2"/>'
     "</svg>"
 )
 
@@ -1720,9 +1743,8 @@ def render_plan_review(message_id, artifact, chat_id):
                 disabled=not controls_enabled,
             )
 
-    # Diagram in a tab (JSON reserved for ASL later). Actions sit below.
-    tab_diagram = st.tabs(["Diagram"])[0]
-    with tab_diagram:
+    # Collapsible diagram only — plan JSON is internal, not shown to users.
+    with st.expander("Diagram", expanded=True):
         dot = artifact.get("graph_dot")
         if dot:
             st.graphviz_chart(dot)
@@ -1761,6 +1783,8 @@ def render_plan_review(message_id, artifact, chat_id):
             disabled=not controls_enabled,
         ):
             clean = {k: v.strip() for k, v in overrides.items() if v and v.strip()}
+            # Show the user's action in the chat, then Approving… indicator.
+            add_message(chat_id, "user", "Approve plan")
             # Queue approve so a double-click cannot fire twice.
             st.session_state.pending_approve = {
                 "chat_id": chat_id,
@@ -1875,20 +1899,9 @@ def render_spec_approved(message_id, artifact, chat_id):
             "once enrichment is fixed; ASL generation is not available yet."
         )
     elif workflow_spec:
-        tabs = st.tabs(["Workflow spec", "Resolved plan"])
-        with tabs[0]:
+        with st.expander("Workflow spec", expanded=True):
             st.json(workflow_spec)
-        with tabs[1]:
-            plan = artifact.get("plan")
-            if plan:
-                st.json(plan)
-            else:
-                st.info("No separate resolved plan payload.")
-    else:
-        plan = artifact.get("plan")
-        if plan:
-            with st.expander("Resolved plan", expanded=False):
-                st.json(plan)
+    # Plan JSON is internal (used for enrichment/ASL) — not shown in the UI.
 
     # ASL generation / deploy reserved for later API stages.
     st.info("ASL generation and deploy will appear here when those APIs are available.")
@@ -2267,8 +2280,9 @@ for message in messages:
 # Example chips: after messages, BEFORE typing + process_user_prompt.
 # Must run before the spinner so Streamlit clears prior-run buttons and they
 # never sit under "Thinking…". Hide once the user has sent anything.
+_examples_dismissed = st.session_state.get(f"examples_dismissed_{active_chat_id}", False)
 _examples_box = st.empty()
-if not has_user and not busy_early:
+if not has_user and not busy_early and not _examples_dismissed:
     with _examples_box.container():
         st.markdown("##### Try an example")
         for i, example in enumerate(EXAMPLE_PROMPTS):
