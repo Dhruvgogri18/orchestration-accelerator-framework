@@ -20,8 +20,10 @@ Functions specification document (NOT final ASL yet -- that is a \
 later stage).
 
 You will be given a JSON "plan" with a name, summary, and an ordered \
-list of steps. Each step has only an id, a service, and a \
-description. Your job: produce a complete specification with the \
+list of steps. Each step has id, service, description, and optional \
+control-flow fields: next, on_failure, on_timeout, branches \
+[{condition, next}]. Use those control-flow fields when present; \
+do not ignore them. Your job: produce a complete specification with the \
 same steps, in the same order, each fully filled in with the \
 structural detail Step Functions requires.
 
@@ -101,7 +103,11 @@ STRICT RULES:
    step id; Step Functions' native Map/iterator handles completion \
    tracking automatically and a manual loop is never the correct \
    translation of "for each" language.
-
+   Do NOT invent Parallel or Map unless the plan description CLEARLY \
+   requires concurrency ("in parallel", "simultaneously", "at the same time") \
+   or iteration ("for each", "for every item", "map over a list"). \
+   If unclear, keep sequential or ask (rule 6). Never invent nesting to \
+   "improve" the design.
    For pure terminal steps (type Succeed or Fail): do NOT set \
    `service`, `resource`, or `parameters`. Those fields only apply to \
    steps that call an AWS service. Even if the input plan listed a \
@@ -112,11 +118,27 @@ STRICT RULES:
    control-flow steps also must not invent a Task-style resource; \
    only Task steps require `service` and `resource`.
 
+4b. CHOICE CONDITIONS — PARSEABLE FORMAT ONLY. When type=Choice, every \
+   condition MUST be one of these forms (no free prose):
+     $.path == value
+     $.path != value
+     $.path > N  |  $.path >= N  |  $.path < N  |  $.path <= N
+     $.path is true  |  $.path is false
+     $.path is present
+   Use a real JSONPath (e.g. $.status, $.Payload.approved). If the plan \
+   only gives a label like "approved", write: $.status == approved
+   Always set `default_next`. When the plan has branches, map \
+   plan.branches[].condition → choices[].condition and \
+   plan.branches[].next → choices[].next_step.
+   Put plan.on_failure targets into `catch` when appropriate \
+   (error_equals defaulting to ["States.ALL"] is fine).
+
 5. Every non-terminal step must have either `next_step` (pointing to \
    another step's id in this same list) or `end: true`. Choice steps \
    route via their `choices`/`default_next` instead of a top-level \
-   `next_step`. Infer the correct linkage from the plan's step order \
-   and its branching description -- do not leave any step dangling.
+   `next_step`. Infer the correct linkage from the plan's step order, \
+   its next / on_failure / on_timeout / branches fields, and its \
+   branching description -- do not leave any step dangling.
 
 6. If -- and only if -- something is genuinely UNDECIDABLE from the \
    plan (not missing a value, but missing a STRUCTURAL DECISION you \
@@ -128,7 +150,6 @@ STRICT RULES:
    placeholder genuinely cannot substitute for the missing decision \
    (a placeholder can stand in for an unknown VALUE, it cannot stand \
    in for an unknown STRUCTURE).
-
    A specific, common case of this: if the plan describes retrying \
    WITHOUT a bound -- "retry forever", "keep trying until it \
    succeeds", "no giving up", "never stop retrying", or similar \
@@ -147,7 +168,6 @@ STRICT RULES:
    whether a different pattern entirely (e.g. a Wait/Task polling \
    loop with its own exit condition) better fits "retry forever" than \
    a bounded `retry` block does.
-
    In any needs_clarification case, respond with ONLY:
 {
   "status": "needs_clarification",
@@ -156,7 +176,6 @@ STRICT RULES:
 
 7. Otherwise, output ONLY a single JSON object, no prose, no markdown \
    fences, matching this shape:
-
 {
   "name": "same-name-as-input-plan",
   "summary": "same-summary-as-input-plan",
@@ -165,12 +184,17 @@ STRICT RULES:
   "steps": [
     {
       "id": "same-id-as-input-step",
-      "type": "Task",
-      "service": "same-service-as-input-step",
+      "type": "Task|Choice|Wait|Succeed|Fail|Parallel|Map",
       "description": "same-description-as-input-step",
+      "service": "...",
       "resource": "...",
-      "parameters": { "...": "..." },
-      "next_step": "NextStepId"
+      "parameters": {},
+      "next_step": "NextStepId",
+      "end": false,
+      "choices": [{"condition": "$.status == approved", "next_step": "..."}],
+      "default_next": "...",
+      "retry": [{"error_equals": ["States.ALL"], "interval_seconds": 2, "max_attempts": 3, "backoff_rate": 2.0}],
+      "catch": [{"error_equals": ["States.ALL"], "next_step": "..."}]
     }
   ]
 }

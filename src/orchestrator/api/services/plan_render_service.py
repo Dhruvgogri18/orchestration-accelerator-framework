@@ -205,8 +205,44 @@ def _plan_has_structured_flow(plan: Plan) -> bool:
     return False
 
 
+def _is_parallel_style_branches(step: PlanStep) -> bool:
+    """True when branches look like Parallel arms, not exclusive Choice arms.
+
+    Extraction often encodes Parallel as a synthetic step with branch
+    conditions like 'parallel arm: orders'. Choice arms use labels like
+    'approved' / 'rejected'. Detecting this lets the diagram draw a clear
+    join edge (next) after the arms complete.
+    """
+    if not step.branches:
+        return False
+    blob = " ".join(
+        f"{b.condition or ''} {step.description or ''} {step.id or ''}"
+        for b in step.branches
+    ).lower()
+    return any(
+        k in blob
+        for k in (
+            "parallel",
+            "concurrent",
+            "simultaneously",
+            "at the same time",
+            "parallel arm",
+            "arm:",
+        )
+    )
+
+
 def _render_structured_diagram(plan: Plan) -> str:
-    """Draw edges exclusively from next / on_failure / on_timeout / branches."""
+    """Draw edges exclusively from next / on_failure / on_timeout / branches.
+
+    Important: a step may have BOTH branches and next.
+    - Choice: branches are exclusive arms; next is usually absent (default
+      is modeled as a branch or left unset).
+    - Parallel (synthetic): branches are concurrent arms; next is the
+      join successor that runs after ALL arms succeed. That next edge
+      must always be drawn or the diagram hides when the post-parallel
+      step (e.g. BuildCustomer360) runs.
+    """
     lines = [
         "digraph plan {",
         "  rankdir=TB;",
@@ -244,17 +280,45 @@ def _render_structured_diagram(plan: Plan) -> str:
             )
 
     for step in plan.steps:
+        parallel_style = _is_parallel_style_branches(step)
+
         if step.branches:
             for branch in step.branches:
+                # Parallel arms: solid orange; Choice arms: dashed amber
+                if parallel_style:
+                    add_edge(
+                        step.id,
+                        branch.next,
+                        "solid",
+                        "#B45309",
+                        branch.condition or "parallel arm",
+                    )
+                else:
+                    add_edge(
+                        step.id,
+                        branch.next,
+                        "dashed",
+                        "#B45309",
+                        branch.condition,
+                    )
+
+        # Always draw next when present — including on Parallel steps where
+        # next = "after both arms complete". Previously this was skipped
+        # whenever branches existed, which hid the join → BuildCustomer360 edge.
+        if step.next:
+            if parallel_style:
                 add_edge(
                     step.id,
-                    branch.next,
-                    "dashed",
-                    "#B45309",
-                    branch.condition,
+                    step.next,
+                    "solid",
+                    "#2F855A",
+                    "after both complete",
                 )
-        elif step.next:
-            add_edge(step.id, step.next, "solid", "#666666")
+            elif step.branches:
+                # Choice with an explicit next (unusual) — still show it
+                add_edge(step.id, step.next, "solid", "#666666", "next")
+            else:
+                add_edge(step.id, step.next, "solid", "#666666")
 
         for target in step.on_failure or []:
             add_edge(step.id, target, "dashed", "#C53030", "on failure")

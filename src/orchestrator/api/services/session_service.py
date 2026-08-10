@@ -9,8 +9,22 @@ from __future__ import annotations
 from orchestrator.api.repositories import session_repository as session_store
 from orchestrator.api.repositories.session_repository import Session
 from orchestrator.api.schemas.common import Plan
-from orchestrator.api.schemas.session import ApproveResponse, MessageResponse
-from orchestrator.api.services.enrichment_service import EnrichmentError, continue_enrichment, enrich_plan
+from orchestrator.api.schemas.session import (
+    ApproveResponse,
+    AslValidateResponse,
+    MessageResponse,
+)
+from orchestrator.api.services.asl_service import (
+    AslGenerationError,
+    build_asl_from_spec,
+    render_asl_graph,
+    validate_asl,
+)
+from orchestrator.api.services.enrichment_service import (
+    EnrichmentError,
+    continue_enrichment,
+    enrich_plan,
+)
 from orchestrator.api.services.extraction_service import ExtractionError, extract_turn
 from orchestrator.api.services.plan_render_service import (
     apply_overrides,
@@ -30,6 +44,10 @@ class NoApprovablePlanError(Exception):
 
 class NoEnrichmentQuestionError(Exception):
     """answer_enrichment_question called with no clarification pending."""
+
+
+class NoWorkflowSpecError(Exception):
+    """ASL generation/validation requested but no workflow_spec is locked."""
 
 
 def start_session() -> Session:
@@ -131,6 +149,26 @@ def reject_plan(session_id: str, feedback: str) -> MessageResponse:
     return run_extraction_turn(session_id, session, revision_message)
 
 
+def _run_asl_stage(workflow_spec: dict) -> tuple[dict | None, str | None, dict | None, str | None]:
+    """Stage 4: workflow_spec -> ASL + validations + graph.
+
+    Returns (asl, graph_dot, validations_dict, error_message).
+    Never raises — ASL failures are reported alongside a successful approval.
+    """
+    try:
+        result = build_asl_from_spec(workflow_spec)
+        return (
+            result.asl,
+            result.graph_dot,
+            result.validations.to_dict(),
+            None,
+        )
+    except AslGenerationError as exc:
+        return None, None, None, str(exc)
+    except Exception as exc:  # noqa: BLE001 — surface unexpected translator bugs
+        return None, None, None, f"ASL generation failed unexpectedly: {exc}"
+
+
 def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
     """Human checkpoint (Stage 3). Requires a ready plan to exist --
     can't approve mid-clarification. Substitutes any TODO_ overrides
@@ -145,6 +183,10 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
     structure needs another attempt later. enrichment_error is
     returned so the caller knows to retry/investigate, without losing
     the approval that already happened.
+
+    When enrichment completes, Stage 4 (ASL generation + the five
+    validation groups + console-style graph) runs immediately and the
+    results are stored on the locked_spec and returned on the response.
     """
     session = get_session_or_raise(session_id)
     if session.latest_plan is None:
@@ -157,10 +199,15 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
     workflow_spec: dict | None = None
     enrichment_error: str | None = None
     enrichment_question: str | None = None
+    asl: dict | None = None
+    asl_graph_dot: str | None = None
+    asl_validations: dict | None = None
+    asl_error: str | None = None
     try:
         result = enrich_plan(resolved_plan)
         if result.status == "complete":
             workflow_spec = result.spec
+            asl, asl_graph_dot, asl_validations, asl_error = _run_asl_stage(workflow_spec)
         else:  # needs_clarification -- pause, persist state for answer endpoint
             enrichment_question = result.question
     except EnrichmentError as exc:
@@ -172,6 +219,10 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
         "workflow_spec": workflow_spec,
         "enrichment_error": enrichment_error,
         "enrichment_question": enrichment_question,
+        "asl": asl,
+        "asl_graph_dot": asl_graph_dot,
+        "asl_validations": asl_validations,
+        "asl_error": asl_error,
     }
     if enrichment_question is not None:
         locked["enrichment_pending"] = {
@@ -187,6 +238,10 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
         workflow_spec=workflow_spec,
         enrichment_error=enrichment_error,
         enrichment_question=enrichment_question,
+        asl=asl,
+        asl_graph_dot=asl_graph_dot,
+        asl_validations=asl_validations,
+        asl_error=asl_error,
     )
 
 
@@ -194,6 +249,7 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
     """Resumes an enrichment conversation paused on a clarifying
     question (see approve_plan). Reuses the persisted resolved_plan/
     remaining_placeholders -- only the enrichment outcome changes.
+    When enrichment completes, Stage 4 ASL generation runs as well.
     """
     session = get_session_or_raise(session_id)
     locked = session.locked_spec or {}
@@ -205,12 +261,17 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
     workflow_spec: dict | None = None
     enrichment_error: str | None = None
     enrichment_question: str | None = None
+    asl: dict | None = None
+    asl_graph_dot: str | None = None
+    asl_validations: dict | None = None
+    asl_error: str | None = None
     try:
         result = continue_enrichment(
             plan, pending["messages"], answer, pending["clarification_rounds"]
         )
         if result.status == "complete":
             workflow_spec = result.spec
+            asl, asl_graph_dot, asl_validations, asl_error = _run_asl_stage(workflow_spec)
         else:
             enrichment_question = result.question
     except EnrichmentError as exc:
@@ -219,6 +280,10 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
     locked["workflow_spec"] = workflow_spec
     locked["enrichment_error"] = enrichment_error
     locked["enrichment_question"] = enrichment_question
+    locked["asl"] = asl
+    locked["asl_graph_dot"] = asl_graph_dot
+    locked["asl_validations"] = asl_validations
+    locked["asl_error"] = asl_error
     if enrichment_question is not None:
         locked["enrichment_pending"] = {
             "messages": result.messages,
@@ -235,4 +300,103 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
         workflow_spec=workflow_spec,
         enrichment_error=enrichment_error,
         enrichment_question=enrichment_question,
+        asl=asl,
+        asl_graph_dot=asl_graph_dot,
+        asl_validations=asl_validations,
+        asl_error=asl_error,
     )
+
+
+def generate_asl_for_session(session_id: str) -> AslValidateResponse:
+    """Re-run Stage 4 from the locked workflow_spec (e.g. after a
+    manual edit of the spec on the client, or to refresh validations).
+    """
+    session = get_session_or_raise(session_id)
+    locked = session.locked_spec or {}
+    spec = locked.get("workflow_spec")
+    if not spec:
+        raise NoWorkflowSpecError(
+            "No workflow_spec locked for this session — approve a plan first."
+        )
+
+    asl, graph_dot, validations, error = _run_asl_stage(spec)
+    if error:
+        # Still persist whatever we can; validations may be partial.
+        locked["asl"] = asl
+        locked["asl_graph_dot"] = graph_dot
+        locked["asl_validations"] = validations
+        locked["asl_error"] = error
+        session_store.set_locked_spec(session_id, locked)
+        return AslValidateResponse(
+            asl=asl,
+            validations=validations
+            or {
+                "ok": False,
+                "errors": [{"group": "generation", "code": "error", "message": error}],
+            },
+            graph_dot=graph_dot,
+        )
+
+    locked["asl"] = asl
+    locked["asl_graph_dot"] = graph_dot
+    locked["asl_validations"] = validations
+    locked["asl_error"] = None
+    session_store.set_locked_spec(session_id, locked)
+    return AslValidateResponse(asl=asl, validations=validations or {}, graph_dot=graph_dot)
+
+
+def revalidate_asl_payload(
+    session_id: str | None, asl: dict | None
+) -> AslValidateResponse:
+    """Validate a client-supplied ASL (or the session's stored ASL)
+    against the locked workflow_spec when available.
+    """
+    spec: dict | None = None
+    stored_asl: dict | None = None
+    if session_id:
+        session = get_session_or_raise(session_id)
+        locked = session.locked_spec or {}
+        spec = locked.get("workflow_spec")
+        stored_asl = locked.get("asl")
+
+    target = asl if asl is not None else stored_asl
+    if target is None:
+        raise NoWorkflowSpecError("No ASL provided and none stored on the session.")
+
+    graph_dot = render_asl_graph(target) if isinstance(target, dict) else ""
+    report = validate_asl(target, spec=spec, graph_dot=graph_dot)
+    return AslValidateResponse(
+        asl=target if isinstance(target, dict) else None,
+        validations=report.to_dict(),
+        graph_dot=graph_dot or None,
+    )
+
+
+class NoAslError(Exception):
+    """Download/fetch requested but no ASL is stored on the session."""
+
+
+def get_asl_for_download(session_id: str) -> tuple[dict, str]:
+    """Return the locked ASL definition and a suggested download filename.
+
+    Raises SessionNotFoundError or NoAslError.
+    """
+    session = get_session_or_raise(session_id)
+    locked = session.locked_spec or {}
+    asl = locked.get("asl")
+    if not isinstance(asl, dict) or not asl:
+        raise NoAslError(
+            "No ASL definition stored for this session — approve a plan "
+            "(and complete enrichment) first."
+        )
+
+    name = "workflow"
+    comment = asl.get("Comment")
+    if isinstance(comment, str) and comment.strip():
+        # Comment is often "name: summary" from the generator
+        name = comment.split(":")[0].strip() or name
+    # Keep filename filesystem-safe
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name).strip("._")
+    filename = f"{safe or 'workflow'}.asl.json"
+    return asl, filename
+

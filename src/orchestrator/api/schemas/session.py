@@ -48,6 +48,11 @@ class ApproveResponse(BaseModel):
     # Set when enrichment paused to ask the user something -- answer
     # via POST /session/{id}/enrichment/answer.
     enrichment_question: str | None = None
+    # Stage 4 — populated only when workflow_spec is complete.
+    asl: dict | None = None
+    asl_graph_dot: str | None = None
+    asl_validations: dict | None = None
+    asl_error: str | None = None
 
 
 class EnrichmentAnswerRequest(BaseModel):
@@ -56,6 +61,18 @@ class EnrichmentAnswerRequest(BaseModel):
 
 class RejectRequest(BaseModel):
     feedback: str = Field(..., min_length=1, description="What should change about the plan.")
+
+
+class AslValidateRequest(BaseModel):
+    """Optional body for re-validating a client-supplied or stored ASL."""
+
+    asl: dict | None = None
+
+
+class AslValidateResponse(BaseModel):
+    asl: dict | None = None
+    validations: dict
+    graph_dot: str | None = None
 
 
 class SessionStateResponse(BaseModel):

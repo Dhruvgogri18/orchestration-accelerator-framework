@@ -1191,15 +1191,29 @@ def create_welcome_message(chat_id):
             "(summary + diagram + placeholders). You can approve the plan or "
             f"request changes. ({mode}.)\n\n"
             "I only help design Step Functions workflows — not general questions. "
-            "ASL generation and deploy are not available until those APIs exist."
+            "After you approve a plan, enrichment produces a workflow spec, then "
+            "ASL is generated, validated (including live AWS validation when "
+            "credentials are configured), and shown as a console-style graph."
         ),
     )
 
 
 def set_active_chat(chat_id, focus: bool = True) -> None:
     """Switch the open chat and persist it in the URL so a browser refresh
-    stays on the same conversation instead of opening a new draft."""
+    stays on the same conversation instead of opening a new draft.
+
+    Does not clear other chats' in-flight work — pending prompts stay
+    queued and resume when the user returns to that chat.
+    """
+    prev = st.session_state.get("active_chat_id")
     st.session_state.active_chat_id = chat_id
+    # Force the next paint to treat the thread as a new widget tree so
+    # Streamlit does not reuse elements (and visible content) from the
+    # chat we just left.
+    if prev != chat_id:
+        st.session_state["_thread_nonce"] = (
+            st.session_state.get("_thread_nonce", 0) + 1
+        )
     if focus:
         st.session_state.focus_chat_input = True
     try:
@@ -1534,10 +1548,12 @@ def render_typing_indicator(label: str = "Thinking…"):
 
 
 def typing_label_for_chat(chat_id) -> str:
-    """Short, context-aware label while the backend works."""
-    if st.session_state.get("pending_approve"):
+    """Short, context-aware label while the backend works for THIS chat only."""
+    pending_approve = st.session_state.get("pending_approve")
+    if pending_approve and pending_approve.get("chat_id") == chat_id:
         return "Approving…"
-    if st.session_state.get("pending_enrichment"):
+    pending_enrichment = st.session_state.get("pending_enrichment")
+    if pending_enrichment and pending_enrichment.get("chat_id") == chat_id:
         return "Enriching…"
     chat = get_chat(chat_id)
     stage = (chat or {}).get("stage")
@@ -1731,14 +1747,19 @@ def render_plan_review(message_id, artifact, chat_id):
         st.markdown(artifact["summary"])
 
     placeholders = artifact.get("placeholders") or []
+    # Deduplicate while preserving order — duplicate tokens would collide on key=.
+    seen_tokens: list[str] = []
+    for token in placeholders:
+        if token and token not in seen_tokens:
+            seen_tokens.append(token)
     overrides = {}
-    if placeholders:
+    if seen_tokens:
         st.markdown("**Placeholders (optional overrides before approve)**")
-        for token in placeholders:
+        for idx, token in enumerate(seen_tokens):
             overrides[token] = st.text_input(
                 token,
                 value="",
-                key=f"ph_{message_id}_{token}",
+                key=f"ph_{chat_id}_{message_id}_{idx}_{token}",
                 placeholder=f"Value for {token}",
                 disabled=not controls_enabled,
             )
@@ -1783,9 +1804,16 @@ def render_plan_review(message_id, artifact, chat_id):
             disabled=not controls_enabled,
         ):
             clean = {k: v.strip() for k, v in overrides.items() if v and v.strip()}
-            # Show the user's action in the chat, then Approving… indicator.
-            add_message(chat_id, "user", "Approve plan")
-            # Queue approve so a double-click cannot fire twice.
+            # Show the user bubble immediately (once). process_pending_approve
+            # must NOT add_message again or the action appears twice.
+            if clean:
+                lines = ["Approve plan", ""] + [
+                    f"{k} = {v}" for k, v in clean.items()
+                ]
+                user_text = "\n".join(lines)
+            else:
+                user_text = "Approve plan"
+            add_message(chat_id, "user", user_text)
             st.session_state.pending_approve = {
                 "chat_id": chat_id,
                 "session_id": session_id,
@@ -1858,6 +1886,9 @@ def render_enrichment_question(message_id, artifact, chat_id, controls_enabled: 
         if not (answer or "").strip():
             st.warning("Enter an answer first.")
         else:
+            # Show the answer in chat immediately; process_pending_enrichment
+            # must not add_message again.
+            add_message(chat_id, "user", answer.strip())
             st.session_state.pending_enrichment = {
                 "chat_id": chat_id,
                 "session_id": session_id,
@@ -1867,6 +1898,10 @@ def render_enrichment_question(message_id, artifact, chat_id, controls_enabled: 
 
 
 def render_spec_approved(message_id, artifact, chat_id):
+    """Approved plan card: enrichment pause UI, then ASL graph + definition.
+
+    workflow_spec and validation reports stay backend-only — not shown here.
+    """
     st.success("Plan approved and locked on the server.")
     remaining = artifact.get("remaining_placeholders") or artifact.get("placeholders") or []
     if remaining:
@@ -1876,11 +1911,11 @@ def render_spec_approved(message_id, artifact, chat_id):
 
     enrichment_question = artifact.get("enrichment_question")
     enrichment_error = artifact.get("enrichment_error")
-    workflow_spec = artifact.get("workflow_spec")
+    asl = artifact.get("asl") or artifact.get("asl_json")
+    asl_error = artifact.get("asl_error")
     session_id = artifact.get("session_id") or artifact.get("run_id")
     busy = is_chat_busy(chat_id)
 
-    # Only the latest approved card is interactive for enrichment answers.
     is_active = message_id == _latest_spec_approved_message_id(chat_id)
     controls_enabled = is_active and not busy and bool(session_id)
 
@@ -1889,22 +1924,89 @@ def render_spec_approved(message_id, artifact, chat_id):
         render_enrichment_question(message_id, artifact, chat_id, controls_enabled)
         if busy:
             st.caption("Working on your answer… actions are paused until it finishes.")
-        st.info("ASL generation and deploy will appear here when those APIs are available.")
+        st.info("ASL will be generated automatically once enrichment completes.")
         return
 
     if enrichment_error:
         st.error(f"Enrichment failed: {enrichment_error}")
         st.caption(
-            "The plan is still locked. You can continue from this approved plan "
-            "once enrichment is fixed; ASL generation is not available yet."
+            "The plan is still locked. Fix enrichment (or re-approve) before ASL "
+            "can be generated."
         )
-    elif workflow_spec:
-        with st.expander("Workflow spec", expanded=True):
-            st.json(workflow_spec)
-    # Plan JSON is internal (used for enrichment/ASL) — not shown in the UI.
+        return
 
-    # ASL generation / deploy reserved for later API stages.
-    st.info("ASL generation and deploy will appear here when those APIs are available.")
+    if asl_error:
+        st.error(f"ASL generation error: {asl_error}")
+
+    # --- ASL graph (console-style) ---
+    dot = artifact.get("graph_dot")
+    if asl and not dot:
+        try:
+            from workflow import build_graphviz_dot
+
+            dot = build_graphviz_dot(asl)
+        except Exception:
+            dot = None
+
+    if dot:
+        with st.expander("ASL graph", expanded=True):
+            try:
+                st.graphviz_chart(dot)
+            except Exception as exc:
+                st.warning(f"Could not render graph: {exc}")
+                st.code(dot, language="dot")
+    elif asl:
+        st.caption("ASL is present but no graph DOT was returned.")
+
+    # --- ASL JSON (downloadable definition from backend) ---
+    if asl:
+        with st.expander("ASL definition (JSON)", expanded=False):
+            st.json(asl)
+            # Download bytes come from GET /session/{id}/asl/download on the
+            # API — not from serializing the in-memory UI artifact.
+            if not session_id:
+                st.caption("No session id — cannot download from backend.")
+            elif not is_active:
+                st.caption("Only the latest approved plan can download ASL.")
+            else:
+                from workflow import USE_MOCK, api_download_asl, OrchestrationApiError
+
+                if USE_MOCK:
+                    # Mock path has no HTTP API; fall back to local bytes.
+                    name = "workflow"
+                    if isinstance(asl, dict) and asl.get("Comment"):
+                        name = str(asl["Comment"]).split(":")[0].strip() or name
+                    st.download_button(
+                        "Download ASL JSON",
+                        data=json.dumps(asl, indent=2),
+                        file_name=f"{name}.asl.json",
+                        mime="application/json",
+                        key=f"download_asl_{message_id}",
+                    )
+                else:
+                    cache_key = f"asl_download_{session_id}"
+                    cached = st.session_state.get(cache_key)
+                    if cached is None:
+                        try:
+                            content, filename = api_download_asl(session_id)
+                            st.session_state[cache_key] = (content, filename)
+                            cached = (content, filename)
+                        except OrchestrationApiError as exc:
+                            st.warning(f"Could not fetch ASL from backend: {exc}")
+                            cached = None
+                    if cached is not None:
+                        content, filename = cached
+                        st.download_button(
+                            "Download ASL JSON",
+                            data=content,
+                            file_name=filename,
+                            mime="application/json",
+                            key=f"download_asl_{message_id}",
+                        )
+    else:
+        st.info("ASL not generated yet.")
+
+
 
 
 def render_out_of_scope(artifact):
@@ -1934,6 +2036,62 @@ def render_artifact(message_id, artifact, chat_id):
         st.json(artifact)
 
 
+def render_chat_thread(chat_id, *, simplify: bool = False) -> None:
+    """Paint only this chat's messages.
+
+    ``simplify=True`` (used while an API call is in flight) renders plain
+    text bubbles only — no plan diagrams / ASL graphs — so heavy widgets
+    from another chat cannot linger in the element tree.
+    """
+    for message in get_messages(chat_id):
+        mid = message.get("id")
+        # Unique marker so Streamlit cannot reconcile this block with a
+        # message from a different chat at the same list index.
+        st.markdown(
+            f'<div data-msg="{chat_id}-{mid}" style="display:none"></div>',
+            unsafe_allow_html=True,
+        )
+        if message["role"] == "user":
+            render_user_message(message["content"])
+            continue
+
+        artifact = message.get("artifact")
+        stage = (artifact or {}).get("stage") if artifact else None
+
+        if simplify:
+            # Plain text only while waiting — avoids graphviz/expanders.
+            text = message.get("content") or ""
+            if stage == "clarifying" and artifact:
+                render_clarifying(artifact)
+            elif text:
+                render_assistant_message(text)
+            continue
+
+        if stage == "clarifying":
+            render_artifact(mid, artifact, chat_id)
+            continue
+        if stage == "out_of_scope":
+            render_assistant_message(message["content"])
+            continue
+        if stage not in ("plan_review", "spec_approved", "failed"):
+            render_assistant_message(message["content"])
+            if artifact:
+                st.markdown(
+                    '<div class="assistant-response">', unsafe_allow_html=True
+                )
+                render_artifact(mid, artifact, chat_id)
+                st.markdown("</div>", unsafe_allow_html=True)
+            continue
+
+        st.markdown('<div class="assistant-response">', unsafe_allow_html=True)
+        render_assistant_block_start()
+        if artifact:
+            render_artifact(mid, artifact, chat_id)
+        else:
+            st.markdown(message["content"])
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
 def queue_user_prompt(active_chat_id, user_prompt):
     # Only block if THIS chat already has a request in flight. Other chats
     # remain fully independent sessions.
@@ -1960,8 +2118,27 @@ def queue_user_prompt(active_chat_id, user_prompt):
     st.rerun()
 
 
+def _clear_reconcile_cache(chat_id) -> None:
+    for key in list(st.session_state.keys()):
+        if isinstance(key, str) and key.startswith(f"reconciled_{chat_id}_"):
+            st.session_state.pop(key, None)
+
+
+def _finish_in_flight(chat_id) -> None:
+    """Persist cleared busy state. Rerun only if the user is still on this chat
+    so a mid-request sidebar switch does not paint the wrong thread."""
+    clear_in_flight(chat_id)
+    _clear_reconcile_cache(chat_id)
+    if st.session_state.get("active_chat_id") == chat_id:
+        st.rerun()
+
+
 def process_pending_approve(region, env):
-    """Run a queued approve exactly once (guards double-submit)."""
+    """Run a queued approve exactly once (guards double-submit).
+
+    The user bubble was already written when the button was clicked —
+    do not add_message again here.
+    """
     _ = region, env
     pending = st.session_state.get("pending_approve")
     if not pending:
@@ -1971,30 +2148,24 @@ def process_pending_approve(region, env):
     session_id = pending["session_id"]
     overrides = pending.get("overrides") or {}
 
-    if overrides:
-        lines = ["Approve plan", ""] + [f"{k} = {v}" for k, v in overrides.items()]
-        user_text = "\n".join(lines)
-    else:
-        user_text = "Approve plan"
-    add_message(chat_id, "user", user_text)
-
     try:
         # Spinner forces Streamlit to flush the typing row above; chrome is CSS-hidden.
         with st.spinner("Approving…"):
             result = approve_plan(session_id, overrides=overrides)
+        # ASL may have changed — drop any cached download bytes for this session.
+        st.session_state.pop(f"asl_download_{session_id}", None)
         apply_run_result(chat_id, result)
-        # Force a fresh reconcile next time this session is viewed.
-        for key in list(st.session_state.keys()):
-            if isinstance(key, str) and key.startswith(f"reconciled_{chat_id}_"):
-                st.session_state.pop(key, None)
-        clear_in_flight(chat_id)
-        st.rerun()
+        _finish_in_flight(chat_id)
     except OrchestrationApiError as exc:
         fail_in_flight(f"Could not approve the plan. {exc}", chat_id=chat_id)
 
 
 def process_pending_enrichment(region, env):
-    """Run a queued enrichment answer exactly once (guards double-submit)."""
+    """Run a queued enrichment answer exactly once (guards double-submit).
+
+    The user bubble was already written when Submit was clicked —
+    do not add_message again here.
+    """
     _ = region, env
     pending = st.session_state.get("pending_enrichment")
     if not pending:
@@ -2004,19 +2175,15 @@ def process_pending_enrichment(region, env):
     session_id = pending["session_id"]
     answer = pending.get("answer") or ""
 
-    add_message(chat_id, "user", answer)
-
     try:
         with st.spinner("Enriching…"):
             result = answer_enrichment(session_id, answer)
+        st.session_state.pop(f"asl_download_{session_id}", None)
         apply_run_result(chat_id, result)
-        for key in list(st.session_state.keys()):
-            if isinstance(key, str) and key.startswith(f"reconciled_{chat_id}_"):
-                st.session_state.pop(key, None)
-        clear_in_flight(chat_id)
-        st.rerun()
+        _finish_in_flight(chat_id)
     except OrchestrationApiError as exc:
         fail_in_flight(f"Could not answer enrichment. {exc}", chat_id=chat_id)
+
 
 
 def process_user_prompt(active_chat_id, user_prompt, region, env):
@@ -2033,13 +2200,7 @@ def process_user_prompt(active_chat_id, user_prompt, region, env):
             with st.spinner("Updating the plan…"):
                 result = reject_plan(session_id, user_prompt, region=region, env=env)
             apply_run_result(active_chat_id, result)
-            for key in list(st.session_state.keys()):
-                if isinstance(key, str) and key.startswith(
-                    f"reconciled_{active_chat_id}_"
-                ):
-                    st.session_state.pop(key, None)
-            clear_in_flight(active_chat_id)
-            st.rerun()
+            _finish_in_flight(active_chat_id)
             return
         except OrchestrationApiError as exc:
             fail_in_flight(
@@ -2057,11 +2218,7 @@ def process_user_prompt(active_chat_id, user_prompt, region, env):
                 env=env,
             )
         apply_run_result(active_chat_id, result)
-        for key in list(st.session_state.keys()):
-            if isinstance(key, str) and key.startswith(f"reconciled_{active_chat_id}_"):
-                st.session_state.pop(key, None)
-        clear_in_flight(active_chat_id)
-        st.rerun()
+        _finish_in_flight(active_chat_id)
     except OrchestrationApiError as exc:
         fail_in_flight(
             "Could not reach the orchestration API. "
@@ -2223,10 +2380,8 @@ if not get_chat(active_chat_id):
     ensure_active_chat()
     active_chat_id = st.session_state.active_chat_id
 
-# Align local stage with backend session (refresh / resume safety).
-# Skip only while THIS chat is mid-request so we don't race the in-flight call.
-if not is_chat_busy(active_chat_id):
-    reconcile_chat_with_api(active_chat_id)
+region = st.session_state.get("aws_region", "ap-south-1")
+env = st.session_state.get("deploy_env", "dev")
 
 st.title("Workflow Assistant")
 st.caption("Chat → clarify → plan review → approve / reject")
@@ -2238,52 +2393,64 @@ if st.session_state.get("api_unreachable") and not USE_MOCK:
         f"storage; approve / send will fail until the API is back. ({detail})"
     )
 
+# Single replaceable slot for the whole thread. st.empty() discards the
+# previous run's elements so switching chats cannot leave another chat's
+# last bubble on screen.
+_thread_slot = st.empty()
+_typing_slot = st.empty()
+_examples_slot = st.empty()
+
+_busy_now = is_chat_busy(active_chat_id)
+
+if _busy_now:
+    # In-flight: plain bubbles only + typing, then run the API. Never paint
+    # the full interactive thread in the same run (avoids duplicate widget keys).
+    with _thread_slot.container():
+        render_chat_thread(active_chat_id, simplify=True)
+    with _typing_slot.container():
+        render_typing_indicator(typing_label_for_chat(active_chat_id))
+
+    pending_approve = st.session_state.get("pending_approve")
+    if pending_approve and pending_approve.get("chat_id") == active_chat_id:
+        process_pending_approve(region=region, env=env)
+
+    pending_enrichment = st.session_state.get("pending_enrichment")
+    if pending_enrichment and pending_enrichment.get("chat_id") == active_chat_id:
+        process_pending_enrichment(region=region, env=env)
+
+    pending_prompts = _pending_prompts()
+    if active_chat_id in pending_prompts:
+        process_user_prompt(
+            active_chat_id,
+            pending_prompts[active_chat_id],
+            region=region,
+            env=env,
+        )
+
+    # Processors call st.rerun() on success. If we are still here, either the
+    # request is still marked busy or the user switched away — stop so we do
+    # not double-render the interactive thread in this same run.
+    try:
+        st.chat_input("Please wait…", disabled=True)
+    except TypeError:
+        st.chat_input("Please wait…")
+    st.stop()
+
+# Idle path — full thread once, examples, input.
+_typing_slot.empty()
+
+if not is_chat_busy(active_chat_id):
+    reconcile_chat_with_api(active_chat_id)
+
+with _thread_slot.container():
+    render_chat_thread(active_chat_id, simplify=False)
+
 messages = get_messages(active_chat_id)
-# Any user message (typed or from clicking an example) means the empty-state
-# example chips should not be shown again in this chat.
 has_user = any(m["role"] == "user" for m in messages)
-busy_early = is_chat_busy(active_chat_id)
-
-for message in messages:
-    if message["role"] == "user":
-        render_user_message(message["content"])
-    else:
-        artifact = message.get("artifact")
-        stage = (artifact or {}).get("stage") if artifact else None
-
-        # Clarifying / out-of-scope: single left-side chat-style reply.
-        if stage == "clarifying":
-            render_artifact(message["id"], artifact, active_chat_id)
-            continue
-        if stage == "out_of_scope":
-            render_assistant_message(message["content"])
-            continue
-
-        # Plain assistant text (welcome, generic) — chat bubble.
-        if stage not in ("plan_review", "spec_approved", "failed"):
-            render_assistant_message(message["content"])
-            if artifact:
-                st.markdown('<div class="assistant-response">', unsafe_allow_html=True)
-                render_artifact(message["id"], artifact, active_chat_id)
-                st.markdown("</div>", unsafe_allow_html=True)
-            continue
-
-        # Richer stages: labeled assistant block (plan / approve / error).
-        st.markdown('<div class="assistant-response">', unsafe_allow_html=True)
-        render_assistant_block_start()
-        if artifact:
-            render_artifact(message["id"], artifact, active_chat_id)
-        else:
-            st.markdown(message["content"])
-        st.markdown("</div>", unsafe_allow_html=True)
-
-# Example chips: after messages, BEFORE typing + process_user_prompt.
-# Must run before the spinner so Streamlit clears prior-run buttons and they
-# never sit under "Thinking…". Hide once the user has sent anything.
 _examples_dismissed = st.session_state.get(f"examples_dismissed_{active_chat_id}", False)
-_examples_box = st.empty()
-if not has_user and not busy_early and not _examples_dismissed:
-    with _examples_box.container():
+
+if not has_user and not _examples_dismissed:
+    with _examples_slot.container():
         st.markdown("##### Try an example")
         for i, example in enumerate(EXAMPLE_PROMPTS):
             if st.button(
@@ -2293,48 +2460,16 @@ if not has_user and not busy_early and not _examples_dismissed:
             ):
                 queue_user_prompt(active_chat_id, example)
 else:
-    _examples_box.empty()
+    _examples_slot.empty()
 
-region = st.session_state.get("aws_region", "ap-south-1")
-env = st.session_state.get("deploy_env", "dev")
-
-# Show API/request errors without leaving the typing indicator stuck on screen.
 last_error = st.session_state.pop("last_request_error", None)
 if last_error:
     st.error(last_error)
 
-# Chat-native typing row (above the hidden spinner that flushes the UI).
-# Only for the chat that actually has work in flight.
-if is_chat_busy(active_chat_id):
-    render_typing_indicator(typing_label_for_chat(active_chat_id))
-
-# Process approve for the open chat (or any queued approve tied to it).
-pending_approve = st.session_state.get("pending_approve")
-if pending_approve and pending_approve.get("chat_id") == active_chat_id:
-    process_pending_approve(region=region, env=env)
-
-# Process enrichment answer for the open chat.
-pending_enrichment = st.session_state.get("pending_enrichment")
-if pending_enrichment and pending_enrichment.get("chat_id") == active_chat_id:
-    process_pending_enrichment(region=region, env=env)
-
-# Process this chat's queued prompt only — other chats keep their own queue
-# and run when the user switches back to them.
-pending_prompts = _pending_prompts()
-if active_chat_id in pending_prompts:
-    process_user_prompt(
-        active_chat_id,
-        pending_prompts[active_chat_id],
-        region=region,
-        env=env,
-    )
-
 busy = is_chat_busy(active_chat_id)
-
 chat_placeholder = (
     "Please wait…" if busy else "Describe a workflow, or answer the question…"
 )
-# disabled= may not exist on older Streamlit; fall back gracefully.
 try:
     user_prompt = st.chat_input(chat_placeholder, disabled=busy)
 except TypeError:

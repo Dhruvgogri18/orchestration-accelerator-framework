@@ -7,11 +7,16 @@ service function, map domain errors to HTTP, return the response.
 
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 
 from orchestrator.api.schemas.session import (
     ApproveRequest,
     ApproveResponse,
+    AslValidateRequest,
+    AslValidateResponse,
     EnrichmentAnswerRequest,
     MessageRequest,
     MessageResponse,
@@ -85,6 +90,9 @@ def approve_plan(session_id: str, request: ApproveRequest) -> ApproveResponse:
     can't approve mid-clarification. Substitutes any TODO_ overrides
     the caller provided; anything not covered is left unresolved on
     purpose rather than blocking approval.
+
+    When enrichment completes, Stage 4 ASL generation + validation +
+    graph rendering runs automatically and is returned on the response.
     """
     try:
         return session_service.approve_plan(session_id, request.overrides)
@@ -95,10 +103,13 @@ def approve_plan(session_id: str, request: ApproveRequest) -> ApproveResponse:
 
 
 @router.post("/{session_id}/enrichment/answer", response_model=ApproveResponse)
-def answer_enrichment_question(session_id: str, request: EnrichmentAnswerRequest) -> ApproveResponse:
+def answer_enrichment_question(
+    session_id: str, request: EnrichmentAnswerRequest
+) -> ApproveResponse:
     """Answers a clarifying question enrichment asked during /approve
     (see ApproveResponse.enrichment_question). May itself return
     another enrichment_question if further clarification is needed.
+    On success, Stage 4 ASL is generated as well.
     """
     try:
         return session_service.answer_enrichment_question(session_id, request.answer)
@@ -106,3 +117,58 @@ def answer_enrichment_question(session_id: str, request: EnrichmentAnswerRequest
         raise HTTPException(status_code=404, detail="Unknown session_id") from None
     except session_service.NoEnrichmentQuestionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.post("/{session_id}/asl/generate", response_model=AslValidateResponse)
+def generate_asl(session_id: str) -> AslValidateResponse:
+    """Re-run Stage 4 from the locked workflow_spec (refresh ASL,
+    validations, and console-style graph).
+    """
+    try:
+        return session_service.generate_asl_for_session(session_id)
+    except session_service.SessionNotFoundError:
+        raise HTTPException(status_code=404, detail="Unknown session_id") from None
+    except session_service.NoWorkflowSpecError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.post("/{session_id}/asl/validate", response_model=AslValidateResponse)
+def validate_asl_endpoint(
+    session_id: str, request: AslValidateRequest
+) -> AslValidateResponse:
+    """Validate ASL (body.asl or the session's stored ASL) against the
+    locked workflow_spec when present. Runs all five validation groups.
+    """
+    try:
+        return session_service.revalidate_asl_payload(session_id, request.asl)
+    except session_service.SessionNotFoundError:
+        raise HTTPException(status_code=404, detail="Unknown session_id") from None
+    except session_service.NoWorkflowSpecError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.get("/{session_id}/asl/download")
+def download_asl(session_id: str) -> Response:
+    """Download the session's stored ASL definition as a JSON file.
+
+    Serves the locked ASL from the backend (not a client-side dump of
+    whatever the UI last rendered). Returns application/json with
+    Content-Disposition: attachment.
+    """
+    try:
+        asl, filename = session_service.get_asl_for_download(session_id)
+    except session_service.SessionNotFoundError:
+        raise HTTPException(status_code=404, detail="Unknown session_id") from None
+    except session_service.NoAslError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+
+    body = json.dumps(asl, indent=2, ensure_ascii=False).encode("utf-8")
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(body)),
+        },
+    )
+

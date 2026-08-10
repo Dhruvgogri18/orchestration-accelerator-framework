@@ -30,7 +30,7 @@ property across the whole document -- every plan step id appears
 EXACTLY ONCE somewhere in the full structure -- not a positional
 top-level list match.
 
-Five independent validation checks guard the repair loop, run in
+Six independent validation checks guard the repair loop, run in
 order (cheapest first):
 
   1. Schema validation     -- structurally valid per workflow_spec.schema.json
@@ -60,7 +60,11 @@ order (cheapest first):
                                something -- proves the addition is a
                                minimal, necessary terminal, not a
                                loophole for inventing business logic.
-  5. ARN whitelist check    -- any `resource` claiming to be a Step
+  5. No unjustified nesting -- Parallel/Map rejected unless the plan text
+                               clearly signals concurrency or iteration.
+                               Stops enrichment inventing nesting on
+                               linear plans.
+  6. ARN whitelist check    -- any `resource` claiming to be a Step
                                Functions optimized integration, ANYWHERE
                                in the document including nested
                                branches/iterators, must EXACTLY match a
@@ -414,6 +418,69 @@ def _check_addition_validity(plan: Plan, spec: dict) -> str | None:
     return None
 
 
+# Keywords that justify inventing Parallel / Map. Without at least one
+# of these somewhere in the plan text, those types are treated as
+# unnecessary structural invention and rejected by the repair loop.
+_PARALLEL_HINTS = (
+    "parallel",
+    "concurrent",
+    "simultaneously",
+    "at the same time",
+    "in parallel",
+    "concurrently",
+)
+_MAP_HINTS = (
+    "for each",
+    "for every",
+    "map over",
+    "iterate over",
+    "each item",
+    "each element",
+    "over a list",
+    "over the list",
+    "for all",
+)
+
+
+def _plan_text_blob(plan: Plan) -> str:
+    parts = [plan.summary or ""]
+    for s in plan.steps:
+        parts.append(s.description or "")
+        parts.append(s.service or "")
+        for b in s.branches or []:
+            parts.append(b.condition or "")
+    return " ".join(parts).lower()
+
+
+def _check_no_unjustified_nesting(plan: Plan, spec: dict) -> str | None:
+    """Reject Parallel/Map unless the plan text clearly signals concurrency
+    or iteration. Stops enrichment from inventing nesting to 'improve'
+    a linear plan.
+    """
+    blob = _plan_text_blob(plan)
+    allows_parallel = any(h in blob for h in _PARALLEL_HINTS)
+    allows_map = any(h in blob for h in _MAP_HINTS)
+
+    for step in _iter_all_steps(spec.get("steps")):
+        stype = step.get("type")
+        sid = step.get("id", "?")
+        if stype == "Parallel" and not allows_parallel:
+            return (
+                f"Step '{sid}' has type Parallel, but the plan does not "
+                f"clearly describe concurrency (e.g. 'in parallel', "
+                f"'simultaneously'). Prefer sequential Task/Choice steps. "
+                f"Only use Parallel when the plan explicitly requires it."
+            )
+        if stype == "Map" and not allows_map:
+            return (
+                f"Step '{sid}' has type Map, but the plan does not clearly "
+                f"describe iteration over a collection (e.g. 'for each', "
+                f"'map over a list'). Prefer sequential steps. Only use Map "
+                f"when the plan explicitly requires it."
+            )
+    return None
+
+
 def _check_arn_whitelist(spec: dict) -> str | None:
     """Returns an error message if any Task step's `resource`, ANYWHERE
     in the document (including nested inside Parallel branches / Map
@@ -447,15 +514,21 @@ def _check_arn_whitelist(spec: dict) -> str | None:
 
 
 def _run_all_checks(plan: Plan, spec: dict) -> str | None:
-    """Runs all five checks in order, cheapest first, returns the first
+    """Runs structural checks in order, cheapest first. Returns the first
     failure found (or None if all pass).
     """
-    checks_needing_plan = (_check_fidelity, _check_merge_validity, _check_addition_validity)
+    checks_needing_plan = (
+        _check_fidelity,
+        _check_merge_validity,
+        _check_addition_validity,
+        _check_no_unjustified_nesting,
+    )
     for check in (
         _check_schema,
         _check_fidelity,
         _check_merge_validity,
         _check_addition_validity,
+        _check_no_unjustified_nesting,
         _check_arn_whitelist,
     ):
         error = check(plan, spec) if check in checks_needing_plan else check(spec)

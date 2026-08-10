@@ -170,8 +170,28 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
         parts.append("")
         parts.append("Enrichment did not return a workflow_spec.")
 
-    parts.append("")
-    parts.append("ASL generation and deploy are not available from the API yet.")
+    # Stage 4 ASL
+    art["asl"] = data.get("asl")
+    art["asl_json"] = data.get("asl")
+    art["graph_dot"] = data.get("asl_graph_dot") or art.get("graph_dot")
+    art["validations"] = data.get("asl_validations") or art.get("validations")
+    if data.get("asl_error"):
+        parts.append("")
+        parts.append(f"ASL generation error: {data['asl_error']}")
+    elif data.get("asl"):
+        parts.append("")
+        vals = data.get("asl_validations") or {}
+        if vals.get("ok"):
+            parts.append("ASL generated and **all validations passed**.")
+        else:
+            errs = vals.get("errors") or []
+            parts.append(f"ASL generated with **{len(errs)} validation issue(s)**.")
+            for e in errs[:5]:
+                parts.append(f"- [{e.get('group')}/{e.get('code')}] {e.get('message')}")
+    else:
+        parts.append("")
+        parts.append("ASL not generated yet (waiting on enrichment).")
+
     art["assistant_text"] = "\n".join(parts)
     return art
 
@@ -228,6 +248,66 @@ def api_get_session(session_id: str) -> dict:
     return _request("GET", f"/session/{session_id}")
 
 
+def api_generate_asl(session_id: str) -> dict:
+    """POST /session/{id}/asl/generate — refresh ASL from locked workflow_spec."""
+    return _request("POST", f"/session/{session_id}/asl/generate")
+
+
+def api_validate_asl(session_id: str, asl: dict | None = None) -> dict:
+    """POST /session/{id}/asl/validate — run all five validation groups (+ AWS)."""
+    return _request(
+        "POST",
+        f"/session/{session_id}/asl/validate",
+        {"asl": asl},
+    )
+
+
+def api_download_asl(session_id: str) -> tuple[bytes, str]:
+    """GET /session/{id}/asl/download — fetch ASL JSON bytes from the backend.
+
+    Returns (content_bytes, filename). Raises OrchestrationApiError on failure.
+    """
+    url = f"{API_BASE_URL}/session/{session_id}/asl/download"
+    try:
+        response = requests.get(url, timeout=API_TIMEOUT)
+    except requests.RequestException as exc:
+        raise OrchestrationApiError(f"Could not reach API at {url}: {exc}") from exc
+
+    if not response.ok:
+        try:
+            detail = response.json().get("detail", response.text)
+        except ValueError:
+            detail = response.text
+        raise OrchestrationApiError(
+            f"API GET /session/{session_id}/asl/download failed "
+            f"({response.status_code}): {detail}"
+        )
+
+    filename = "workflow.asl.json"
+    cd = response.headers.get("Content-Disposition") or ""
+    # attachment; filename="foo.asl.json"
+    if "filename=" in cd:
+        part = cd.split("filename=", 1)[1].strip().strip('"').strip("'")
+        if part:
+            filename = part
+    return response.content, filename
+
+
+
+def _apply_asl_payload_to_artifact(art: dict, data: dict) -> dict:
+    """Merge generate/validate API payload into a UI artifact."""
+    if not isinstance(data, dict):
+        return art
+    if data.get("asl") is not None:
+        art["asl"] = data["asl"]
+        art["asl_json"] = data["asl"]
+    if data.get("graph_dot"):
+        art["graph_dot"] = data["graph_dot"]
+    if data.get("validations"):
+        art["validations"] = data["validations"]
+    return art
+
+
 # ---------------------------------------------------------------------------
 # Public functions used by app.py
 # ---------------------------------------------------------------------------
@@ -274,24 +354,89 @@ def reject_plan(
     return api_reject_plan(run_id, feedback)
 
 
+def _mock_approved_artifact(run_id: str, text: str) -> dict:
+    """Mock Stage 3.5+4 response with a minimal ASL + validations."""
+    asl = {
+        "Comment": "mock-approved: Validate → Process → Notify",
+        "StartAt": "Validate",
+        "States": {
+            "Validate": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Next": "Process",
+            },
+            "Process": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Next": "Notify",
+            },
+            "Notify": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "End": True,
+            },
+        },
+    }
+    return {
+        **_empty_artifact(run_id, "spec_approved", text),
+        "workflow_spec": {
+            "name": "mock-approved",
+            "summary": "Validate, process, notify",
+            "start_at": "Validate",
+            "steps": [
+                {
+                    "id": "Validate",
+                    "type": "Task",
+                    "service": "Lambda",
+                    "resource": "arn:aws:states:::lambda:invoke",
+                    "next_step": "Process",
+                },
+                {
+                    "id": "Process",
+                    "type": "Task",
+                    "service": "Glue",
+                    "resource": "arn:aws:states:::glue:startJobRun.sync",
+                    "next_step": "Notify",
+                },
+                {
+                    "id": "Notify",
+                    "type": "Task",
+                    "service": "SNS",
+                    "resource": "arn:aws:states:::sns:publish",
+                    "end": True,
+                },
+            ],
+        },
+        "asl": asl,
+        "asl_json": asl,
+        "graph_dot": build_graphviz_dot(asl),
+        "validations": {
+            "ok": True,
+            "json_ok": True,
+            "structure_ok": True,
+            "reachability_ok": True,
+            "spec_consistency_ok": True,
+            "aws_constraints_ok": True,
+            "extras_ok": True,
+            "aws_validate_ok": None,
+            "errors": [],
+            "aws_details": {
+                "attempted": False,
+                "skipped": True,
+                "reason": "mock mode",
+            },
+        },
+        "remaining_placeholders": [],
+        "enrichment_error": None,
+        "enrichment_question": None,
+        "asl_error": None,
+    }
+
+
 def approve_plan(run_id: str, overrides: dict[str, str] | None = None) -> dict:
     if USE_MOCK:
         _mock_pause()
-        # Mock: jump to a simple "approved" artifact (no ASL API).
-        return {
-            **_empty_artifact(run_id, "spec_approved", "Mock plan approved."),
-            "workflow_spec": {
-                "name": "mock-approved",
-                "steps": [
-                    {"id": "Validate", "type": "Task", "service": "Lambda"},
-                    {"id": "Process", "type": "Task", "service": "Glue"},
-                    {"id": "Notify", "type": "Task", "service": "SNS"},
-                ],
-            },
-            "remaining_placeholders": [],
-            "enrichment_error": None,
-            "enrichment_question": None,
-        }
+        return _mock_approved_artifact(run_id, "Mock plan approved.")
     return api_approve_plan(run_id, overrides or {})
 
 
@@ -299,21 +444,20 @@ def answer_enrichment(run_id: str, answer: str) -> dict:
     """Resume Stage 3.5 enrichment after a clarifying question."""
     if USE_MOCK:
         _mock_pause()
-        return {
-            **_empty_artifact(run_id, "spec_approved", "Mock enrichment answered."),
-            "workflow_spec": {
-                "name": "mock-approved",
-                "steps": [
-                    {"id": "Validate", "type": "Task", "service": "Lambda"},
-                    {"id": "Process", "type": "Task", "service": "Glue"},
-                    {"id": "Notify", "type": "Task", "service": "SNS"},
-                ],
-            },
-            "remaining_placeholders": [],
-            "enrichment_error": None,
-            "enrichment_question": None,
-        }
+        return _mock_approved_artifact(run_id, "Mock enrichment answered.")
     return api_answer_enrichment(run_id, answer)
+
+
+def generate_asl(run_id: str) -> dict:
+    """Re-run Stage 4 from the locked workflow_spec."""
+    if USE_MOCK:
+        art = _mock_approved_artifact(run_id, "Mock ASL regenerated.")
+        return {
+            "asl": art["asl"],
+            "validations": art["validations"],
+            "graph_dot": art["graph_dot"],
+        }
+    return api_generate_asl(run_id)
 
 
 # Back-compat names (old mock UI). Prefer approve_plan / reject_plan.
@@ -328,8 +472,28 @@ def approve_and_deploy(*args, **kwargs) -> dict:
     )
 
 
-def revalidate_asl(asl: Any) -> dict:
-    raise OrchestrationApiError("ASL validation API is not available yet.")
+def revalidate_asl(asl: Any, session_id: str | None = None) -> dict:
+    """POST /session/{id}/asl/validate — runs all five validation groups (+ AWS)."""
+    if USE_MOCK:
+        return {
+            "asl": asl,
+            "validations": {
+                "ok": True,
+                "json_ok": True,
+                "structure_ok": True,
+                "reachability_ok": True,
+                "spec_consistency_ok": True,
+                "aws_constraints_ok": True,
+                "extras_ok": True,
+                "aws_validate_ok": None,
+                "errors": [],
+                "aws_details": {"attempted": False, "skipped": True, "reason": "mock"},
+            },
+            "graph_dot": build_graphviz_dot(asl) if isinstance(asl, dict) else None,
+        }
+    if not session_id:
+        raise OrchestrationApiError("session_id required for ASL validation")
+    return api_validate_asl(session_id, asl if isinstance(asl, dict) else None)
 
 
 def build_graphviz_dot(asl_definition: dict) -> str:

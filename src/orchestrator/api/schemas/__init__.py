@@ -4,6 +4,8 @@ from orchestrator.api.schemas.common import ExtractionResult, Plan, PlanStep
 from orchestrator.api.schemas.session import (
     ApproveRequest,
     ApproveResponse,
+    AslValidateRequest,
+    AslValidateResponse,
     MessageRequest,
     MessageResponse,
     RejectRequest,
@@ -20,6 +22,8 @@ __all__ = [
     "MessageResponse",
     "ApproveRequest",
     "ApproveResponse",
+    "AslValidateRequest",
+    "AslValidateResponse",
     "RejectRequest",
     "SessionStateResponse",
 ]
