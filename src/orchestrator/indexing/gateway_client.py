@@ -17,10 +17,24 @@ import os
 from functools import lru_cache
 
 from dotenv import load_dotenv
+from langsmith import traceable
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 load_dotenv()
+
+try:
+    from orchestrator.api.services.llm_trace import log_llm_call, log_llm_response
+except ImportError:  # pragma: no cover
+    def log_llm_call(**kwargs):
+        return __import__("time").perf_counter()
+
+    def log_llm_response(**kwargs):
+        return None
+
+# Default seed for more reproducible completions when the provider supports it.
+# Override with GATEWAY_SEED in .env. Pass seed=None to omit the parameter.
+DEFAULT_SEED = int(os.environ.get("GATEWAY_SEED", "42"))
 
 
 def _require_env(name: str) -> str:
@@ -41,25 +55,63 @@ def get_client() -> OpenAI:
     return OpenAI(api_key=api_key, base_url=base_url)
 
 
+@traceable(name="chat_completion", run_type="llm")
 @retry(wait=wait_exponential(multiplier=1, min=1, max=20), stop=stop_after_attempt(4))
-def chat_completion(messages: list[dict], **kwargs) -> str:
+def chat_completion(
+    messages: list[dict],
+    *,
+    temperature: float = 0,
+    seed: int | None = DEFAULT_SEED,
+    **kwargs,
+) -> str:
     """Send a chat completion request to the gateway and return the text.
 
     `messages` follows the standard OpenAI chat format:
         [{"role": "system"|"user"|"assistant", "content": "..."}]
 
-    Extra kwargs (temperature, max_tokens, etc.) are passed straight
-    through to the underlying `chat.completions.create` call.
+    Determinism knobs:
+      - temperature defaults to 0
+      - seed defaults to GATEWAY_SEED (env) or 42
+      - pass seed=None to omit the seed field (if the gateway rejects it)
+
+    Extra kwargs (max_tokens, etc.) are passed through to
+    `chat.completions.create`. `model` always comes from GATEWAY_CHAT_MODEL.
 
     Confirmed working against GATEWAY_CHAT_MODEL=codex/gpt-5.6-sol.
     Retries up to 4 times with exponential backoff on transient failures
     (network errors, rate limits, etc.) — see tenacity docs if you need
     to narrow this to specific exception types.
+
+    LangSmith: when LANGSMITH_TRACING=true and LANGSMITH_API_KEY are set,
+    each call is logged as a run (prompt in / completion out).
     """
     chat_model = _require_env("GATEWAY_CHAT_MODEL")
     client = get_client()
-    response = client.chat.completions.create(model=chat_model, messages=messages, **kwargs)
-    return response.choices[0].message.content or ""
+
+    create_kwargs: dict = {
+        "model": chat_model,
+        "messages": messages,
+        "temperature": temperature,
+        **kwargs,
+    }
+    if seed is not None:
+        create_kwargs["seed"] = int(seed)
+
+    t0 = log_llm_call(
+        messages=messages,
+        model=chat_model,
+        temperature=temperature,
+        seed=seed,
+        extra={k: v for k, v in kwargs.items() if k != "messages"},
+    )
+    try:
+        response = client.chat.completions.create(**create_kwargs)
+        content = response.choices[0].message.content or ""
+        log_llm_response(t0=t0, content=content, model=chat_model)
+        return content
+    except Exception as exc:
+        log_llm_response(t0=t0, content=None, model=chat_model, error=str(exc))
+        raise
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:

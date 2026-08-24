@@ -1,0 +1,1 @@
+"""Pipeline analysis (extraction) and session orchestration."""

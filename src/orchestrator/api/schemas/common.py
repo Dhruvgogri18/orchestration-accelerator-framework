@@ -80,6 +80,15 @@ class ExtractionResult(BaseModel):
     # Required when status is out_of_scope -- polite refusal explaining
     # this product only designs AWS Step Functions workflows.
     message: str | None = Field(default=None, validate_default=True)
+    # Populated only on the ready path when produced via
+    # pipeline_analysis_service.analyze_pipeline() -- the full,
+    # paper-aligned Stage 1 artifact (see schemas/pipeline_analysis.py:
+    # PipelineAnalysis.model_dump()). Typed as dict rather than
+    # PipelineAnalysis here to avoid a schemas/common <-> schemas/
+    # pipeline_analysis import cycle (pipeline_analysis.py imports
+    # PlanBranch from this module). None for the legacy single-call
+    # extract_turn()/extract_turn_v2() paths, which never populate it.
+    analysis: dict | None = Field(default=None)
 
     @field_validator("plan")
     @classmethod
@@ -105,3 +114,68 @@ class ExtractionResult(BaseModel):
                 "message is required when status is 'out_of_scope'"
             )
         return v
+
+
+# ---------------------------------------------------------------------------
+# Split extraction pipeline (Stage 1-2 determinism pass #1).
+#
+# Three narrow shapes, one per split extraction stage (see
+# extraction_service.py: classify_scope / decompose_steps /
+# wire_control_flow). Each stage's LLM call must match exactly ONE of
+# these -- same "prompt instructs it, Pydantic enforces it" pattern as
+# ExtractionResult above. extract_turn_v2() chains all three and
+# returns a normal ExtractionResult, so callers don't need to know the
+# pipeline is split internally.
+# ---------------------------------------------------------------------------
+
+
+class ScopeResult(BaseModel):
+    """Stage A: is the latest message in-domain at all? Nothing else."""
+
+    status: Literal["in_scope", "out_of_scope"]
+    message: str | None = Field(default=None, validate_default=True)
+
+    @field_validator("message")
+    @classmethod
+    def message_required_when_out_of_scope(cls, v, info):
+        if info.data.get("status") == "out_of_scope" and not v:
+            raise ValueError("message is required when status is 'out_of_scope'")
+        return v
+
+
+class DraftStep(BaseModel):
+    """Stage B output: id/service/description only -- no wiring yet."""
+
+    id: str = Field(..., description="Short unique identifier, e.g. 'ValidateFile'.")
+    service: str
+    description: str
+
+
+class StepDecompositionResult(BaseModel):
+    """Stage B: break the request into steps, or ask ONE structural question."""
+
+    status: Literal["ready", "needs_clarification"]
+    steps: list[DraftStep] | None = Field(default=None, validate_default=True)
+    clarifying_question: str | None = Field(default=None, validate_default=True)
+
+    @field_validator("steps")
+    @classmethod
+    def steps_required_when_ready(cls, v, info):
+        if info.data.get("status") == "ready" and not v:
+            raise ValueError("steps is required when status is 'ready'")
+        return v
+
+    @field_validator("clarifying_question")
+    @classmethod
+    def question_required_when_clarifying(cls, v, info):
+        if info.data.get("status") == "needs_clarification" and not v:
+            raise ValueError(
+                "clarifying_question is required when status is 'needs_clarification'"
+            )
+        return v
+
+
+# Stage C (wiring) reuses Plan directly -- it must echo the same step ids
+# from Stage B plus add next/on_failure/on_timeout/branches. No new model
+# needed; extraction_service._check_ids_preserved() enforces the "same
+# ids, same order, nothing invented/dropped" contract Plan alone can't.

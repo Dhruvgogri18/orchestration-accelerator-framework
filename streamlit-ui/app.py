@@ -1,8 +1,10 @@
 import json
 import re
+import threading
 
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 from database import (
     add_message,
@@ -18,10 +20,17 @@ from database import (
 from workflow import (
     USE_MOCK,
     OrchestrationApiError,
+    PreDeployCheckFailed,
     answer_enrichment,
     api_get_session,
+    api_get_status,
     approve_plan,
+    create_session,
+    deploy_workflow,
+    fill_spec_placeholders,
+    generate_asl,
     reject_plan,
+    revalidate_asl,
     send_message,
 )
 
@@ -817,6 +826,80 @@ div[data-testid="stSpinner"] {
   display: none !important;
 }
 
+/* Stage progress — auto-advancing checklist shown instead of a plain
+   "Thinking…" spinner while a backend request is in flight. Same bubble
+   shape as an assistant message so it reads as part of the conversation. */
+.stage-progress-row {
+  display: flex;
+  justify-content: flex-start;
+  align-items: flex-start;
+  gap: 0.65rem;
+  margin: 0.6rem 0 1.25rem;
+  max-width: 86%;
+}
+.stage-progress-bubble {
+  flex: 1;
+  min-width: 0;
+  padding: 0.8rem 1rem;
+  border-radius: 4px 18px 18px 18px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+}
+.stage-progress-header {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 0.55rem;
+  letter-spacing: 0.01em;
+}
+.stage-progress-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+.stage-item {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-size: 0.88rem;
+  line-height: 1.3;
+  color: var(--text-muted);
+}
+.stage-item .stage-icon {
+  width: 1.05rem;
+  height: 1.05rem;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+}
+.stage-item.done {
+  color: var(--bubble-text);
+}
+.stage-item.done .stage-icon {
+  color: #16a34a;
+}
+.stage-item.active {
+  color: var(--bubble-text);
+  font-weight: 600;
+}
+.stage-item .stage-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: var(--border);
+  display: block;
+}
+.stage-item.active .stage-dot {
+  background: var(--brand);
+  animation: stage-pulse 1.1s ease-in-out infinite;
+}
+@keyframes stage-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
+
 /* ===== Compact chat history rows ===== */
 
 /* Zero out Streamlit’s default vertical gap inside the history scroller */
@@ -1278,6 +1361,14 @@ def is_draft_chat(chat_id):
 
 
 def get_active_session_id(chat_id):
+    # Freshly created session, not yet persisted to chat["run_id"] (that
+    # only happens once the full response comes back) — see
+    # process_user_prompt(), which stashes it here immediately so the
+    # live-status checklist has something to poll from the very first
+    # message of a new chat, not just from the second message onward.
+    hints = st.session_state.get("_pending_session_ids")
+    if isinstance(hints, dict) and hints.get(chat_id):
+        return hints[chat_id]
     chat = get_chat(chat_id)
     if chat and chat.get("run_id"):
         return chat["run_id"]
@@ -1287,6 +1378,20 @@ def get_active_session_id(chat_id):
         if sid:
             return sid
     return None
+
+
+def _remember_session_id(chat_id, session_id) -> None:
+    """Session-state hint so get_active_session_id() finds a just-created
+    session immediately. Without this, a brand-new chat's first message has
+    no session_id to poll GET /status with until the whole request
+    finishes, so the stage checklist has nothing to advance on and sits on
+    step one the entire time.
+    """
+    hints = st.session_state.get("_pending_session_ids")
+    if not isinstance(hints, dict):
+        hints = {}
+    hints[chat_id] = session_id
+    st.session_state._pending_session_ids = hints
 
 
 def create_new_chat():
@@ -1547,6 +1652,172 @@ def render_typing_indicator(label: str = "Thinking…"):
     )
 
 
+# ---------------------------------------------------------------------------
+# Stage progress — auto-advancing checklist of real backend steps
+# ---------------------------------------------------------------------------
+#
+# Ordered (stage_key, display_label) pairs, one list per kind of in-flight
+# request. stage_key must match the `stage` string the API reports via
+# GET /session/{id}/status (see api/services/llm_trace.py's llm_stage()
+# calls, invoked from pipeline_analysis_service.py / enrichment_service.py /
+# session_service.py). The list itself is defined here rather than fetched
+# from the API so it renders immediately and doesn't jump around — only the
+# *current position* moves, driven by the polled stage value.
+_EXTRACTION_STEPS: list[tuple[str, str]] = [
+    ("pipeline_analysis_env_and_clauses", "Reading through what you described"),
+    ("component_identification", "Identifying the workflow's components"),
+    ("flow_structure_analysis", "Working out the control flow"),
+    ("pipeline_analysis_params_and_integrations", "Extracting parameters & checking integrations"),
+]
+
+_APPROVE_STEPS: list[tuple[str, str]] = [
+    ("enrichment", "Filling in the remaining details"),
+    ("asl_generation", "Generating the Step Functions definition"),
+]
+
+_STAGE_CHECK_ICON = (
+    '<svg class="stage-icon" viewBox="0 0 20 20" fill="none" '
+    'xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
+    '<path d="M4 10.5l3.5 3.5L16 6" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+)
+_STAGE_DOT_ICON = '<span class="stage-icon"><span class="stage-dot"></span></span>'
+
+
+def _stage_steps_for_chat(chat_id) -> list[tuple[str, str]]:
+    """Which step checklist applies to whatever request is in flight for
+    this chat: approve / answer-enrichment share one (enrichment -> ASL),
+    everything else (send message / reject) is the extraction pipeline.
+    """
+    pending_approve = st.session_state.get("pending_approve")
+    if pending_approve and pending_approve.get("chat_id") == chat_id:
+        return _APPROVE_STEPS
+    pending_enrichment = st.session_state.get("pending_enrichment")
+    if pending_enrichment and pending_enrichment.get("chat_id") == chat_id:
+        return _APPROVE_STEPS
+    return _EXTRACTION_STEPS
+
+
+def render_stage_progress(chat_id, session_id, fallback_label: str = "Working…"):
+    """Checklist that auto-advances as the backend moves through real
+    pipeline stages, replacing a plain "Thinking…" spinner. Position comes
+    from polling GET /session/{id}/status; if the reported stage isn't one
+    we recognize yet (request just started, or a stage name the list
+    doesn't know about) the first not-yet-reached step just stays active
+    instead of the display breaking or looking stuck on nothing.
+    """
+    steps = _stage_steps_for_chat(chat_id)
+    current_stage = None
+    if session_id and not USE_MOCK:
+        status = api_get_status(session_id)
+        if status.get("busy"):
+            current_stage = status.get("stage")
+
+    keys = [key for key, _ in steps]
+    current_idx = keys.index(current_stage) if current_stage in keys else 0
+
+    rows = []
+    for i, (_, label) in enumerate(steps):
+        if i < current_idx:
+            state, icon = "done", _STAGE_CHECK_ICON
+        elif i == current_idx:
+            state, icon = "active", _STAGE_DOT_ICON
+        else:
+            state, icon = "pending", _STAGE_DOT_ICON
+        rows.append(
+            f'<div class="stage-item {state}">{icon}<span>{_escape_html(label)}</span></div>'
+        )
+
+    st.markdown(
+        (
+            '<div class="stage-progress-row">'
+            f'<div class="chat-avatar assistant-avatar">{_ASSISTANT_ICON}</div>'
+            '<div class="stage-progress-bubble">'
+            f'<div class="stage-progress-header">{_escape_html(fallback_label)}</div>'
+            f'<div class="stage-progress-list">{"".join(rows)}</div>'
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _bg_jobs() -> dict:
+    """Per-session registry of in-flight background API calls, keyed by
+    chat_id. Lets the polling fragment below tell whether a job is still
+    running without touching the network itself.
+    """
+    jobs = st.session_state.get("_bg_jobs")
+    if not isinstance(jobs, dict):
+        jobs = {}
+        st.session_state._bg_jobs = jobs
+    return jobs
+
+
+def run_with_live_status(chat_id, work_fn):
+    """Run a blocking orchestration-API call on a background thread so the
+    main script isn't stuck inside `with st.spinner(...): result = work_fn()`
+    for the whole duration — that pattern is why the UI could only ever show
+    a static "Thinking…" the entire time. With the call moved to a thread,
+    the main script returns immediately and `render_live_status` (below)
+    can keep polling GET /session/{id}/status and repainting the label
+    while the real work happens.
+
+    First call for a given chat_id starts the thread and returns
+    ("running", None, None). Call again (the polling fragment triggers a
+    rerun that re-enters this same call site) once the thread finishes to
+    get ("done", result, None) or ("error", None, exception) — returned
+    exactly once, then the job is cleared.
+    """
+    jobs = _bg_jobs()
+    job = jobs.get(chat_id)
+
+    if job is None:
+        state = {"status": "running", "result": None, "error": None}
+
+        def _runner():
+            try:
+                state["result"] = work_fn()
+                state["status"] = "done"
+            except Exception as exc:  # noqa: BLE001 -- surfaced to the UI below, not swallowed
+                state["error"] = exc
+                state["status"] = "error"
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        add_script_run_ctx(thread)  # lets the thread touch st.* safely if it ever needs to
+        thread.start()
+        jobs[chat_id] = state
+        return "running", None, None
+
+    if job["status"] == "running":
+        return "running", None, None
+
+    jobs.pop(chat_id, None)
+    if job["status"] == "error":
+        return "error", None, job["error"]
+    return "done", job["result"], None
+
+
+@st.fragment(run_every=1)
+def render_live_status(chat_id, session_id, fallback_label="Thinking…"):
+    """Polls /session/{id}/status roughly once a second and shows the
+    real backend stage ("Working out the control flow…", "Generating
+    the Step Functions definition…") instead of a static spinner. Only
+    this fragment re-executes on the timer -- the rest of the page (and
+    the blocking API call running in its background thread) is untouched.
+
+    Once the background job finishes, triggers one full-page rerun so
+    the normal (non-fragment) code path picks up the result and renders
+    it exactly as it did before this change.
+    """
+    job = _bg_jobs().get(chat_id)
+    if job is not None and job["status"] != "running":
+        st.rerun()
+        return
+
+    render_stage_progress(chat_id, session_id, fallback_label=fallback_label)
+
+
 def typing_label_for_chat(chat_id) -> str:
     """Short, context-aware label while the backend works for THIS chat only."""
     pending_approve = st.session_state.get("pending_approve")
@@ -1555,6 +1826,18 @@ def typing_label_for_chat(chat_id) -> str:
     pending_enrichment = st.session_state.get("pending_enrichment")
     if pending_enrichment and pending_enrichment.get("chat_id") == chat_id:
         return "Enriching…"
+    pending_fill = st.session_state.get("pending_fill_placeholders")
+    if pending_fill and pending_fill.get("chat_id") == chat_id:
+        return "Applying placeholders…"
+    pending_gen = st.session_state.get("pending_generate_asl")
+    if pending_gen and pending_gen.get("chat_id") == chat_id:
+        return "Generating ASL…"
+    pending_reval = st.session_state.get("pending_revalidate_asl")
+    if pending_reval and pending_reval.get("chat_id") == chat_id:
+        return "Validating ASL…"
+    pending_deploy = st.session_state.get("pending_deploy")
+    if pending_deploy and pending_deploy.get("chat_id") == chat_id:
+        return "Deploying to AWS…"
     chat = get_chat(chat_id)
     stage = (chat or {}).get("stage")
     if stage == "plan_review":
@@ -1585,17 +1868,22 @@ def _pending_prompts() -> dict:
 
 
 def is_chat_busy(chat_id) -> bool:
-    """True while a message, approve, enrichment, or reject is in flight for this chat only."""
+    """True while a message, approve, enrichment, ASL, or deploy is in flight for this chat only."""
     if chat_id is None:
         return False
     if chat_id in _pending_prompts():
         return True
-    pending_approve = st.session_state.get("pending_approve")
-    if pending_approve and pending_approve.get("chat_id") == chat_id:
-        return True
-    pending_enrichment = st.session_state.get("pending_enrichment")
-    if pending_enrichment and pending_enrichment.get("chat_id") == chat_id:
-        return True
+    for key in (
+        "pending_approve",
+        "pending_enrichment",
+        "pending_fill_placeholders",
+        "pending_generate_asl",
+        "pending_revalidate_asl",
+        "pending_deploy",
+    ):
+        pending = st.session_state.get(key)
+        if pending and pending.get("chat_id") == chat_id:
+            return True
     return False
 
 
@@ -1605,15 +1893,31 @@ def is_ui_busy() -> bool:
         return True
     if st.session_state.get("pending_approve"):
         return True
-    return bool(st.session_state.get("pending_enrichment"))
+    if st.session_state.get("pending_enrichment"):
+        return True
+    if st.session_state.get("pending_fill_placeholders"):
+        return True
+    if st.session_state.get("pending_generate_asl"):
+        return True
+    if st.session_state.get("pending_revalidate_asl"):
+        return True
+    return bool(st.session_state.get("pending_deploy"))
 
 
 def clear_in_flight(chat_id=None):
     """Clear in-flight state. If chat_id is given, only clear that chat."""
+    pending_keys = (
+        "pending_approve",
+        "pending_enrichment",
+        "pending_fill_placeholders",
+        "pending_generate_asl",
+        "pending_revalidate_asl",
+        "pending_deploy",
+    )
     if chat_id is None:
         st.session_state.pending_prompts = {}
-        st.session_state.pending_approve = None
-        st.session_state.pending_enrichment = None
+        for k in pending_keys:
+            st.session_state[k] = None
         # Legacy keys (older runs / partial upgrades)
         st.session_state.pending_prompt = None
         st.session_state.pending_chat_id = None
@@ -1622,12 +1926,10 @@ def clear_in_flight(chat_id=None):
     prompts = _pending_prompts()
     prompts.pop(chat_id, None)
     st.session_state.pending_prompts = prompts
-    pending_approve = st.session_state.get("pending_approve")
-    if pending_approve and pending_approve.get("chat_id") == chat_id:
-        st.session_state.pending_approve = None
-    pending_enrichment = st.session_state.get("pending_enrichment")
-    if pending_enrichment and pending_enrichment.get("chat_id") == chat_id:
-        st.session_state.pending_enrichment = None
+    for k in pending_keys:
+        pending = st.session_state.get(k)
+        if pending and pending.get("chat_id") == chat_id:
+            st.session_state[k] = None
     if st.session_state.get("pending_chat_id") == chat_id:
         st.session_state.pending_prompt = None
         st.session_state.pending_chat_id = None
@@ -1768,7 +2070,18 @@ def render_plan_review(message_id, artifact, chat_id):
     with st.expander("Diagram", expanded=True):
         dot = artifact.get("graph_dot")
         if dot:
-            st.graphviz_chart(dot)
+            head = (dot or "").lstrip()[:32].lower()
+            if head.startswith("flowchart") or head.startswith("statediagram"):
+                try:
+                    import streamlit_mermaid as stmd
+                    stmd.st_mermaid(dot, height=520)
+                except Exception:
+                    st.markdown(f"```mermaid\n{dot}\n```")
+            else:
+                try:
+                    st.graphviz_chart(dot)
+                except Exception:
+                    st.code(dot)
         else:
             st.info(
                 "No diagram was returned for this plan. "
@@ -1839,6 +2152,33 @@ def render_plan_review(message_id, artifact, chat_id):
                 queue_user_prompt(chat_id, feedback.strip())
 
 
+def _find_todo_placeholders_in_value(node, seen=None) -> list[str]:
+    """Walk any JSON-like value and collect unique TODO_[A-Z0-9_]+ tokens.
+
+    Plan-level remaining_placeholders only cover extraction/plan text.
+    Enrichment + ASL generation often introduce additional tokens
+    (e.g. TODO_UNKNOWN_INTEGRATION_ARN, TableName TODOs) that only
+    exist inside the ASL document — deploy pre-checks scan the ASL,
+    so the fill form must too.
+    """
+    import re
+
+    if seen is None:
+        seen = []
+    pattern = re.compile(r"\bTODO_[A-Z0-9_]+\b")
+    if isinstance(node, str):
+        for match in pattern.findall(node):
+            if match not in seen:
+                seen.append(match)
+    elif isinstance(node, dict):
+        for v in node.values():
+            _find_todo_placeholders_in_value(v, seen)
+    elif isinstance(node, (list, tuple)):
+        for v in node:
+            _find_todo_placeholders_in_value(v, seen)
+    return seen
+
+
 def _latest_spec_approved_message_id(chat_id):
     """Return the message id of the newest spec_approved artifact in this chat."""
     messages = get_messages(chat_id)
@@ -1898,16 +2238,13 @@ def render_enrichment_question(message_id, artifact, chat_id, controls_enabled: 
 
 
 def render_spec_approved(message_id, artifact, chat_id):
-    """Approved plan card: enrichment pause UI, then ASL graph + definition.
+    """Approved plan card: enrichment pause UI, then ASL graph + definition + deploy.
 
-    workflow_spec and validation reports stay backend-only — not shown here.
+    workflow_spec stays backend-only — not shown here. Validation summary,
+    regenerate/revalidate, and Stage 5 deploy controls are interactive on the
+    latest approved message only.
     """
     st.success("Plan approved and locked on the server.")
-    remaining = artifact.get("remaining_placeholders") or artifact.get("placeholders") or []
-    if remaining:
-        st.warning("Unresolved placeholders:")
-        for p in remaining:
-            st.markdown(f"- `{p}`")
 
     enrichment_question = artifact.get("enrichment_question")
     enrichment_error = artifact.get("enrichment_error")
@@ -1918,6 +2255,93 @@ def render_spec_approved(message_id, artifact, chat_id):
 
     is_active = message_id == _latest_spec_approved_message_id(chat_id)
     controls_enabled = is_active and not busy and bool(session_id)
+
+    # Prefer API-reported spec_placeholders (workflow_spec TODOs). Fall back
+    # to plan remaining + ASL/validation scans so older messages still work.
+    remaining: list[str] = []
+    for token in list(artifact.get("spec_placeholders") or []):
+        if token and token not in remaining:
+            remaining.append(token)
+    if not remaining:
+        for token in (
+            list(artifact.get("remaining_placeholders") or [])
+            + list(artifact.get("placeholders") or [])
+        ):
+            if token and token not in remaining:
+                remaining.append(token)
+        if asl:
+            for token in _find_todo_placeholders_in_value(asl):
+                if token not in remaining:
+                    remaining.append(token)
+        vals = artifact.get("validations") or {}
+        for token in vals.get("unresolved_placeholders") or []:
+            if token and token not in remaining:
+                remaining.append(token)
+
+    # --- Fill remaining placeholders (re-approve with overrides → new ASL) ---
+    # Deploy pre-checks reject leftover TODO_ tokens. Users can supply values
+    # here after the first approve; we call POST /approve again so enrichment
+    # + Stage 4 re-run with a fully resolved plan.
+    if remaining and is_active:
+        st.warning(
+            f"**{len(remaining)} unresolved placeholder(s)** must be filled "
+            "before deploy will pass pre-checks."
+        )
+        with st.expander("Fill placeholders", expanded=True):
+            st.caption(
+                "Provide concrete values (resource names, ARNs, bucket keys, etc.). "
+                "Applying them re-runs enrichment and regenerates ASL."
+            )
+            ph_overrides: dict[str, str] = {}
+            for idx, token in enumerate(remaining):
+                ph_overrides[token] = st.text_input(
+                    token,
+                    value="",
+                    key=f"post_ph_{chat_id}_{message_id}_{idx}_{token}",
+                    placeholder=f"Value for {token}",
+                    disabled=not controls_enabled,
+                )
+            filled = {
+                k: v.strip() for k, v in ph_overrides.items() if v and v.strip()
+            }
+            missing = [t for t in remaining if t not in filled]
+            if missing:
+                st.caption(
+                    f"{len(missing)} still empty — fill all tokens, then apply."
+                )
+            apply_label = (
+                "Apply placeholders & regenerate ASL"
+                if filled
+                else "Apply placeholders & regenerate ASL"
+            )
+            if st.button(
+                apply_label,
+                key=f"apply_placeholders_{message_id}",
+                type="primary",
+                use_container_width=True,
+                disabled=not controls_enabled or not filled,
+            ):
+                if missing:
+                    st.warning(
+                        "Some placeholders are still empty: "
+                        + ", ".join(f"`{t}`" for t in missing)
+                        + ". You can apply a partial set, but deploy will keep "
+                        "blocking until every TODO_ is gone."
+                    )
+                lines = ["Apply placeholders"] + [
+                    f"{k} = {v}" for k, v in filled.items()
+                ]
+                add_message(chat_id, "user", "\n".join(lines))
+                st.session_state.pending_fill_placeholders = {
+                    "chat_id": chat_id,
+                    "session_id": session_id,
+                    "overrides": filled,
+                }
+                st.rerun()
+    elif remaining and not is_active:
+        st.warning("Unresolved placeholders (read-only on older cards):")
+        for p in remaining:
+            st.markdown(f"- `{p}`")
 
     # --- Enrichment question section (Stage 3.5 pause) ---
     if enrichment_question:
@@ -1937,6 +2361,28 @@ def render_spec_approved(message_id, artifact, chat_id):
 
     if asl_error:
         st.error(f"ASL generation error: {asl_error}")
+
+    # --- Validation summary ---
+    vals = artifact.get("validations") or {}
+    if vals:
+        ok = vals.get("ok")
+        errs = vals.get("errors") or []
+        if ok is True:
+            st.success("ASL validations passed.")
+        elif ok is False:
+            st.warning(f"ASL has {len(errs)} validation issue(s).")
+            for e in errs[:8]:
+                if isinstance(e, dict):
+                    st.markdown(
+                        f"- `[{e.get('group')}/{e.get('code')}]` {e.get('message')}"
+                    )
+                else:
+                    st.markdown(f"- {e}")
+        aws = vals.get("aws_details") or {}
+        if aws.get("skipped"):
+            st.caption(f"AWS ValidateStateMachine skipped: {aws.get('reason') or 'n/a'}")
+        elif aws.get("attempted") and vals.get("aws_validate_ok") is False:
+            st.caption("AWS ValidateStateMachine reported issues (see errors above).")
 
     # --- ASL graph (console-style) ---
     dot = artifact.get("graph_dot")
@@ -2006,7 +2452,229 @@ def render_spec_approved(message_id, artifact, chat_id):
     else:
         st.info("ASL not generated yet.")
 
+    # --- ASL review: Approve / Reject (not regenerate/revalidate) ---
+    asl_approved_key = f"asl_approved_{session_id}" if session_id else None
+    asl_approved = bool(
+        (asl_approved_key and st.session_state.get(asl_approved_key))
+        or artifact.get("asl_approved")
+        or (
+            isinstance(artifact.get("deployment"), dict)
+            and artifact["deployment"].get("state_machine_arn")
+        )
+    )
+    deploy_prompt_key = f"deploy_prompt_{session_id}" if session_id else None
+    show_deploy_form = bool(
+        deploy_prompt_key and st.session_state.get(deploy_prompt_key)
+    )
 
+    # Cannot review ASL until placeholders are cleared and ASL exists.
+    can_review_asl = bool(asl) and not remaining and not enrichment_question
+
+    if is_active and session_id and can_review_asl and not asl_approved:
+        st.markdown("#### Review ASL")
+        st.caption(
+            "Approve if this definition looks right. Reject to request changes "
+            "(sends feedback and rebuilds the plan)."
+        )
+        reject_fb = st.text_area(
+            "Reject feedback (optional unless you reject)",
+            key=f"asl_reject_fb_{message_id}",
+            placeholder="What should change in the ASL / workflow?",
+            height=70,
+            disabled=not controls_enabled,
+        )
+        c_ok, c_no = st.columns(2)
+        with c_ok:
+            st.markdown(
+                '<div class="approve-btn-marker plan-actions-marker"></div>',
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                "Approve ASL",
+                key=f"approve_asl_{message_id}",
+                type="primary",
+                use_container_width=True,
+                disabled=not controls_enabled,
+            ):
+                add_message(chat_id, "user", "Approve ASL")
+                st.session_state[asl_approved_key] = True
+                st.session_state[deploy_prompt_key] = True
+                # Record a lightweight assistant turn so the thread shows the decision.
+                apply_run_result(
+                    chat_id,
+                    {
+                        "session_id": session_id,
+                        "run_id": session_id,
+                        "stage": "spec_approved",
+                        "assistant_text": (
+                            "ASL **approved**. Do you want to deploy this workflow "
+                            "to AWS Step Functions?"
+                        ),
+                        "asl": asl,
+                        "asl_json": asl,
+                        "graph_dot": artifact.get("graph_dot"),
+                        "validations": artifact.get("validations") or {},
+                        "spec_placeholders": [],
+                        "remaining_placeholders": [],
+                        "placeholders": [],
+                        "asl_approved": True,
+                        "ask_deploy": True,
+                    },
+                )
+                st.rerun()
+        with c_no:
+            st.markdown(
+                '<div class="reject-btn-marker plan-actions-marker"></div>',
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                "Reject ASL",
+                key=f"reject_asl_{message_id}",
+                type="secondary",
+                use_container_width=True,
+                disabled=not controls_enabled,
+            ):
+                fb = (reject_fb or "").strip()
+                if not fb:
+                    st.warning("Enter feedback describing what to change, then Reject ASL.")
+                else:
+                    if asl_approved_key:
+                        st.session_state.pop(asl_approved_key, None)
+                    if deploy_prompt_key:
+                        st.session_state.pop(deploy_prompt_key, None)
+                    queue_user_prompt(chat_id, fb)
+
+        if busy:
+            st.caption("Working… actions are paused until the current request finishes.")
+
+    elif is_active and session_id and remaining and asl:
+        st.info(
+            "Fill all placeholders above and apply them before you can approve this ASL."
+        )
+
+    # --- After ASL approve: deploy prompt ---
+    deployment = artifact.get("deployment")
+    if deployment and isinstance(deployment, dict) and deployment.get("state_machine_arn"):
+        st.success(
+            f"Deployed ({deployment.get('action') or 'ok'}): "
+            f"`{deployment.get('state_machine_arn')}`"
+        )
+        st.caption(
+            f"Region `{deployment.get('region')}` · role `{deployment.get('role_arn')}`"
+        )
+
+    wants_deploy = asl_approved and (
+        show_deploy_form
+        or artifact.get("ask_deploy")
+        or st.session_state.get(deploy_prompt_key)
+    )
+
+    if (
+        is_active
+        and session_id
+        and asl
+        and asl_approved
+        and wants_deploy
+        and not (
+            isinstance(deployment, dict) and deployment.get("state_machine_arn")
+        )
+    ):
+        st.markdown("#### Deploy this ASL?")
+        st.caption(
+            "Creates or updates a Step Functions state machine from the locked ASL."
+        )
+        c_yes, c_skip = st.columns(2)
+        with c_yes:
+            if st.button(
+                "Yes, deploy",
+                key=f"deploy_yes_{message_id}",
+                type="primary",
+                use_container_width=True,
+                disabled=not controls_enabled,
+            ):
+                st.session_state[f"show_deploy_form_{session_id}"] = True
+                st.rerun()
+        with c_skip:
+            if st.button(
+                "Not now",
+                key=f"deploy_no_{message_id}",
+                use_container_width=True,
+                disabled=not controls_enabled,
+            ):
+                if deploy_prompt_key:
+                    st.session_state[deploy_prompt_key] = False
+                st.session_state.pop(f"show_deploy_form_{session_id}", None)
+                add_message(chat_id, "user", "Not now — skip deploy")
+                apply_run_result(
+                    chat_id,
+                    {
+                        "session_id": session_id,
+                        "run_id": session_id,
+                        "stage": "spec_approved",
+                        "assistant_text": (
+                            "Okay — deploy skipped. You can deploy later from this "
+                            "approved ASL card when you're ready."
+                        ),
+                        "asl": asl,
+                        "asl_json": asl,
+                        "graph_dot": artifact.get("graph_dot"),
+                        "validations": artifact.get("validations") or {},
+                        "asl_approved": True,
+                        "ask_deploy": False,
+                    },
+                )
+                st.rerun()
+
+        show_form = st.session_state.get(f"show_deploy_form_{session_id}")
+        if show_form:
+            with st.expander("Deploy to AWS Step Functions", expanded=True):
+                st.caption(
+                    "Optional overrides — leave blank to use server defaults "
+                    "(plan name slug + AWS_STATE_MACHINE_ROLE_ARN)."
+                )
+                sm_name = st.text_input(
+                    "State machine name (optional)",
+                    value="",
+                    key=f"deploy_name_{message_id}",
+                    placeholder="defaults to plan name slug",
+                    disabled=not controls_enabled,
+                )
+                role_arn = st.text_input(
+                    "Execution role ARN (optional)",
+                    value="",
+                    key=f"deploy_role_{message_id}",
+                    placeholder="defaults to server AWS_STATE_MACHINE_ROLE_ARN",
+                    disabled=not controls_enabled,
+                )
+                force = st.checkbox(
+                    "Force deploy (skip pre-deploy checks)",
+                    value=False,
+                    key=f"deploy_force_{message_id}",
+                    disabled=not controls_enabled,
+                )
+                if st.button(
+                    "Deploy workflow",
+                    key=f"deploy_btn_{message_id}",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not controls_enabled,
+                ):
+                    add_message(chat_id, "user", "Deploy workflow")
+                    st.session_state.pending_deploy = {
+                        "chat_id": chat_id,
+                        "session_id": session_id,
+                        "state_machine_name": (sm_name or "").strip() or None,
+                        "role_arn": (role_arn or "").strip() or None,
+                        "force": bool(force),
+                    }
+                    st.rerun()
+
+    # Show last pre-deploy failure reasons if present on this artifact
+    pre_reasons = artifact.get("pre_deploy_reasons")
+    if pre_reasons:
+        st.error("Pre-deploy checks failed:")
+        for r in pre_reasons:
+            st.markdown(f"- {r}")
 
 
 def render_out_of_scope(artifact):
@@ -2148,16 +2816,18 @@ def process_pending_approve(region, env):
     session_id = pending["session_id"]
     overrides = pending.get("overrides") or {}
 
-    try:
-        # Spinner forces Streamlit to flush the typing row above; chrome is CSS-hidden.
-        with st.spinner("Approving…"):
-            result = approve_plan(session_id, overrides=overrides)
-        # ASL may have changed — drop any cached download bytes for this session.
-        st.session_state.pop(f"asl_download_{session_id}", None)
-        apply_run_result(chat_id, result)
-        _finish_in_flight(chat_id)
-    except OrchestrationApiError as exc:
-        fail_in_flight(f"Could not approve the plan. {exc}", chat_id=chat_id)
+    status, result, err = run_with_live_status(
+        chat_id, lambda: approve_plan(session_id, overrides=overrides)
+    )
+    if status == "running":
+        return
+    if status == "error":
+        fail_in_flight(f"Could not approve the plan. {err}", chat_id=chat_id)
+        return
+    # ASL may have changed — drop any cached download bytes for this session.
+    st.session_state.pop(f"asl_download_{session_id}", None)
+    apply_run_result(chat_id, result)
+    _finish_in_flight(chat_id)
 
 
 def process_pending_enrichment(region, env):
@@ -2175,14 +2845,206 @@ def process_pending_enrichment(region, env):
     session_id = pending["session_id"]
     answer = pending.get("answer") or ""
 
-    try:
-        with st.spinner("Enriching…"):
-            result = answer_enrichment(session_id, answer)
-        st.session_state.pop(f"asl_download_{session_id}", None)
-        apply_run_result(chat_id, result)
+    status, result, err = run_with_live_status(
+        chat_id, lambda: answer_enrichment(session_id, answer)
+    )
+    if status == "running":
+        return
+    if status == "error":
+        fail_in_flight(f"Could not answer enrichment. {err}", chat_id=chat_id)
+        return
+    st.session_state.pop(f"asl_download_{session_id}", None)
+    apply_run_result(chat_id, result)
+    _finish_in_flight(chat_id)
+
+
+
+def process_pending_fill_placeholders(region, env):
+    """POST /session/{id}/spec/placeholders — resolve workflow_spec TODOs."""
+    _ = region, env
+    pending = st.session_state.get("pending_fill_placeholders")
+    if not pending:
+        return
+
+    chat_id = pending["chat_id"]
+    session_id = pending["session_id"]
+    overrides = pending.get("overrides") or {}
+
+    status, result, err = run_with_live_status(
+        chat_id, lambda: fill_spec_placeholders(session_id, overrides=overrides)
+    )
+    if status == "running":
+        return
+    if status == "error":
+        fail_in_flight(f"Could not apply placeholders. {err}", chat_id=chat_id)
+        st.session_state.pop("pending_fill_placeholders", None)
+        return
+
+    st.session_state.pop("pending_fill_placeholders", None)
+    st.session_state.pop(f"asl_download_{session_id}", None)
+    apply_run_result(chat_id, result)
+    _finish_in_flight(chat_id)
+
+
+def process_pending_generate_asl(region, env):
+    """Re-run Stage 4 ASL generation for the locked workflow_spec."""
+    _ = region, env
+    pending = st.session_state.get("pending_generate_asl")
+    if not pending:
+        return
+
+    chat_id = pending["chat_id"]
+    session_id = pending["session_id"]
+
+    status, result, err = run_with_live_status(
+        chat_id, lambda: generate_asl(session_id)
+    )
+    if status == "running":
+        return
+    if status == "error":
+        fail_in_flight(f"Could not regenerate ASL. {err}", chat_id=chat_id)
+        st.session_state.pop("pending_generate_asl", None)
+        return
+
+    st.session_state.pop("pending_generate_asl", None)
+    st.session_state.pop(f"asl_download_{session_id}", None)
+
+    # Merge generate payload into a full UI artifact so the thread can re-render.
+    art = {
+        "session_id": session_id,
+        "run_id": session_id,
+        "stage": "spec_approved",
+        "assistant_text": "ASL regenerated from the locked workflow specification.",
+        "asl": result.get("asl"),
+        "asl_json": result.get("asl"),
+        "graph_dot": result.get("graph_dot"),
+        "validations": result.get("validations") or {},
+        "remaining_placeholders": [],
+        "enrichment_question": None,
+        "enrichment_error": None,
+        "asl_error": None,
+    }
+    apply_run_result(chat_id, art)
+    _finish_in_flight(chat_id)
+
+
+def process_pending_revalidate_asl(region, env):
+    """Re-run validation groups on the current ASL."""
+    _ = region, env
+    pending = st.session_state.get("pending_revalidate_asl")
+    if not pending:
+        return
+
+    chat_id = pending["chat_id"]
+    session_id = pending["session_id"]
+    asl = pending.get("asl")
+
+    status, result, err = run_with_live_status(
+        chat_id, lambda: revalidate_asl(asl, session_id=session_id)
+    )
+    if status == "running":
+        return
+    if status == "error":
+        fail_in_flight(f"Could not re-validate ASL. {err}", chat_id=chat_id)
+        st.session_state.pop("pending_revalidate_asl", None)
+        return
+
+    st.session_state.pop("pending_revalidate_asl", None)
+
+    vals = result.get("validations") or {}
+    ok = vals.get("ok")
+    n_err = len(vals.get("errors") or [])
+    summary = (
+        "ASL re-validation **passed**."
+        if ok
+        else f"ASL re-validation finished with **{n_err}** issue(s)."
+    )
+    art = {
+        "session_id": session_id,
+        "run_id": session_id,
+        "stage": "spec_approved",
+        "assistant_text": summary,
+        "asl": result.get("asl") or asl,
+        "asl_json": result.get("asl") or asl,
+        "graph_dot": result.get("graph_dot"),
+        "validations": vals,
+        "remaining_placeholders": [],
+        "enrichment_question": None,
+        "enrichment_error": None,
+        "asl_error": None,
+    }
+    apply_run_result(chat_id, art)
+    _finish_in_flight(chat_id)
+
+
+def process_pending_deploy(region, env):
+    """Stage 5: create-or-update the state machine from locked ASL."""
+    _ = region, env
+    pending = st.session_state.get("pending_deploy")
+    if not pending:
+        return
+
+    chat_id = pending["chat_id"]
+    session_id = pending["session_id"]
+
+    def _do_deploy():
+        return deploy_workflow(
+            session_id,
+            state_machine_name=pending.get("state_machine_name"),
+            role_arn=pending.get("role_arn"),
+            force=bool(pending.get("force")),
+        )
+
+    status, result, err = run_with_live_status(chat_id, _do_deploy)
+    if status == "running":
+        return
+    if status == "error":
+        # Surface structured pre-deploy checklist when available.
+        if isinstance(err, PreDeployCheckFailed) or (
+            hasattr(err, "reasons") and getattr(err, "reasons", None)
+        ):
+            reasons = list(getattr(err, "reasons", []) or [])
+            art = {
+                "session_id": session_id,
+                "run_id": session_id,
+                "stage": "spec_approved",
+                "assistant_text": "Pre-deploy checks failed — fix the items below or force deploy.",
+                "pre_deploy_reasons": reasons,
+                "asl": None,
+            }
+            # Keep previous ASL on the thread by not wiping; just add the error note.
+            apply_run_result(chat_id, art)
+            update_chat_run_state(
+                chat_id, run_id=session_id, stage="spec_approved", deploy_status="blocked"
+            )
+        else:
+            fail_in_flight(f"Deploy failed. {err}", chat_id=chat_id)
+        st.session_state.pop("pending_deploy", None)
         _finish_in_flight(chat_id)
-    except OrchestrationApiError as exc:
-        fail_in_flight(f"Could not answer enrichment. {exc}", chat_id=chat_id)
+        return
+
+    st.session_state.pop("pending_deploy", None)
+    arn = (result or {}).get("state_machine_arn")
+    action = (result or {}).get("action") or "ok"
+    art = {
+        "session_id": session_id,
+        "run_id": session_id,
+        "stage": "spec_approved",
+        "assistant_text": (
+            f"Workflow **{action}** on AWS Step Functions.\n\n"
+            f"`{arn}`"
+        ),
+        "deployment": result,
+        "remaining_placeholders": [],
+        "enrichment_question": None,
+        "enrichment_error": None,
+        "asl_error": None,
+    }
+    apply_run_result(chat_id, art)
+    update_chat_run_state(
+        chat_id, run_id=session_id, stage="spec_approved", deploy_status="deployed"
+    )
+    _finish_in_flight(chat_id)
 
 
 
@@ -2195,37 +3057,56 @@ def process_user_prompt(active_chat_id, user_prompt, region, env):
     chat = get_chat(active_chat_id)
     session_id = get_active_session_id(active_chat_id)
 
-    if chat and chat.get("stage") == "plan_review" and session_id and not USE_MOCK:
+    # Brand-new chat: no session exists yet. Create it up front (a fast
+    # POST /session call, not the slow LLM work) instead of letting
+    # send_message() create it lazily on the background thread — that left
+    # nothing for the live-status checklist to poll GET /status with for
+    # the entire first message, so it always sat stuck on step one.
+    if not session_id and not USE_MOCK:
         try:
-            with st.spinner("Updating the plan…"):
-                result = reject_plan(session_id, user_prompt, region=region, env=env)
-            apply_run_result(active_chat_id, result)
-            _finish_in_flight(active_chat_id)
-            return
+            session_id = create_session()
         except OrchestrationApiError as exc:
             fail_in_flight(
-                f"Could not send the change request. {exc}",
+                f"Could not reach the orchestration API. Check that the API "
+                f"is running and try again. ({exc})",
                 chat_id=active_chat_id,
             )
             return
+        _remember_session_id(active_chat_id, session_id)
 
-    try:
-        with st.spinner("Thinking…"):
-            result = send_message(
-                user_prompt,
-                run_id=session_id,
-                region=region,
-                env=env,
+    if chat and chat.get("stage") == "plan_review" and session_id and not USE_MOCK:
+        status, result, err = run_with_live_status(
+            active_chat_id,
+            lambda: reject_plan(session_id, user_prompt, region=region, env=env),
+        )
+        if status == "running":
+            return
+        if status == "error":
+            fail_in_flight(
+                f"Could not send the change request. {err}",
+                chat_id=active_chat_id,
             )
+            return
         apply_run_result(active_chat_id, result)
         _finish_in_flight(active_chat_id)
-    except OrchestrationApiError as exc:
+        return
+
+    status, result, err = run_with_live_status(
+        active_chat_id,
+        lambda: send_message(user_prompt, run_id=session_id, region=region, env=env),
+    )
+    if status == "running":
+        return
+    if status == "error":
         fail_in_flight(
             "Could not reach the orchestration API. "
             "Check that the API is running and try again. "
-            f"({exc})",
+            f"({err})",
             chat_id=active_chat_id,
         )
+        return
+    apply_run_result(active_chat_id, result)
+    _finish_in_flight(active_chat_id)
 
 
 def _chat_input_resize_script(nonce: str, *, focus: bool) -> str:
@@ -2384,7 +3265,7 @@ region = st.session_state.get("aws_region", "ap-south-1")
 env = st.session_state.get("deploy_env", "dev")
 
 st.title("Workflow Assistant")
-st.caption("Chat → clarify → plan review → approve / reject")
+st.caption("Chat → plan → approve plan → fill placeholders → approve ASL → deploy")
 
 if st.session_state.get("api_unreachable") and not USE_MOCK:
     detail = st.session_state.get("api_error_detail") or "API unreachable"
@@ -2407,9 +3288,15 @@ if _busy_now:
     # the full interactive thread in the same run (avoids duplicate widget keys).
     with _thread_slot.container():
         render_chat_thread(active_chat_id, simplify=True)
-    with _typing_slot.container():
-        render_typing_indicator(typing_label_for_chat(active_chat_id))
 
+    # IMPORTANT: consume any finished background job BEFORE rendering the
+    # live-status fragment. render_live_status() calls st.rerun() as soon as
+    # it sees a job whose status is no longer "running" — and st.rerun()
+    # halts this script immediately. If the fragment ran first, a finished
+    # job would never reach process_pending_* (which is what actually pops
+    # the job, applies the result, and adds the assistant message), so the
+    # app would loop forever re-triggering reruns on a job nobody consumes:
+    # a spinner that never resolves and a chat message that never appears.
     pending_approve = st.session_state.get("pending_approve")
     if pending_approve and pending_approve.get("chat_id") == active_chat_id:
         process_pending_approve(region=region, env=env)
@@ -2418,6 +3305,22 @@ if _busy_now:
     if pending_enrichment and pending_enrichment.get("chat_id") == active_chat_id:
         process_pending_enrichment(region=region, env=env)
 
+    pending_fill = st.session_state.get("pending_fill_placeholders")
+    if pending_fill and pending_fill.get("chat_id") == active_chat_id:
+        process_pending_fill_placeholders(region=region, env=env)
+
+    pending_generate = st.session_state.get("pending_generate_asl")
+    if pending_generate and pending_generate.get("chat_id") == active_chat_id:
+        process_pending_generate_asl(region=region, env=env)
+
+    pending_revalidate = st.session_state.get("pending_revalidate_asl")
+    if pending_revalidate and pending_revalidate.get("chat_id") == active_chat_id:
+        process_pending_revalidate_asl(region=region, env=env)
+
+    pending_deploy = st.session_state.get("pending_deploy")
+    if pending_deploy and pending_deploy.get("chat_id") == active_chat_id:
+        process_pending_deploy(region=region, env=env)
+
     pending_prompts = _pending_prompts()
     if active_chat_id in pending_prompts:
         process_user_prompt(
@@ -2425,6 +3328,16 @@ if _busy_now:
             pending_prompts[active_chat_id],
             region=region,
             env=env,
+        )
+
+    # Processors call st.rerun() as soon as a job completes. If we're still
+    # here, the job (if any) is genuinely still running, so it's now safe to
+    # show the polling indicator without racing the job's completion.
+    with _typing_slot.container():
+        render_live_status(
+            active_chat_id,
+            get_active_session_id(active_chat_id),
+            fallback_label=typing_label_for_chat(active_chat_id),
         )
 
     # Processors call st.rerun() on success. If we are still here, either the

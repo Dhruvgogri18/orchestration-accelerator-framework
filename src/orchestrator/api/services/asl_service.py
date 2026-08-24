@@ -42,6 +42,63 @@ MAX_NESTING_DEPTH = 8
 MAX_STATE_NAME_LEN = 80
 STATE_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,80}$")
 
+# Same sentinel pattern plan/render.py uses for the thin Plan
+# (service/description text). Defined again here because this one
+# scans a completely different, later-stage document -- the full ASL
+# tree, at any depth, in any field -- not just two fields on a Plan
+# step. See find_asl_placeholders() below.
+_PLACEHOLDER_PATTERN = re.compile(r"\bTODO_[A-Z0-9_]+\b")
+
+
+def find_asl_placeholders(node: Any, _seen: list[str] | None = None) -> list[str]:
+    """Recursively scan the FULL ASL document -- including nested
+    Parallel Branches and Map ItemProcessor/Iterator bodies, since
+    those are just nested dicts/lists within the same JSON tree -- for
+    any TODO_ token in any string value at any depth.
+
+    Deliberately broader than the aws_constraints group's TODO_ check
+    below, which only ever looks at a Task's `Resource`: enrichment
+    can just as easily leave a TODO_ token in a Parameters value, a
+    Comment, or an InputPath, and a workflow with any of those is
+    exactly as undeployable as one with a placeholder Resource.
+    """
+    out = _seen if _seen is not None else []
+    if isinstance(node, str):
+        for m in _PLACEHOLDER_PATTERN.findall(node):
+            if m not in out:
+                out.append(m)
+    elif isinstance(node, dict):
+        for v in node.values():
+            find_asl_placeholders(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            find_asl_placeholders(v, out)
+    return out
+
+
+def apply_placeholder_overrides(node: Any, overrides: dict[str, str]) -> Any:
+    """Deep-replace TODO_ tokens (or any string keys) in a JSON tree.
+
+    Used after Stage 4 so user-supplied values from /approve overrides
+    land in the locked ASL / workflow_spec — not only in the thin Plan
+    service/description fields. Enrichment routinely re-emits TODOs in
+    Parameters and Resource; without this step, Apply placeholders in
+    the UI never changes the deployable definition.
+    """
+    if not overrides:
+        return node
+    if isinstance(node, str):
+        out = node
+        for token, value in overrides.items():
+            if token and value is not None:
+                out = out.replace(token, value)
+        return out
+    if isinstance(node, dict):
+        return {k: apply_placeholder_overrides(v, overrides) for k, v in node.items()}
+    if isinstance(node, list):
+        return [apply_placeholder_overrides(v, overrides) for v in node]
+    return node
+
 
 @dataclass
 class ValidationIssue:
@@ -66,6 +123,21 @@ class ValidationReport:
     aws_validate_ok: bool | None = None  # None = not attempted
     issues: list[ValidationIssue] = field(default_factory=list)
     aws_details: dict | None = None
+    # Every TODO_ token still present anywhere in the ASL document.
+    # Kept as its own field (not just buried in `issues`) because it's
+    # the one thing a UI needs to answer "what do I still have to fill
+    # in", separately from "why did validation fail". A non-empty list
+    # here always means extras_ok (and therefore ok) is False -- see
+    # _validate_extras()/validate_asl() below. This is what closes the
+    # gap where a TODO_ resource -- explicitly allowed through by the
+    # aws_constraints group and by enrichment's ARN whitelist, correctly,
+    # since a placeholder is a well-formed sentinel at those stages --
+    # could otherwise reach `ok: True` here despite not being
+    # deployable. TODO_ is valid ASL *syntax*; it is not a deployable
+    # *value*, and this report's `ok` is documented (see
+    # build_asl_from_spec below) as the deploy signal, so it has to
+    # reflect that.
+    unresolved_placeholders: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -92,6 +164,7 @@ class ValidationReport:
             "extras_ok": self.extras_ok,
             "aws_validate_ok": self.aws_validate_ok,
             "ok": self.ok,
+            "unresolved_placeholders": self.unresolved_placeholders,
             "errors": [
                 {
                     "group": i.group,
@@ -418,6 +491,14 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             )
         state["ItemsPath"] = items_path
         state["Iterator"] = _build_branch_asl(iterator, notes)
+        max_concurrency = step.get("max_concurrency")
+        if max_concurrency is not None:
+            state["MaxConcurrency"] = max_concurrency
+        items_batcher = step.get("items_batcher")
+        if items_batcher and items_batcher.get("max_items_per_batch"):
+            state["ItemBatcher"] = {
+                "MaxItemsPerBatch": items_batcher["max_items_per_batch"]
+            }
         retry = _retry_to_asl(step.get("retry"))
         if retry:
             state["Retry"] = retry
@@ -1428,6 +1509,23 @@ def _validate_extras(
         )
         ok = False
 
+    # Deploy readiness: TODO_ is valid ASL syntax (aws_constraints
+    # above explicitly allows it) but not a deployable value. Checked
+    # here, not there, because this is the group that answers "is this
+    # actually ready to hand to CreateStateMachine" rather than "is
+    # this syntactically sound ASL".
+    report.unresolved_placeholders = find_asl_placeholders(asl)
+    if report.unresolved_placeholders:
+        report.issues.append(
+            ValidationIssue(
+                "extras",
+                "unresolved_placeholders",
+                "Unresolved TODO_ placeholders remain: "
+                + ", ".join(report.unresolved_placeholders),
+            )
+        )
+        ok = False
+
     # Graph DOT must at least mention StartAt and contain digraph.
     if not graph_dot or "digraph" not in graph_dot:
         report.issues.append(
@@ -1515,8 +1613,22 @@ def validate_asl(asl: Any, spec: dict | None = None, graph_dot: str = "") -> Val
     if spec is not None:
         _validate_extras(root, spec, report, graph_dot)
     else:
-        # Still run live AWS + graph checks without a spec.
-        report.extras_ok = True
+        # No spec to round-trip against, but deploy-readiness still
+        # applies -- same placeholder scan _validate_extras() would
+        # have run, just without the spec-dependent round-trip check.
+        ok = True
+        report.unresolved_placeholders = find_asl_placeholders(root)
+        if report.unresolved_placeholders:
+            report.issues.append(
+                ValidationIssue(
+                    "extras",
+                    "unresolved_placeholders",
+                    "Unresolved TODO_ placeholders remain: "
+                    + ", ".join(report.unresolved_placeholders),
+                )
+            )
+            ok = False
+        report.extras_ok = ok
         details = call_aws_validate_state_machine(root)
         report.aws_details = details
         if details.get("skipped") or not details.get("attempted"):

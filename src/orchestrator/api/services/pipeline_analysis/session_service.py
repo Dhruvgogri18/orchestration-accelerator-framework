@@ -2,6 +2,16 @@
 
 Routes stay thin: HTTP in/out only. This module owns the conversation
 loop formerly living as _run_extraction_turn inside session_router.
+
+Lives inside pipeline_analysis/ (moved from services/session_service.py)
+since analyze_pipeline() and ExtractionError -- its two heaviest
+dependencies -- both live in the sibling pipeline_analysis/service.py
+module; the old extraction/ package (extraction/service.py,
+extraction/prompts.py) that ExtractionError previously came from has
+been deleted -- its only other still-live pieces (classify_scope,
+_chat_completion_structured, _call_llm_json_with_repair,
+MAX_STAGE_ATTEMPTS) were folded directly into pipeline_analysis/service.py,
+the only module that ever called them.
 """
 
 from __future__ import annotations
@@ -12,22 +22,42 @@ from orchestrator.api.schemas.common import Plan
 from orchestrator.api.schemas.session import (
     ApproveResponse,
     AslValidateResponse,
+    DeployRequest,
+    DeployResponse,
     MessageResponse,
 )
 from orchestrator.api.services.asl_service import (
     AslGenerationError,
     build_asl_from_spec,
+    find_asl_placeholders,
     render_asl_graph,
     validate_asl,
 )
-from orchestrator.api.services.enrichment_service import (
+from orchestrator.api.services.deploy.service import (
+    deploy_state_machine,
+    slugify_state_machine_name,
+)
+from orchestrator.api.services.enrichment.service import (
     EnrichmentError,
     continue_enrichment,
     enrich_plan,
 )
-from orchestrator.api.services.extraction_service import ExtractionError, extract_turn
-from orchestrator.api.services.plan_render_service import (
+from orchestrator.api.services.llm_trace import (
+    end_request,
+    get_status,
+    llm_stage,
+    log_event,
+    start_request,
+)
+from orchestrator.api.services.plan.matching import match as match_plan
+from orchestrator.api.services.pipeline_analysis.service import (
+    ExtractionError,
+    analyze_pipeline,
+)
+from orchestrator.api.services.plan.canonicalize import canonicalize_plan
+from orchestrator.api.services.plan.render import (
     apply_overrides,
+    apply_overrides_to_json,
     find_placeholders,
     render_plan_diagram,
     render_plan_summary,
@@ -50,8 +80,47 @@ class NoWorkflowSpecError(Exception):
     """ASL generation/validation requested but no workflow_spec is locked."""
 
 
+class NoSpecPlaceholdersError(Exception):
+    """fill_spec_placeholders called with no spec-level placeholders
+    pending -- either no workflow_spec is locked yet, or the locked one
+    already has zero TODO_ tokens (use /asl/generate to force a
+    regeneration instead)."""
+
+
+class UnresolvedSpecPlaceholdersError(Exception):
+    """ASL generation was requested (directly, via /asl/generate) while
+    the locked workflow_spec still has TODO_ tokens in it. Every other
+    path into Stage 4 (approve_plan, answer_enrichment_question,
+    fill_spec_placeholders) already routes through
+    _finalize_workflow_spec, which refuses to build ASL from a spec
+    that still has placeholders in it -- this exists so the
+    force-regenerate entrypoint can't be used to sidestep that same
+    rule. Caller should resolve everything via
+    POST /session/{id}/spec/placeholders first."""
+
+
 def start_session() -> Session:
     return session_store.create_session()
+
+
+def get_live_status(session_id: str) -> dict:
+    """What the backend is doing *right now* for this session, for the
+    frontend to poll while /message or /approve is in flight on another
+    connection. Cheap in-memory read -- safe to call every second.
+
+    Returns {"busy": False} when nothing is running (already finished,
+    not started, or unknown session -- deliberately not a 404 here so
+    a client can poll optimistically right after firing a request).
+    """
+    snap = get_status(session_id)
+    if not snap:
+        return {"busy": False}
+    return {
+        "busy": True,
+        "stage": snap.get("stage"),
+        "label": snap.get("label"),
+        "updated_at": snap.get("updated_at"),
+    }
 
 
 def get_session_or_raise(session_id: str) -> Session:
@@ -66,8 +135,18 @@ def run_extraction_turn(session_id: str, session: Session, message: str) -> Mess
     run extraction again, return the result" with identical rendering
     behavior. /reject is not a different code path, just a different
     HTTP entry point into the same conversation loop.
+
+    Uses analyze_pipeline() -- the paper-aligned Stage 1 Pipeline
+    Analysis chain (pipeline_analysis/service.py: environment inference
+    -> component identification -> flow structure analysis -> parameter
+    extraction -> integration analysis). There is no user-facing pause
+    between its five sub-stages: the only human checkpoint in this
+    product is plan review below (plain-language approve/reject), not
+    an intermediate component list a non-developer user would have no
+    way to judge.
     """
     session_store.append_message(session_id, "user", message)
+    start_request(session_id=session_id, user_message=message)
 
     # session.history was fetched before the append above -- the
     # SQLite-backed store returns a snapshot, not a live reference, so
@@ -77,8 +156,10 @@ def run_extraction_turn(session_id: str, session: Session, message: str) -> Mess
     current_history = [*session.history, {"role": "user", "content": message}]
 
     try:
-        result = extract_turn(current_history)
-    except ExtractionError:
+        with llm_stage("pipeline_analysis"):
+            result = analyze_pipeline(current_history)
+    except ExtractionError as _ext_err:
+        end_request(status="error", error=str(_ext_err))
         # Don't record a broken assistant turn into history -- next
         # retry should see the same clean state, not a garbage reply
         # baked into the conversation. Re-raise for the router to map
@@ -88,6 +169,33 @@ def run_extraction_turn(session_id: str, session: Session, message: str) -> Mess
     # Record the assistant's turn as JSON text, matching what the LLM
     # actually said -- keeps history faithful to the real conversation
     # for the next call's context.
+    end_request(status=result.status)
+
+    # Plan matching → lock known archetypes; otherwise canonicalize as today.
+    if result.status == "ready" and result.plan is not None:
+        match_result = match_plan(
+            result.plan,
+            session_id=session_id,
+            user_message=message,
+        )
+        log_event(
+            "plan_match",
+            tier=match_result.tier,
+            archetype=getattr(match_result, "archetype", None)
+            or getattr(match_result, "template_name", None),
+            score=match_result.score,
+            signature_hash=getattr(match_result, "signature_hash", None),
+        )
+        if match_result.tier == "high" and match_result.plan is not None:
+            # Structure locked by prototype — skip canonicalize topology
+            result.plan = match_result.plan
+        elif match_result.tier == "medium" and match_result.plan is not None:
+            # Partial trust: project then light canonicalize
+            result.plan = canonicalize_plan(match_result.plan)
+        else:
+            # low / none — legacy path (curation queue already written)
+            result.plan = canonicalize_plan(result.plan)
+
     session_store.append_message(session_id, "assistant", result.model_dump_json())
 
     # Persist the latest ready plan -- /approve needs to know "is there
@@ -106,6 +214,15 @@ def run_extraction_turn(session_id: str, session: Session, message: str) -> Mess
             summary_markdown=render_plan_summary(result.plan),
             diagram_dot=render_plan_diagram(result.plan),
             placeholders=find_placeholders(result.plan),
+            # Full Stage 1 Pipeline Analysis artifact (environment,
+            # components, flow, parameters, integrations) -- see
+            # schemas/pipeline_analysis.py:PipelineAnalysis. `result.plan`
+            # above is derived from `analysis["flow"]` for everything
+            # downstream that only understands the Plan shape; this field
+            # is purely for client-side transparency/audit, matching the
+            # paper's "human-readable report and comprehensive JSON
+            # artifact" deliverable for Pipeline Analysis.
+            pipeline_analysis=result.analysis,
         )
     if result.status == "out_of_scope":
         return MessageResponse(
@@ -156,7 +273,8 @@ def _run_asl_stage(workflow_spec: dict) -> tuple[dict | None, str | None, dict |
     Never raises — ASL failures are reported alongside a successful approval.
     """
     try:
-        result = build_asl_from_spec(workflow_spec)
+        with llm_stage("asl_generation"):
+            result = build_asl_from_spec(workflow_spec)
         return (
             result.asl,
             result.graph_dot,
@@ -167,6 +285,41 @@ def _run_asl_stage(workflow_spec: dict) -> tuple[dict | None, str | None, dict |
         return None, None, None, str(exc)
     except Exception as exc:  # noqa: BLE001 — surface unexpected translator bugs
         return None, None, None, f"ASL generation failed unexpectedly: {exc}"
+
+
+def _finalize_workflow_spec(
+    workflow_spec: dict,
+) -> tuple[dict | None, str | None, dict | None, str | None, list[str]]:
+    """The gate between Stage 3.5 (enrichment) and Stage 4 (ASL
+    generation): scan the WHOLE workflow_spec for TODO_ placeholders
+    before generating anything from it.
+
+    Enrichment's ARN whitelist deliberately lets TODO_ tokens through
+    when it can't resolve something on its own -- correct for Stage
+    3.5, since a placeholder is a valid sentinel for "needs a human"
+    at that point. But those tokens never appeared on the Stage 2 plan
+    (apply_overrides/find_placeholders only ever saw plan text), so
+    without this check they'd only surface after ASL generation ran
+    once already (via asl_service.find_asl_placeholders inside
+    validate_asl) -- meaning the user discovers what to fill in one
+    token at a time, across repeated generate-inspect-fix cycles,
+    instead of all at once.
+
+    find_asl_placeholders is reused as-is here (not renamed) -- despite
+    the name, it's a generic recursive JSON string scanner with no ASL-
+    specific logic, so it works identically against a workflow_spec
+    dict.
+
+    Returns (asl, graph_dot, validations_dict, asl_error,
+    spec_placeholders). When spec_placeholders is non-empty, the first
+    four are always (None, None, None, None) -- ASL generation is
+    skipped entirely, not attempted-and-reported.
+    """
+    spec_placeholders = find_asl_placeholders(workflow_spec)
+    if spec_placeholders:
+        return None, None, None, None, spec_placeholders
+    asl, graph_dot, validations, asl_error = _run_asl_stage(workflow_spec)
+    return asl, graph_dot, validations, asl_error, []
 
 
 def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
@@ -203,15 +356,21 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
     asl_graph_dot: str | None = None
     asl_validations: dict | None = None
     asl_error: str | None = None
+    spec_placeholders: list[str] = []
+    start_request(session_id=session_id)
     try:
         result = enrich_plan(resolved_plan)
         if result.status == "complete":
             workflow_spec = result.spec
-            asl, asl_graph_dot, asl_validations, asl_error = _run_asl_stage(workflow_spec)
+            asl, asl_graph_dot, asl_validations, asl_error, spec_placeholders = (
+                _finalize_workflow_spec(workflow_spec)
+            )
         else:  # needs_clarification -- pause, persist state for answer endpoint
             enrichment_question = result.question
     except EnrichmentError as exc:
         enrichment_error = str(exc)
+    finally:
+        end_request(status="approved")
 
     locked = {
         "resolved_plan": resolved_plan.model_dump(),
@@ -219,6 +378,7 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
         "workflow_spec": workflow_spec,
         "enrichment_error": enrichment_error,
         "enrichment_question": enrichment_question,
+        "spec_placeholders": spec_placeholders,
         "asl": asl,
         "asl_graph_dot": asl_graph_dot,
         "asl_validations": asl_validations,
@@ -238,6 +398,7 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
         workflow_spec=workflow_spec,
         enrichment_error=enrichment_error,
         enrichment_question=enrichment_question,
+        spec_placeholders=spec_placeholders,
         asl=asl,
         asl_graph_dot=asl_graph_dot,
         asl_validations=asl_validations,
@@ -265,21 +426,28 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
     asl_graph_dot: str | None = None
     asl_validations: dict | None = None
     asl_error: str | None = None
+    spec_placeholders: list[str] = []
+    start_request(session_id=session_id)
     try:
         result = continue_enrichment(
             plan, pending["messages"], answer, pending["clarification_rounds"]
         )
         if result.status == "complete":
             workflow_spec = result.spec
-            asl, asl_graph_dot, asl_validations, asl_error = _run_asl_stage(workflow_spec)
+            asl, asl_graph_dot, asl_validations, asl_error, spec_placeholders = (
+                _finalize_workflow_spec(workflow_spec)
+            )
         else:
             enrichment_question = result.question
     except EnrichmentError as exc:
         enrichment_error = str(exc)
+    finally:
+        end_request(status="approved")
 
     locked["workflow_spec"] = workflow_spec
     locked["enrichment_error"] = enrichment_error
     locked["enrichment_question"] = enrichment_question
+    locked["spec_placeholders"] = spec_placeholders
     locked["asl"] = asl
     locked["asl_graph_dot"] = asl_graph_dot
     locked["asl_validations"] = asl_validations
@@ -300,6 +468,74 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
         workflow_spec=workflow_spec,
         enrichment_error=enrichment_error,
         enrichment_question=enrichment_question,
+        spec_placeholders=spec_placeholders,
+        asl=asl,
+        asl_graph_dot=asl_graph_dot,
+        asl_validations=asl_validations,
+        asl_error=asl_error,
+    )
+
+
+def fill_spec_placeholders(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
+    """Stage 3.5 -> Stage 4 gate: apply every value for the tokens
+    approve_plan()/answer_enrichment_question() reported in
+    spec_placeholders, all in one call, then generate ASL only once
+    nothing is left unresolved.
+
+    overrides is applied across the ENTIRE locked workflow_spec (every
+    string, at any depth -- see apply_overrides_to_json), not just the
+    specific fields ApproveRequest.overrides touches, since enrichment
+    can place a TODO_ token anywhere. Whatever wasn't covered by
+    overrides is reported back in spec_placeholders on the response --
+    calling this with a partial set is allowed (mirrors approve_plan's
+    "unresolved is reported, not rejected" stance), it just means ASL
+    generation stays skipped until a follow-up call clears the rest.
+    """
+    session = get_session_or_raise(session_id)
+    locked = session.locked_spec or {}
+    workflow_spec = locked.get("workflow_spec")
+    if not isinstance(workflow_spec, dict) or not workflow_spec:
+        raise NoSpecPlaceholdersError(
+            "No workflow_spec is locked for this session -- approve a plan "
+            "(and complete enrichment) first."
+        )
+    if not locked.get("spec_placeholders"):
+        raise NoSpecPlaceholdersError(
+            "No spec-level placeholders are pending for this session. "
+            "Use POST /session/{id}/asl/generate to force a regeneration."
+        )
+
+    updated_spec = apply_overrides_to_json(workflow_spec, overrides)
+
+    asl: dict | None = None
+    asl_graph_dot: str | None = None
+    asl_validations: dict | None = None
+    asl_error: str | None = None
+    start_request(session_id=session_id)
+    try:
+        asl, asl_graph_dot, asl_validations, asl_error, spec_placeholders = (
+            _finalize_workflow_spec(updated_spec)
+        )
+    finally:
+        end_request(status="approved")
+
+    locked["workflow_spec"] = updated_spec
+    locked["spec_placeholders"] = spec_placeholders
+    locked["asl"] = asl
+    locked["asl_graph_dot"] = asl_graph_dot
+    locked["asl_validations"] = asl_validations
+    locked["asl_error"] = asl_error
+    session_store.set_locked_spec(session_id, locked)
+
+    resolved_plan = Plan.model_validate(locked["resolved_plan"])
+    return ApproveResponse(
+        status="approved",
+        resolved_plan=resolved_plan,
+        remaining_placeholders=locked.get("remaining_placeholders") or [],
+        workflow_spec=updated_spec,
+        enrichment_error=locked.get("enrichment_error"),
+        enrichment_question=locked.get("enrichment_question"),
+        spec_placeholders=spec_placeholders,
         asl=asl,
         asl_graph_dot=asl_graph_dot,
         asl_validations=asl_validations,
@@ -310,6 +546,14 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
 def generate_asl_for_session(session_id: str) -> AslValidateResponse:
     """Re-run Stage 4 from the locked workflow_spec (e.g. after a
     manual edit of the spec on the client, or to refresh validations).
+
+    Subject to the same placeholder gate as every other path into
+    Stage 4 (see _finalize_workflow_spec): if the locked spec still
+    has TODO_ tokens anywhere in it, generation is refused rather than
+    run against unresolved input. This matters here specifically
+    because a client-side manual edit could reintroduce a TODO_ token
+    that was previously resolved -- without this check that edit would
+    sail straight into ASL generation.
     """
     session = get_session_or_raise(session_id)
     locked = session.locked_spec or {}
@@ -317,6 +561,16 @@ def generate_asl_for_session(session_id: str) -> AslValidateResponse:
     if not spec:
         raise NoWorkflowSpecError(
             "No workflow_spec locked for this session — approve a plan first."
+        )
+
+    spec_placeholders = find_asl_placeholders(spec)
+    if spec_placeholders:
+        locked["spec_placeholders"] = spec_placeholders
+        session_store.set_locked_spec(session_id, locked)
+        raise UnresolvedSpecPlaceholdersError(
+            "workflow_spec still has unresolved TODO_ placeholders: "
+            f"{', '.join(spec_placeholders)}. Resolve them via "
+            "POST /session/{id}/spec/placeholders before generating ASL."
         )
 
     asl, graph_dot, validations, error = _run_asl_stage(spec)
@@ -400,3 +654,61 @@ def get_asl_for_download(session_id: str) -> tuple[dict, str]:
     filename = f"{safe or 'workflow'}.asl.json"
     return asl, filename
 
+
+def deploy_workflow(session_id: str, request: DeployRequest) -> DeployResponse:
+    """Stage 5: create-or-update the session's locked ASL as a real
+    Step Functions state machine.
+
+    Requires a locked ASL definition (approve a plan, complete
+    enrichment, and let Stage 4 generate ASL first — same
+    precondition as get_asl_for_download). The actual readiness gate
+    (validation report, live AWS validate, leftover placeholders,
+    execution role) lives in deploy_state_machine()/
+    run_pre_deploy_checks() — this function just resolves what to pass
+    it and persists the outcome.
+    """
+    session = get_session_or_raise(session_id)
+    locked = session.locked_spec or {}
+    asl = locked.get("asl")
+    if not isinstance(asl, dict) or not asl:
+        raise NoAslError(
+            "No ASL definition stored for this session — approve a plan "
+            "(and complete enrichment) first."
+        )
+
+    if request.state_machine_name:
+        name = slugify_state_machine_name(request.state_machine_name)
+    else:
+        resolved_plan = locked.get("resolved_plan") or {}
+        name = slugify_state_machine_name(resolved_plan.get("name") or "workflow")
+
+    result = deploy_state_machine(
+        name=name,
+        asl=asl,
+        role_arn=request.role_arn,
+        deploy_role_arn=request.deploy_role_arn,
+        external_id=request.external_id,
+        validations=locked.get("asl_validations"),
+        tags=request.tags,
+        skip_checks=request.force,
+    )
+
+    locked["deployment"] = {
+        "state_machine_arn": result.state_machine_arn,
+        "action": result.action,
+        "state_machine_name": result.state_machine_name,
+        "region": result.region,
+        "role_arn": result.role_arn,
+        "account_id": result.account_id,
+    }
+    session_store.set_locked_spec(session_id, locked)
+
+    return DeployResponse(
+        status="deployed",
+        state_machine_arn=result.state_machine_arn,
+        action=result.action,
+        state_machine_name=result.state_machine_name,
+        region=result.region,
+        role_arn=result.role_arn,
+        account_id=result.account_id,
+    )

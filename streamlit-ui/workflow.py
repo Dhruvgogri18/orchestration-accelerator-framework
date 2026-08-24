@@ -1,10 +1,9 @@
 """
 UI orchestration client.
 
-USE_MOCK_API=true  -> local mock (dev without API)
+USE_MOCK_API=true -> local mock (dev without API)
 USE_MOCK_API=false -> real FastAPI session endpoints
 """
-
 from __future__ import annotations
 
 import json
@@ -23,6 +22,20 @@ API_TIMEOUT = float(_settings.orchestration_api_timeout)
 
 class OrchestrationApiError(Exception):
     """Raised when the orchestration API call fails."""
+
+
+class PreDeployCheckFailed(OrchestrationApiError):
+    """Raised specifically for POST /session/{id}/deploy's 422 response --
+    the structured {"reasons": [...]} list the API returns when one or
+    more pre-deploy checks fail (validation not passing, leftover TODO_
+    placeholders, no execution role configured, etc.). Kept distinct
+    from the generic OrchestrationApiError so the UI can render these as
+    an actionable checklist instead of a single opaque error string.
+    """
+
+    def __init__(self, reasons: list[str]):
+        self.reasons = reasons
+        super().__init__("Pre-deploy checks failed: " + "; ".join(reasons))
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +62,12 @@ def _request(method: str, path: str, payload: dict | None = None) -> dict:
 
     if not response.ok:
         detail = data.get("detail") if isinstance(data, dict) else data
+        if (
+            response.status_code == 422
+            and isinstance(detail, dict)
+            and isinstance(detail.get("reasons"), list)
+        ):
+            raise PreDeployCheckFailed(detail["reasons"])
         raise OrchestrationApiError(
             f"API {method} {path} failed ({response.status_code}): {detail}"
         )
@@ -79,6 +98,7 @@ def _empty_artifact(session_id: str = "", stage: str = "failed", text: str = "")
         "spec_validation": None,
         "deployment": None,
         "remaining_placeholders": [],
+        "spec_placeholders": [],
         "api_raw": None,
     }
 
@@ -140,6 +160,10 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
     remaining = list(data.get("remaining_placeholders") or [])
     art["placeholders"] = remaining
     art["remaining_placeholders"] = remaining
+    # Spec-level TODOs (workflow_spec) — primary list for the fill form.
+    # Prefer this over plan remaining + ASL scan when the API provides it.
+    spec_ph = list(data.get("spec_placeholders") or [])
+    art["spec_placeholders"] = spec_ph
     art["enrichment_error"] = data.get("enrichment_error")
     art["enrichment_question"] = data.get("enrichment_question")
 
@@ -148,10 +172,18 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
         "",
     ]
     if remaining:
-        parts.append("Remaining placeholders (allowed until later pre-flight):")
+        parts.append("Remaining plan placeholders (allowed until later pre-flight):")
         parts.extend(f"- `{p}`" for p in remaining)
     else:
-        parts.append("All known placeholders were resolved (or none were present).")
+        parts.append("All known plan placeholders were resolved (or none were present).")
+
+    if spec_ph:
+        parts.append("")
+        parts.append(
+            f"**{len(spec_ph)} workflow-spec placeholder(s)** must be filled "
+            "before ASL can be generated:"
+        )
+        parts.extend(f"- `{p}`" for p in spec_ph)
 
     if data.get("enrichment_question"):
         parts.append("")
@@ -175,6 +207,7 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
     art["asl_json"] = data.get("asl")
     art["graph_dot"] = data.get("asl_graph_dot") or art.get("graph_dot")
     art["validations"] = data.get("asl_validations") or art.get("validations")
+
     if data.get("asl_error"):
         parts.append("")
         parts.append(f"ASL generation error: {data['asl_error']}")
@@ -244,8 +277,39 @@ def api_answer_enrichment(session_id: str, answer: str) -> dict:
     return _normalize_approve_response(session_id, data)
 
 
+def api_fill_spec_placeholders(
+    session_id: str, overrides: dict[str, str] | None = None
+) -> dict:
+    """POST /session/{id}/spec/placeholders — resolve TODO_ tokens in
+    the locked workflow_spec, then run Stage 4 once none remain.
+    """
+    data = _request(
+        "POST",
+        f"/session/{session_id}/spec/placeholders",
+        {"overrides": overrides or {}},
+    )
+    return _normalize_approve_response(session_id, data)
+
+
 def api_get_session(session_id: str) -> dict:
     return _request("GET", f"/session/{session_id}")
+
+
+def api_get_status(session_id: str) -> dict:
+    """GET /session/{id}/status — cheap, poll-friendly read of what the
+    backend is doing *right now* for this session (e.g. "Working out the
+    control flow…"). Safe to call every ~1s while a /message, /reject,
+    /approve, or /enrichment/answer call is in flight on another
+    connection. Returns {"busy": False} once nothing is running, and
+    also (deliberately, not an error) if the API is briefly unreachable
+    -- a failed status poll should never interrupt the actual request.
+    """
+    if USE_MOCK:
+        return {"busy": False}
+    try:
+        return _request("GET", f"/session/{session_id}/status")
+    except OrchestrationApiError:
+        return {"busy": False}
 
 
 def api_generate_asl(session_id: str) -> dict:
@@ -292,6 +356,60 @@ def api_download_asl(session_id: str) -> tuple[bytes, str]:
             filename = part
     return response.content, filename
 
+
+def api_deploy_workflow(
+    session_id: str,
+    state_machine_name: str | None = None,
+    role_arn: str | None = None,
+    tags: dict[str, str] | None = None,
+    force: bool = False,
+) -> dict:
+    """POST /session/{id}/deploy — Stage 5: create-or-update the session's
+    locked ASL as a real Step Functions state machine.
+
+    Raises PreDeployCheckFailed (with `.reasons`) if the API's pre-deploy
+    checks block the deploy (422) -- validation not passing, leftover
+    TODO_ placeholders anywhere in the ASL, or no execution role
+    configured. Raises the generic OrchestrationApiError for everything
+    else (unknown session, no ASL yet, or AWS itself rejecting the call).
+    """
+    payload: dict = {"force": force}
+    if state_machine_name:
+        payload["state_machine_name"] = state_machine_name
+    if role_arn:
+        payload["role_arn"] = role_arn
+    if tags:
+        payload["tags"] = tags
+    data = _request("POST", f"/session/{session_id}/deploy", payload)
+    return {
+        "state_machine_arn": data.get("state_machine_arn"),
+        "action": data.get("action"),
+        "state_machine_name": data.get("state_machine_name"),
+        "region": data.get("region"),
+        "role_arn": data.get("role_arn"),
+    }
+
+
+def deploy_workflow(
+    run_id: str,
+    state_machine_name: str | None = None,
+    role_arn: str | None = None,
+    tags: dict[str, str] | None = None,
+    force: bool = False,
+) -> dict:
+    """Stage 5 entry point used by app.py. Mirrors approve_plan /
+    answer_enrichment's USE_MOCK split.
+    """
+    if USE_MOCK:
+        _mock_pause()
+        return _mock_deploy_result(run_id, state_machine_name)
+    return api_deploy_workflow(
+        run_id,
+        state_machine_name=state_machine_name,
+        role_arn=role_arn,
+        tags=tags,
+        force=force,
+    )
 
 
 def _apply_asl_payload_to_artifact(art: dict, data: dict) -> dict:
@@ -448,6 +566,23 @@ def answer_enrichment(run_id: str, answer: str) -> dict:
     return api_answer_enrichment(run_id, answer)
 
 
+def fill_spec_placeholders(run_id: str, overrides: dict[str, str] | None = None) -> dict:
+    """Fill workflow_spec TODO_ tokens then regenerate ASL when clear."""
+    if USE_MOCK:
+        _mock_pause()
+        art = _mock_approved_artifact(run_id, "Mock placeholders applied.")
+        # Simulate resolution: drop remaining list when overrides provided.
+        if overrides:
+            art["spec_placeholders"] = []
+            art["remaining_placeholders"] = []
+            art["placeholders"] = []
+            art["assistant_text"] = (
+                "Placeholders applied (mock). ASL regenerated with resolved values."
+            )
+        return art
+    return api_fill_spec_placeholders(run_id, overrides or {})
+
+
 def generate_asl(run_id: str) -> dict:
     """Re-run Stage 4 from the locked workflow_spec."""
     if USE_MOCK:
@@ -466,10 +601,13 @@ def approve_spec(run_id: str, workflow_spec_override=None, region: str = "ap-sou
     return approve_plan(run_id, overrides={})
 
 
-def approve_and_deploy(*args, **kwargs) -> dict:
-    raise OrchestrationApiError(
-        "Deploy is not available yet — no deploy API endpoint."
-    )
+def approve_and_deploy(run_id: str, *args, **kwargs) -> dict:
+    """Old name kept for back-compat with any earlier callers. Prefer
+    deploy_workflow() -- same thing, clearer name now that the deploy
+    API endpoint actually exists.
+    """
+    _ = args
+    return deploy_workflow(run_id, **kwargs)
 
 
 def revalidate_asl(asl: Any, session_id: str | None = None) -> dict:
@@ -503,6 +641,7 @@ def build_graphviz_dot(asl_definition: dict) -> str:
         start = asl_definition["StartAt"]
     except Exception:
         return "digraph G {}"
+
     lines = [
         "digraph Workflow {",
         'rankdir="TB";',
@@ -521,6 +660,7 @@ def build_graphviz_dot(asl_definition: dict) -> str:
 # ---------------------------------------------------------------------------
 
 _MOCK_RUNS: dict[str, dict] = {}
+_MOCK_DEPLOYS: dict[str, dict] = {}
 
 # Artificial delay so the typing indicator is visible in mock mode.
 # Set to 0 to disable.
@@ -572,6 +712,23 @@ def _looks_out_of_scope(text: str) -> bool:
     return len(lower.split()) >= 4 and not any(
         h in lower for h in ("aws", "amazon", "step", "task", "queue", "bucket")
     )
+
+
+def _mock_deploy_result(run_id: str, state_machine_name: str | None = None) -> dict:
+    """Second call for the same run_id reports 'updated' instead of
+    'created', matching the real API's create-or-update behavior."""
+    name = state_machine_name or f"mock-workflow-{(run_id or 'run')[:8]}"
+    existing = _MOCK_DEPLOYS.get(run_id)
+    action = "updated" if existing else "created"
+    result = {
+        "state_machine_arn": f"arn:aws:states:ap-south-1:123456789012:stateMachine:{name}",
+        "action": action,
+        "state_machine_name": name,
+        "region": "ap-south-1",
+        "role_arn": "arn:aws:iam::123456789012:role/mock-execution-role",
+    }
+    _MOCK_DEPLOYS[run_id] = result
+    return result
 
 
 def _mock_send_message(message: str, run_id: str | None = None) -> dict:

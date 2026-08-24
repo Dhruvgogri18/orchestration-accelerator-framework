@@ -82,11 +82,22 @@ from typing import Iterator, Literal
 import jsonschema
 
 from orchestrator.api.schemas.common import Plan
-from orchestrator.api.services.enrichment_prompts import ENRICHMENT_SYSTEM_PROMPT
+from orchestrator.api.services.enrichment.prompts import ENRICHMENT_SYSTEM_PROMPT
 from orchestrator.indexing.gateway_client import chat_completion
+from orchestrator.api.services.llm_trace import log_event, llm_stage
 
 MAX_ENRICHMENT_ATTEMPTS = 4
 MAX_CLARIFICATION_ROUNDS = 3
+
+# If the exact same resource string trips _find_unknown_arns this many
+# times across attempts in one enrichment run, stop asking the model to
+# re-guess it and patch it to the placeholder ourselves. The model is
+# already told to fall back to TODO_UNKNOWN_INTEGRATION_ARN when unsure
+# (see ENRICHMENT_SYSTEM_PROMPT) -- this is a backstop for when it doesn't
+# take that instruction, so one bad guess doesn't burn the whole attempt
+# budget re-guessing the same wrong (or, as with ".sync:2", sometimes
+# actually-correct-but-whitelist-missing) value.
+ARN_FORCE_PLACEHOLDER_AFTER = 2
 
 # A declared "added" step may only be one of these ASL types -- a
 # minimal terminal, never a real action or new decision point. This is
@@ -114,7 +125,7 @@ KNOWN_ARNS = {
     "arn:aws:states:::ecs:runTask",
     "arn:aws:states:::states:startExecution",
 }
-KNOWN_SUFFIXES = ("", ".sync", ".sync2", ".waitForTaskToken")
+KNOWN_SUFFIXES = ("", ".sync", ".sync:2", ".waitForTaskToken")
 
 # arn:aws:states:::aws-sdk:<service>:<apiAction> is a deliberately
 # open-ended REAL AWS pattern -- it mirrors the AWS SDK's own API
@@ -158,8 +169,12 @@ def _load_schema() -> dict:
     # schema file actually lives somewhere else now, update this path
     # accordingly; this is the one thing in this file NOT rebuilt from
     # scratch, since I can't see your current directory layout.
+    #
+    # This file lives at api/services/enrichment/service.py, so:
+    # parents[0] = services/enrichment/, parents[1] = services/,
+    # parents[2] = api/
     schema_path = (
-        Path(__file__).resolve().parents[1]   # api/
+        Path(__file__).resolve().parents[2]   # api/
         / "config"
         / "workflow_spec.schema.json"
     )
@@ -192,13 +207,26 @@ def _iter_all_steps(steps: list[dict] | None) -> Iterator[dict]:
     """Yields every step dict in the document, depth-first: each
     top-level step, then recursing into its Parallel branches and Map
     iterator (if any) before moving to the next top-level step.
+
+    Defensive against malformed (non-dict) entries at any level -- a
+    schema-invalid LLM response (e.g. a `steps` entry that's a raw
+    string instead of an object) must not crash this walk. That case
+    belongs to _check_schema to catch and feed back to the model;
+    every other check/caller that shares this walker (fidelity, ARN
+    whitelist, the enrichment loop's repeat-detection) would otherwise
+    inherit whatever ordering guarantee happened to protect them,
+    which is exactly the kind of implicit, easy-to-break invariant
+    that caused this bug once already.
     """
     for step in steps or []:
+        if not isinstance(step, dict):
+            continue
         yield step
         for branch in step.get("branches") or []:
-            yield from _iter_all_steps(branch.get("steps"))
+            if isinstance(branch, dict):
+                yield from _iter_all_steps(branch.get("steps"))
         iterator = step.get("iterator")
-        if iterator:
+        if isinstance(iterator, dict):
             yield from _iter_all_steps(iterator.get("steps"))
 
 
@@ -215,22 +243,61 @@ def _find_step_by_id(spec: dict, step_id: str) -> dict | None:
 
 def _collect_all_references(spec: dict) -> set[str]:
     """Every step id referenced anywhere as a routing target: next_step,
-    choices[].next_step, catch[].next_step, default_next -- across the
-    whole document, not just top level.
+    choices[].next_step, catch[].next_step, default_next, and Parallel /
+    Map entry points (branches[].start_at, iterator.start_at) -- across
+    the whole document, not just top level.
     """
     refs: set[str] = set()
-    for s in _iter_all_steps(spec.get("steps")):
-        if s.get("next_step"):
-            refs.add(s["next_step"])
-        if s.get("default_next"):
-            refs.add(s["default_next"])
-        for c in s.get("choices") or []:
-            if c.get("next_step"):
-                refs.add(c["next_step"])
-        for c in s.get("catch") or []:
-            if c.get("next_step"):
-                refs.add(c["next_step"])
+
+    def walk_steps(steps) -> None:
+        for s in steps or []:
+            if not isinstance(s, dict):
+                continue
+            if s.get("next_step"):
+                refs.add(s["next_step"])
+            if s.get("default_next"):
+                refs.add(s["default_next"])
+            for c in s.get("choices") or []:
+                if c.get("next_step"):
+                    refs.add(c["next_step"])
+            for c in s.get("catch") or []:
+                if c.get("next_step"):
+                    refs.add(c["next_step"])
+            for b in s.get("branches") or []:
+                if isinstance(b, dict) and b.get("start_at"):
+                    refs.add(b["start_at"])
+                walk_steps((b or {}).get("steps"))
+            it = s.get("iterator")
+            if isinstance(it, dict):
+                if it.get("start_at"):
+                    refs.add(it["start_at"])
+                walk_steps(it.get("steps"))
+
+    walk_steps(spec.get("steps"))
     return refs
+
+
+def _added_step_nesting_context(spec: dict, step_id: str) -> str | None:
+    """Return 'map_iterator' | 'parallel_branch' | None for where step_id lives."""
+
+    def walk(steps, ctx: str | None) -> str | None:
+        for s in steps or []:
+            if not isinstance(s, dict):
+                continue
+            if s.get("id") == step_id:
+                return ctx
+            for b in s.get("branches") or []:
+                found = walk((b or {}).get("steps"), "parallel_branch")
+                if found:
+                    return found
+            it = s.get("iterator")
+            if isinstance(it, dict):
+                found = walk(it.get("steps"), "map_iterator")
+                if found:
+                    return found
+        return None
+
+    return walk(spec.get("steps"), None)
 
 
 # ---- checks -------------------------------------------------------
@@ -401,13 +468,26 @@ def _check_addition_validity(plan: Plan, spec: dict) -> str | None:
                 f"'{added_id}' is declared in added_step_ids but does not appear "
                 f"anywhere in the output steps."
             )
-        if step.get("type") not in ALLOWED_ADDED_STEP_TYPES:
+        nest = _added_step_nesting_context(spec, added_id)
+        stype = step.get("type")
+        if nest in {"map_iterator", "parallel_branch"}:
+            # Map/Parallel need distinct worker step ids inside the nest;
+            # those may be Tasks (the per-item / per-branch work). Still
+            # forbid inventing nested Parallel/Map/Choice as "added" work.
+            if stype not in (ALLOWED_ADDED_STEP_TYPES | {"Task", "Wait", "Pass"}):
+                return (
+                    f"'{added_id}' is declared in added_step_ids and nested under "
+                    f"a {nest}, but type '{stype}' is not allowed there. Nested "
+                    f"added workers may be Task/Wait/Pass or Succeed/Fail only."
+                )
+        elif stype not in ALLOWED_ADDED_STEP_TYPES:
             return (
                 f"'{added_id}' is declared in added_step_ids with type "
-                f"'{step.get('type')}', but added steps may only be "
+                f"'{stype}', but top-level added steps may only be "
                 f"{sorted(ALLOWED_ADDED_STEP_TYPES)} -- a minimal terminal, never "
-                f"a Task/Choice/Wait/Parallel/Map. Added steps cannot perform "
-                f"external actions or introduce new decision logic."
+                f"a Task/Choice/Wait/Parallel/Map. (Exception: Task/Wait/Pass "
+                f"are allowed when nested inside a Map iterator or Parallel "
+                f"branch as the worker for that structure.)"
             )
         if added_id not in refs:
             return (
@@ -481,13 +561,18 @@ def _check_no_unjustified_nesting(plan: Plan, spec: dict) -> str | None:
     return None
 
 
-def _check_arn_whitelist(spec: dict) -> str | None:
-    """Returns an error message if any Task step's `resource`, ANYWHERE
-    in the document (including nested inside Parallel branches / Map
-    iterators), looks like a Step Functions optimized integration ARN
-    but doesn't exactly match a known-real integration and isn't a
-    TODO_ placeholder.
+def _find_unknown_arns(spec: dict) -> list[dict]:
+    """Returns [{"step_id": ..., "resource": ...}, ...] for every Task
+    step's `resource`, ANYWHERE in the document (including nested inside
+    Parallel branches / Map iterators), that looks like a Step Functions
+    optimized integration ARN but doesn't exactly match a known-real
+    integration and isn't a TODO_ placeholder.
+
+    Factored out of _check_arn_whitelist so callers can act on individual
+    violations (e.g. auto-patch a resource that keeps getting rejected)
+    rather than only seeing the first error message.
     """
+    violations = []
     for step in _iter_all_steps(spec.get("steps")):
         resource = step.get("resource")
         if not resource:
@@ -503,14 +588,25 @@ def _check_arn_whitelist(spec: dict) -> str | None:
                 for suffix in KNOWN_SUFFIXES
             )
             if not matches_known:
-                return (
-                    f"Step '{step.get('id')}' has resource '{resource}', which does "
-                    f"not match any known Step Functions integration pattern. If "
-                    f"you are not certain of the exact fixed ARN pattern for this "
-                    f"service, use 'TODO_UNKNOWN_INTEGRATION_ARN' instead of "
-                    f"guessing."
-                )
-    return None
+                violations.append({"step_id": step.get("id"), "resource": resource})
+    return violations
+
+
+def _check_arn_whitelist(spec: dict) -> str | None:
+    """Returns an error message for the first unknown-ARN violation found
+    (see _find_unknown_arns), or None if there are none.
+    """
+    violations = _find_unknown_arns(spec)
+    if not violations:
+        return None
+    v = violations[0]
+    return (
+        f"Step '{v['step_id']}' has resource '{v['resource']}', which does "
+        f"not match any known Step Functions integration pattern. If "
+        f"you are not certain of the exact fixed ARN pattern for this "
+        f"service, use 'TODO_UNKNOWN_INTEGRATION_ARN' instead of "
+        f"guessing."
+    )
 
 
 def _run_all_checks(plan: Plan, spec: dict) -> str | None:
@@ -547,6 +643,8 @@ def _run_enrichment_loop(
     candidate spec (validate via _run_all_checks, repair on failure).
     """
     last_error = None
+    unknown_arn_seen_counts: dict[str, int] = {}
+
     for _attempt in range(1, MAX_ENRICHMENT_ATTEMPTS + 1):
         raw = chat_completion(messages, temperature=0)
         cleaned = _strip_code_fences(raw)
@@ -584,6 +682,21 @@ def _run_enrichment_loop(
                 clarification_rounds=clarification_rounds + 1,
             )
 
+        # Before running the full check suite: if this response repeats an
+        # ARN-whitelist violation on the exact same resource string we've
+        # already rejected ARN_FORCE_PLACEHOLDER_AFTER times, the model is
+        # stuck re-guessing rather than falling back to the placeholder as
+        # instructed. Patch it ourselves rather than spending another
+        # attempt asking again.
+        for violation in _find_unknown_arns(parsed):
+            resource = violation["resource"]
+            seen = unknown_arn_seen_counts.get(resource, 0) + 1
+            unknown_arn_seen_counts[resource] = seen
+            if seen >= ARN_FORCE_PLACEHOLDER_AFTER:
+                step = _find_step_by_id(parsed, violation["step_id"])
+                if step is not None:
+                    step["resource"] = "TODO_UNKNOWN_INTEGRATION_ARN"
+
         error = _run_all_checks(plan, parsed)
         if error is None:
             return EnrichmentResult(status="complete", spec=parsed, messages=messages)
@@ -603,7 +716,8 @@ def enrich_plan(plan: Plan) -> EnrichmentResult:
         {"role": "system", "content": ENRICHMENT_SYSTEM_PROMPT},
         {"role": "user", "content": plan.model_dump_json()},
     ]
-    return _run_enrichment_loop(plan, messages, clarification_rounds=0)
+    with llm_stage("enrichment"):
+        return _run_enrichment_loop(plan, messages, clarification_rounds=0)
 
 
 def continue_enrichment(

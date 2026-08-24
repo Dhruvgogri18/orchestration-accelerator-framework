@@ -40,6 +40,25 @@ class APISettings(BaseSettings):
         validation_alias="AWS_STATE_MACHINE_TYPE",
     )
 
+    # --- AWS (Stage 5 deploy) ---
+    # The IAM role Step Functions assumes to RUN the deployed state
+    # machine (states.amazonaws.com trust policy). This is deliberately
+    # not something the API creates on your behalf -- minting IAM
+    # roles/policies from an LLM-adjacent service is a bad idea. Set it
+    # here for a single-role setup, or pass role_arn per deploy request
+    # for multi-team/multi-account setups.
+    aws_state_machine_role_arn: str | None = Field(
+        default=None,
+        validation_alias="AWS_STATE_MACHINE_ROLE_ARN",
+    )
+    # Optional prefix so state machines created by this tool are easy
+    # to pick out in an account that has other, unrelated ones — e.g.
+    # "orch-" -> "orch-my-workflow". Empty string (default) adds none.
+    aws_deploy_name_prefix: str = Field(
+        default="",
+        validation_alias="AWS_DEPLOY_NAME_PREFIX",
+    )
+
 
 @lru_cache
 def get_api_settings() -> APISettings:
