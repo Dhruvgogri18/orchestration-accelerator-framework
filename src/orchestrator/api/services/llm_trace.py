@@ -59,9 +59,110 @@ import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field as _dc_field
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
+
+# ---- token accounting ------------------------------------------------
+#
+# tiktoken is optional. When present we get a real (if model-approximate)
+# token count; when absent we fall back to a chars/4 heuristic, which is
+# the commonly-cited rule of thumb for English text and is good enough
+# for relative cost tracking (spotting an expensive stage/prompt change)
+# even though it won't match a provider's billed count exactly.
+try:
+    import tiktoken
+
+    _TIKTOKEN_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised via _TIKTOKEN_AVAILABLE=False path
+    tiktoken = None  # type: ignore[assignment]
+    _TIKTOKEN_AVAILABLE = False
+
+# Universal fallback encoding -- close enough for GPT/Claude-family
+# tokenizers for the purpose of relative cost tracking. We don't know
+# the actual model from this layer (gateway_client owns that), so we
+# don't try to pick a model-specific encoding.
+_FALLBACK_ENCODING_NAME = "cl100k_base"
+
+
+@lru_cache(maxsize=1)
+def _encoding():
+    if not _TIKTOKEN_AVAILABLE:
+        return None
+    try:
+        return tiktoken.get_encoding(_FALLBACK_ENCODING_NAME)
+    except Exception:
+        return None
+
+
+def count_tokens(text: str | None) -> int:
+    """Best-effort token count for one string. Uses tiktoken's cl100k_base
+    encoding when available, else a chars/4 heuristic. Never raises.
+    """
+    if not text:
+        return 0
+    enc = _encoding()
+    if enc is not None:
+        try:
+            return len(enc.encode(text))
+        except Exception:
+            pass
+    return max(1, len(text) // 4)
+
+
+def _token_estimate_method() -> str:
+    return "tiktoken:" + _FALLBACK_ENCODING_NAME if _encoding() is not None else "heuristic:chars/4"
+
+
+def _count_message_tokens(messages: list[dict]) -> int:
+    total = 0
+    for m in messages or []:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, str):
+            total += count_tokens(content)
+    return total
+
+
+# ---- cost estimation ---------------------------------------------------
+#
+# Best-effort USD estimate, OFF by default. Set OAF_LLM_PRICING_MODEL to
+# one of the keys below (or add your own) to get a cost figure alongside
+# token counts. Prices are per 1M tokens (input, output) and go stale --
+# treat this as a rough, relative signal for comparing stages/sessions,
+# not a billing reconciliation tool.
+MODEL_PRICING_PER_1M: dict[str, tuple[float, float]] = {
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4o-mini": (0.15, 0.60),
+    "claude-3-5-sonnet": (3.00, 15.00),
+    "claude-3-5-haiku": (0.80, 4.00),
+    "claude-3-7-sonnet": (3.00, 15.00),
+}
+
+
+def pricing_model_hint() -> str | None:
+    """Which MODEL_PRICING_PER_1M row to cost against, if any. This is a
+    label for cost estimation only -- it does not select which model
+    actually serves the request (that's entirely gateway_client's call).
+    """
+    return os.environ.get("OAF_LLM_PRICING_MODEL") or None
+
+
+def estimate_cost_usd(
+    prompt_tokens: int, completion_tokens: int, *, model: str | None = None
+) -> float | None:
+    """Returns None (not an unknown-but-zero cost) when we have no
+    pricing row for `model`, so callers/log readers can tell "cost
+    unknown" apart from "cost is genuinely zero".
+    """
+    if not model:
+        return None
+    row = MODEL_PRICING_PER_1M.get(model)
+    if row is None:
+        return None
+    in_price, out_price = row
+    return round(prompt_tokens * in_price / 1_000_000 + completion_tokens * out_price / 1_000_000, 6)
 
 # ---- config ---------------------------------------------------------------
 
@@ -169,6 +270,89 @@ _STAGE_LABELS: dict[str, str] = {
 _status_lock = threading.Lock()
 _status_store: dict[str, dict[str, Any]] = {}
 
+# ---- live token/cost usage (for polling + end-of-request summary) --------
+#
+# Same shape/limits as _status_store above: in-memory, single-process,
+# latest-cumulative-total per session (not per-call history -- the full
+# per-call detail already lives in the session's .log file via
+# log_event("llm_call"/"llm_response", ...)). Keyed by session_id;
+# "_unassigned" holds pre-session-id calls same as the file logger does.
+#
+# NOTE: never evicted. A long-lived server tracking many sessions should
+# call clear_token_usage(session_id) once a session is truly done (e.g.
+# from the same place that would otherwise let its status/log grow
+# unboundedly), or back this with shared storage across workers.
+
+_token_usage_lock = threading.Lock()
+_token_usage_store: dict[str, dict[str, Any]] = {}
+
+
+def _usage_key(session_id: str | None) -> str:
+    return session_id or "_unassigned"
+
+
+def _empty_usage() -> dict[str, Any]:
+    return {
+        "calls": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+        "cost_is_estimate": pricing_model_hint() is not None,
+        "stages": {},
+    }
+
+
+def _record_usage(
+    session_id: str | None,
+    stage: str | None,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cost_usd: float | None,
+) -> dict[str, Any]:
+    key = _usage_key(session_id)
+    stage_key = stage or "_unstaged"
+    with _token_usage_lock:
+        totals = _token_usage_store.setdefault(key, _empty_usage())
+        totals["calls"] += 1
+        totals["prompt_tokens"] += prompt_tokens
+        totals["completion_tokens"] += completion_tokens
+        totals["total_tokens"] += prompt_tokens + completion_tokens
+        if cost_usd is not None:
+            totals["cost_usd"] += cost_usd
+
+        stage_totals = totals["stages"].setdefault(
+            stage_key,
+            {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost_usd": 0.0},
+        )
+        stage_totals["calls"] += 1
+        stage_totals["prompt_tokens"] += prompt_tokens
+        stage_totals["completion_tokens"] += completion_tokens
+        stage_totals["total_tokens"] += prompt_tokens + completion_tokens
+        if cost_usd is not None:
+            stage_totals["cost_usd"] += cost_usd
+
+        return json.loads(json.dumps(totals))  # cheap deep copy for a safe-to-return snapshot
+
+
+def get_token_usage(session_id: str | None) -> dict[str, Any]:
+    """Cumulative prompt/completion/total token counts (and estimated
+    cost, if OAF_LLM_PRICING_MODEL is set) for a session so far, broken
+    down by stage. Returns a zeroed structure for an unknown session
+    rather than None, so callers can render it directly.
+    """
+    with _token_usage_lock:
+        totals = _token_usage_store.get(_usage_key(session_id))
+        return json.loads(json.dumps(totals)) if totals else _empty_usage()
+
+
+def clear_token_usage(session_id: str | None) -> None:
+    """Drop a session's accumulated usage. Call once a session is truly
+    finished if you're tracking many long-lived sessions in one process.
+    """
+    with _token_usage_lock:
+        _token_usage_store.pop(_usage_key(session_id), None)
+
 
 def _stage_label(stage: str | None) -> str:
     if not stage:
@@ -243,7 +427,16 @@ def start_request(
 
 
 def end_request(*, status: str | None = None, error: str | None = None) -> None:
-    log_event("request_end", status=status, error=_truncate(error) if error else None)
+    usage = get_token_usage(_session_id.get())
+    log_event(
+        "request_end",
+        status=status,
+        error=_truncate(error) if error else None,
+        total_prompt_tokens=usage["prompt_tokens"],
+        total_completion_tokens=usage["completion_tokens"],
+        total_tokens=usage["total_tokens"],
+        total_cost_usd=usage["cost_usd"] if usage["cost_is_estimate"] else None,
+    )
     set_status(_session_id.get(), None, status="done")
 
 
@@ -304,6 +497,22 @@ def log_event(event: str, **fields: Any) -> None:
             f.write(index_line + "\n")
 
 
+@dataclass
+class LlmCallHandle:
+    """Returned by log_llm_call(), passed into log_llm_response(). Carries
+    the perf_counter start time plus the already-computed prompt token
+    count so log_llm_response() doesn't need to re-walk `messages` (and
+    so a caller can't accidentally recompute it against the wrong
+    message list after appending repair-loop turns).
+    """
+
+    t0: float
+    prompt_tokens: int
+    model: str | None = None
+    session_id: str | None = _dc_field(default=None)
+    stage: str | None = _dc_field(default=None)
+
+
 def log_llm_call(
     *,
     messages: list[dict],
@@ -311,15 +520,22 @@ def log_llm_call(
     temperature: float | None = None,
     seed: int | None = None,
     extra: dict | None = None,
-) -> float:
-    """Log an outbound LLM request. Returns perf_counter start time."""
+) -> LlmCallHandle:
+    """Log an outbound LLM request and start its token/cost accounting.
+
+    Returns an LlmCallHandle -- pass it straight into log_llm_response()
+    when the completion (or error) comes back.
+    """
     t0 = time.perf_counter()
+    prompt_tokens = _count_message_tokens(messages or [])
     payload: dict[str, Any] = {
         "model": model,
         "temperature": temperature,
         "seed": seed,
         "message_count": len(messages or []),
         "roles": [m.get("role") for m in (messages or [])],
+        "prompt_tokens": prompt_tokens,
+        "token_estimate_method": _token_estimate_method(),
     }
     if _log_prompts():
         payload["messages"] = _sanitize_messages(messages or [])
@@ -328,28 +544,78 @@ def log_llm_call(
     if extra:
         payload["extra"] = _safe_meta(extra)
     log_event("llm_call", **payload)
-    return t0
+    return LlmCallHandle(
+        t0=t0,
+        prompt_tokens=prompt_tokens,
+        model=model,
+        session_id=_session_id.get(),
+        stage=_stage.get(),
+    )
 
 
 def log_llm_response(
     *,
-    t0: float,
+    t0: float | LlmCallHandle,
     content: str | None,
     model: str | None = None,
     error: str | None = None,
-) -> None:
-    """Log the model completion (or error) for the matching llm_call."""
-    duration_ms = round((time.perf_counter() - t0) * 1000, 1)
+) -> dict[str, Any]:
+    """Log the model completion (or error) for the matching llm_call, and
+    fold its token/cost usage into the session's running total.
+
+    `t0` accepts either the LlmCallHandle returned by log_llm_call()
+    (preferred -- carries the prompt token count along) or a bare
+    perf_counter float for callers that only care about timing; in the
+    latter case prompt_tokens is reported as 0 since it's unknown here.
+
+    Returns the per-call usage dict that was folded into the session
+    total: {prompt_tokens, completion_tokens, total_tokens, cost_usd}.
+    """
+    if isinstance(t0, LlmCallHandle):
+        handle = t0
+        start = handle.t0
+        prompt_tokens = handle.prompt_tokens
+        model = model or handle.model
+        session_id = handle.session_id
+        stage = handle.stage
+    else:
+        start = t0
+        prompt_tokens = 0
+        session_id = _session_id.get()
+        stage = _stage.get()
+
+    duration_ms = round((time.perf_counter() - start) * 1000, 1)
+    completion_tokens = count_tokens(content) if content is not None else 0
+    cost_usd = estimate_cost_usd(prompt_tokens, completion_tokens, model=model or pricing_model_hint())
+
     payload: dict[str, Any] = {
         "model": model,
         "duration_ms": duration_ms,
         "response_chars": len(content or ""),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "cost_usd": cost_usd,
     }
     if error:
         payload["error"] = _truncate(error)
     if _log_prompts() and content is not None:
         payload["response"] = _truncate(content)
     log_event("llm_response", **payload)
+
+    if not error:
+        # Only successful calls count toward spend -- a failed attempt's
+        # prompt tokens were still billed by the provider in reality, but
+        # this store is meant to answer "what did the WORK cost", and a
+        # retried-after-error call already re-logs its own prompt cost.
+        _record_usage(session_id, stage, prompt_tokens, completion_tokens, cost_usd)
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "cost_usd": cost_usd,
+    }
 
 
 # ---- readable formatting ------------------------------------------------

@@ -17,7 +17,7 @@ import os
 from functools import lru_cache
 
 from dotenv import load_dotenv
-from langsmith import traceable
+# from langsmith import traceable
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -55,7 +55,7 @@ def get_client() -> OpenAI:
     return OpenAI(api_key=api_key, base_url=base_url)
 
 
-@traceable(name="chat_completion", run_type="llm")
+# @traceable(name="chat_completion", run_type="llm")
 @retry(wait=wait_exponential(multiplier=1, min=1, max=20), stop=stop_after_attempt(4))
 def chat_completion(
     messages: list[dict],
