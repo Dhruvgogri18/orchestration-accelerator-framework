@@ -115,6 +115,10 @@
             "type": "string"
           }
         },
+        "result_path": {
+          "type": "string",
+          "description": "ASL Catch ResultPath: where the error object is written on state before transitioning (e.g. '$.chargeError')."
+        },
         "next_step": {
           "type": "string"
         }
@@ -241,6 +245,14 @@
               "minimum": 1
             }
           }
+        },
+        "result_path": {
+          "type": "string",
+          "description": "ASL ResultPath: JSONPath where this state's result is written on the execution state (e.g. '$.batch'). Use null-equivalent omission to keep prior state; '$' replaces the entire state. Allowed on Task, Parallel, Map, Pass, and Wait."
+        },
+        "result_selector": {
+          "type": "object",
+          "description": "ASL ResultSelector: object that reshapes the raw task/parallel/map result before ResultPath is applied. Values may use path endings like 'Field.$' with JSONPath or intrinsic functions (e.g. States.StringToJson($.Body))."
         },
         "error": {
           "type": "string"

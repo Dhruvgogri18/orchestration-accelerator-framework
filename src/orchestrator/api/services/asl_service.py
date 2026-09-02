@@ -691,14 +691,18 @@ def _retry_to_asl(retriers: list[dict] | None) -> list[dict] | None:
 def _catch_to_asl(catchers: list[dict] | None) -> list[dict] | None:
     if not catchers:
         return None
-    return [
-        {
+    out: list[dict] = []
+    for c in catchers:
+        if not c.get("next_step"):
+            continue
+        entry: dict[str, Any] = {
             "ErrorEquals": list(c.get("error_equals") or ["States.ALL"]),
             "Next": c["next_step"],
         }
-        for c in catchers
-        if c.get("next_step")
-    ]
+        if c.get("result_path") is not None:
+            entry["ResultPath"] = c["result_path"]
+        out.append(entry)
+    return out or None
 
 
 def _apply_common_transition(state: dict, step: dict) -> None:
@@ -741,6 +745,10 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             state["Parameters"] = step["parameters"]
         if step.get("timeout_seconds") is not None:
             state["TimeoutSeconds"] = int(step["timeout_seconds"])
+        if step.get("result_selector") is not None:
+            state["ResultSelector"] = step["result_selector"]
+        if step.get("result_path") is not None:
+            state["ResultPath"] = step["result_path"]
         retry = _retry_to_asl(step.get("retry"))
         if retry:
             state["Retry"] = retry
@@ -756,6 +764,8 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             state["Timestamp"] = step["timestamp"]
         else:
             raise AslGenerationError(f"Wait step '{sid}' needs seconds or timestamp")
+        if step.get("result_path") is not None:
+            state["ResultPath"] = step["result_path"]
         _apply_common_transition(state, step)
 
     elif stype == "Choice":
@@ -776,6 +786,10 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
         if not branches:
             raise AslGenerationError(f"Parallel step '{sid}' has no branches")
         state["Branches"] = [_build_branch_asl(b, notes) for b in branches]
+        if step.get("result_selector") is not None:
+            state["ResultSelector"] = step["result_selector"]
+        if step.get("result_path") is not None:
+            state["ResultPath"] = step["result_path"]
         retry = _retry_to_asl(step.get("retry"))
         if retry:
             state["Retry"] = retry
@@ -801,6 +815,10 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             state["ItemBatcher"] = {
                 "MaxItemsPerBatch": items_batcher["max_items_per_batch"]
             }
+        if step.get("result_selector") is not None:
+            state["ResultSelector"] = step["result_selector"]
+        if step.get("result_path") is not None:
+            state["ResultPath"] = step["result_path"]
         retry = _retry_to_asl(step.get("retry"))
         if retry:
             state["Retry"] = retry
@@ -819,6 +837,10 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             state["Cause"] = step["cause"]
 
     elif stype == "Pass":
+        if step.get("result_selector") is not None:
+            state["ResultSelector"] = step["result_selector"]
+        if step.get("result_path") is not None:
+            state["ResultPath"] = step["result_path"]
         _apply_common_transition(state, step)
 
     return state

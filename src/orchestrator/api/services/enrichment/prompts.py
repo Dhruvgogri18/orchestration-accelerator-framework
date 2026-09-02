@@ -179,7 +179,11 @@ In any needs_clarification case, respond with ONLY:
 {"status": "needs_clarification", "clarifying_question": "Your single, specific question here."}
 
 Otherwise, output ONLY a single JSON object, no prose, no markdown fences, matching this shape:
-{"name": "same-name-as-input-plan", "summary": "same-summary-as-input-plan", "merged_step_ids": [], "added_step_ids": [], "steps": [{"id": "same-id-as-input-step", "type": "Task|Choice|Wait|Succeed|Fail|Parallel|Map", "description": "same-description-as-input-step", "service": "...", "resource": "...", "parameters": {}, "next_step": "NextStepId", "end": false, "choices": [{"condition": "$.status == approved", "next_step": "..."}], "default_next": "...", "retry": [{"error_equals": ["States.ALL"], "interval_seconds": 2, "max_attempts": 3, "backoff_rate": 2.0}], "catch": [{"error_equals": ["States.ALL"], "next_step": "..."}]}]}
+{"name": "same-name-as-input-plan", "summary": "same-summary-as-input-plan", "merged_step_ids": [], "added_step_ids": [], "steps": [{"id": "same-id-as-input-step", "type": "Task|Choice|Wait|Succeed|Fail|Parallel|Map", "description": "same-description-as-input-step", "service": "...", "resource": "...", "parameters": {}, "result_path": "$.optionalPath", "result_selector": {"orders.$": "States.StringToJson($.Body)"}, "next_step": "NextStepId", "end": false, "choices": [{"condition": "$.status == approved", "next_step": "..."}], "default_next": "...", "retry": [{"error_equals": ["States.ALL"], "interval_seconds": 2, "max_attempts": 3, "backoff_rate": 2.0}], "catch": [{"error_equals": ["States.ALL"], "result_path": "$.errorInfo", "next_step": "..."}], "error": "RequiredOnFailOnly", "cause": "optional on Fail"}]}
+
+Notes on optional fields in that shape:
+- `result_path` / `result_selector` are allowed on Task, Parallel, Map, Pass (and `result_path` on Wait / on Catch entries). Omit when not needed.
+- Every `type: "Fail"` step MUST include a non-empty `error` string (ASL Error name).
 
 If a previous attempt was rejected, you will be shown the specific validation error below -- fix exactly that issue without changing anything else that was already correct.
 </output_format>
