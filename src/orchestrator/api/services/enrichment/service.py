@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Literal
@@ -239,6 +240,23 @@ def _find_step_by_id(spec: dict, step_id: str) -> dict | None:
         if s.get("id") == step_id:
             return s
     return None
+
+
+def _unknown_arn_token(step_id: str | None) -> str:
+    """A TODO_ placeholder unique to this step, for the ARN-whitelist
+    force-patch backstop (see the ARN_FORCE_PLACEHOLDER_AFTER loop).
+
+    Must still match asl_service._PLACEHOLDER_PATTERN
+    (r"\\bTODO_[A-Z0-9_]+\\b") so downstream scanning/description/
+    override-substitution code (which all just do generic TODO_ token
+    matching) treats it like any other placeholder. Falls back to a
+    bare, non-unique token only if step_id is unusable -- better than
+    crashing, though callers should always have a real step id here.
+    """
+    suffix = re.sub(r"[^A-Z0-9]+", "_", (step_id or "").upper()).strip("_")
+    if not suffix:
+        return "TODO_UNKNOWN_INTEGRATION_ARN"
+    return f"TODO_UNKNOWN_INTEGRATION_ARN_{suffix}"
 
 
 def _collect_all_references(spec: dict) -> set[str]:
@@ -688,6 +706,16 @@ def _run_enrichment_loop(
         # stuck re-guessing rather than falling back to the placeholder as
         # instructed. Patch it ourselves rather than spending another
         # attempt asking again.
+        #
+        # IMPORTANT: the placeholder must be unique PER STEP, not the bare
+        # "TODO_UNKNOWN_INTEGRATION_ARN" constant. If two different steps
+        # both fail to resolve an ARN in the same enrichment run (common --
+        # one bad guess pattern often repeats across several steps), a
+        # shared literal token means apply_overrides_to_json's plain string
+        # substitution later fills EVERY one of those steps' Resource with
+        # whatever single value the user supplied for that one token --
+        # silently pointing multiple different Task states at the same
+        # (wrong) ARN instead of asking for a distinct value per step.
         for violation in _find_unknown_arns(parsed):
             resource = violation["resource"]
             seen = unknown_arn_seen_counts.get(resource, 0) + 1
@@ -695,7 +723,7 @@ def _run_enrichment_loop(
             if seen >= ARN_FORCE_PLACEHOLDER_AFTER:
                 step = _find_step_by_id(parsed, violation["step_id"])
                 if step is not None:
-                    step["resource"] = "TODO_UNKNOWN_INTEGRATION_ARN"
+                    step["resource"] = _unknown_arn_token(violation["step_id"])
 
         error = _run_all_checks(plan, parsed)
         if error is None:

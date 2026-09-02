@@ -65,6 +65,7 @@ def apply_overrides(plan: Plan, overrides: dict[str, str]) -> tuple[Plan, list[s
                 on_failure=list(step.on_failure or []),
                 on_timeout=list(step.on_timeout or []),
                 branches=list(step.branches or []),
+                component_type=step.component_type,
             )
         )
 
@@ -114,14 +115,34 @@ def _node_label(step: PlanStep) -> str:
     return f"{step.id}\\n({step.service})"
 
 
+def _md_escape_currency(text: str | None) -> str:
+    """Prevent Streamlit/Markdown math mode from eating `$1000`-style amounts.
+
+    Unescaped `$…$` pairs are treated as inline math, which collapses branch
+    labels like ``order amount is over $1000 → Charge`` into mangled text
+    (e.g. ``orderamountisnotover1000→…``). Escape every ``$`` so currency
+    and thresholds render literally in the plan summary.
+    """
+    if not text:
+        return ""
+    return str(text).replace("$", "\\$")
+
+
 def _summary_step_line(step: PlanStep) -> str:
+    desc = _md_escape_currency(step.description)
     if _is_placeholder_service(step.service):
-        return f"**{step.id}** — {step.description}"
-    return f"**{step.id}** ({step.service}) — {step.description}"
+        return f"**{step.id}** — {desc}"
+    return f"**{step.id}** ({step.service}) — {desc}"
 
 
 def render_plan_summary(plan: Plan) -> str:
-    lines = [f"### {plan.name}", "", plan.summary, "", "**Steps:**"]
+    lines = [
+        f"### {_md_escape_currency(plan.name)}",
+        "",
+        _md_escape_currency(plan.summary),
+        "",
+        "**Steps:**",
+    ]
     for i, step in enumerate(plan.steps, start=1):
         lines.append(f"{i}. {_summary_step_line(step)}")
         flow_bits: list[str] = []
@@ -137,7 +158,8 @@ def render_plan_summary(plan: Plan) -> str:
             )
         if step.branches:
             arms = ", ".join(
-                f"{b.condition} → `{b.next}`" for b in step.branches
+                f"{_md_escape_currency(b.condition)} → `{b.next}`"
+                for b in step.branches
             )
             flow_bits.append(f"branches: {arms}")
         if flow_bits:
@@ -166,36 +188,248 @@ def _plan_has_structured_flow(plan: Plan) -> bool:
     return False
 
 
-def _is_parallel_style_branches(step: PlanStep) -> bool:
-    """True when branches look like Parallel arms, not exclusive Choice arms.
+# ---------------------------------------------------------------------------
+# Control-flow kind classification (Choice / Parallel / Map)
+#
+# Single source of truth used by render (diagram + summary) and by
+# canonicalize (branch labeling). Prefer explicit `component_type` from
+# Pipeline Analysis; only fall back to text heuristics for older stored
+# plans / templates that predate the field.
+#
+# Design rule for the fallback (when component_type is absent):
+#   - Parallel requires POSITIVE concurrency evidence.
+#   - Map requires POSITIVE iteration evidence (and a single branch body).
+#   - Otherwise any step with branches is Choice (exclusive alternatives).
+# Exclusive branches are the default shape of "decide / if / whether /
+# threshold / outcome" language. Concurrent branches are the special case
+# and must not be inferred from the mere presence of a branches list.
+# ---------------------------------------------------------------------------
 
-    Extraction often encodes Parallel as a synthetic step with branch
-    conditions like 'parallel arm: orders'. Choice arms use labels like
-    'approved' / 'rejected'. Detecting this lets the diagram draw a clear
-    join edge (next) after the arms complete.
+_PARALLEL_EVIDENCE = (
+    "parallel",
+    "concurrent",
+    "simultaneously",
+    "at the same time",
+    "in parallel",
+    "all at once",
+    "in tandem",
+    "fan-out",
+    "fan out",
+)
+
+_MAP_ITERATE_KEYWORDS = (
+    "for each",
+    "for every",
+    "map over",
+    "iterate over",
+    "each file",
+    "each item",
+    "each element",
+    "each record",
+    "each order",
+    "each row",
+    "per item",
+    "per file",
+    "per record",
+    "per order",
+    "over a list",
+    "over the list",
+    "over the collection",
+    "every item",
+    "every file",
+    "every order",
+)
+
+# Signals on the step itself (id / description) that this is a decision
+# point rather than a concurrent fan-out or a Map iterator.
+_CHOICE_SIGNAL_KEYWORDS = (
+    "evaluat",
+    "rout",
+    "decision",
+    "choice",
+    "decide",
+    "determine",
+    "whether",
+    "gate",
+    "branch on",
+    "based on",
+    "depending on",
+    "if ",
+    "otherwise",
+    "bypass",
+    "skip",
+    "threshold",
+    "amount",
+    "greater",
+    "less than",
+    "over $",
+    "under $",
+    "above",
+    "below",
+    "at least",
+    "at most",
+    "exceed",
+)
+
+# Signals on a branch condition that the arm is an exclusive outcome,
+# not a concurrent worker job.
+_CHOICE_CONDITION_KEYWORDS = (
+    "succeeded",
+    "success",
+    "approved",
+    "rejected",
+    "pass",
+    "fail",
+    "failed",
+    "failure",
+    "eligible",
+    "ineligible",
+    "valid",
+    "invalid",
+    "true",
+    "false",
+    "match",
+    "no match",
+    "over",
+    "under",
+    "or less",
+    "or more",
+    "or fewer",
+    "greater than",
+    "less than",
+    "at least",
+    "at most",
+    "above",
+    "below",
+    "exceed",
+    "within",
+    "outside",
+    "skip",
+    "bypass",
+    "otherwise",
+    "else",
+    "default",
+    "timeout",
+    "timed out",
+    "still failing",
+    "still failed",
+    "not found",
+    "found",
+    "empty",
+    "non-empty",
+    "present",
+    "absent",
+    "yes",
+    "no",
+)
+
+
+def _step_text_blob(step: PlanStep) -> str:
+    """Id + description + every branch condition, lowercased."""
+    parts = [step.id or "", step.description or ""]
+    for b in step.branches or []:
+        parts.append(b.condition or "")
+    return " ".join(parts).lower()
+
+
+def _has_parallel_evidence(step: PlanStep) -> bool:
+    """Positive concurrency signal in id/description/conditions."""
+    blob = _step_text_blob(step)
+    if any(k in blob for k in _PARALLEL_EVIDENCE):
+        return True
+    # Explicit "parallel arm" labels (often written by older canonicalize)
+    # count as evidence, but bare "arm:" alone does not — that substring
+    # appears in non-concurrent wording and caused false Parallel labels.
+    for b in step.branches or []:
+        cond = (b.condition or "").lower()
+        if "parallel arm" in cond or cond.startswith("parallel "):
+            return True
+    return False
+
+
+def _has_choice_evidence(step: PlanStep) -> bool:
+    """Positive exclusive-decision signal in id/description/conditions."""
+    blob = _step_text_blob(step)
+    if any(k in blob for k in _CHOICE_SIGNAL_KEYWORDS):
+        return True
+    for b in step.branches or []:
+        cond = (b.condition or "").lower()
+        if any(k in cond for k in _CHOICE_CONDITION_KEYWORDS):
+            return True
+    # Id patterns that almost always mean a Choice node.
+    sid = (step.id or "").lower()
+    if sid.endswith("gate") or sid.endswith("choice") or "decision" in sid:
+        return True
+    return False
+
+
+def _has_map_evidence(step: PlanStep) -> bool:
+    """Positive per-item iteration signal in id/description/conditions."""
+    blob = _step_text_blob(step)
+    return any(k in blob for k in _MAP_ITERATE_KEYWORDS)
+
+
+def _component_kind(step: PlanStep) -> str | None:
+    """Classify a step as map / parallel / choice / task, or None.
+
+    Order of authority:
+      1. Explicit `component_type` from Pipeline Analysis (DecisionGate,
+         Orchestrator, or any Task-like type). Orchestrator is split into
+         map vs parallel by branch cardinality only after the type is known.
+      2. Text heuristics for plans that predate component_type. Parallel
+         and Map require positive evidence; otherwise branches imply Choice.
     """
+    ct = step.component_type
+    if ct is not None:
+        if ct == "DecisionGate":
+            return "choice"
+        if ct == "Orchestrator":
+            n = len(step.branches or [])
+            if n == 1:
+                return "map"
+            if n >= 2:
+                return "parallel"
+            return None  # Orchestrator with no branches: extraction defect
+        # Any other component_type is not a Map/Parallel/Choice container.
+        return "task"
+
+    # --- legacy fallback (no component_type) ---
     if not step.branches:
-        return False
-    blob = " ".join(
-        f"{b.condition or ''} {step.description or ''} {step.id or ''}"
-        for b in step.branches
-    ).lower()
-    return any(
-        k in blob
-        for k in (
-            "parallel",
-            "concurrent",
-            "simultaneously",
-            "at the same time",
-            "parallel arm",
-            "arm:",
-        )
-    )
+        # Rare: iteration described only in prose with a plain next chain.
+        if _is_placeholder_service(step.service) and _has_map_evidence(step):
+            return "map"
+        return None
+
+    n = len(step.branches)
+    if n == 1 and _has_map_evidence(step) and not _has_choice_evidence(step):
+        return "map"
+    if n >= 2 and _has_parallel_evidence(step) and not _has_choice_evidence(step):
+        return "parallel"
+    if n >= 1 and _has_choice_evidence(step):
+        return "choice"
+    # Default for any branched step without concurrency/iteration evidence:
+    # exclusive alternatives (Choice). Do NOT default to Parallel — that is
+    # what mislabeled amount/threshold/outcome gates as concurrent arms.
+    if n >= 1:
+        return "choice"
+    return None
+
+
+def _is_parallel_style_branches(step: PlanStep) -> bool:
+    """True when branches are concurrent Parallel arms (not exclusive Choice).
+
+    Uses `_component_kind` so render and canonicalize share one classifier.
+    """
+    return _component_kind(step) == "parallel"
 
 
 def _step_style(step: PlanStep, is_branch: bool) -> tuple[str, str, str]:
-    if is_branch or step.branches:
+    """fillcolor, strokecolor, shape — diamond only for exclusive Choice."""
+    kind = _component_kind(step)
+    if kind == "choice" or (kind is None and step.branches and not _is_parallel_style_branches(step) and not _is_map_style_step(step)):
         return "#FEF3C7", "#B45309", "diamond"
+    if kind == "parallel" or kind == "map":
+        return "#EDE9FE", "#7C3AED", "box"
     blob = f"{step.service or ''} {step.description or ''}".lower()
     if any(k in blob for k in ("fail", "notif", "release", "compensat", "rollback", "refund", "alert", "timeout")):
         return "#FDE2E1", "#C53030", "box"
@@ -301,40 +535,11 @@ def _render_structured_diagram(plan: Plan) -> str:
 def _is_map_style_step(step: PlanStep) -> bool:
     """True when the step is a Map / for-each over a collection.
 
-    Structural signal takes priority: a container with exactly ONE
-    outgoing branch is a Map (one reusable per-item body run once per
-    element), not a Parallel fan-out (that's >=2 named branches -- see
-    `_is_parallel_style_branches`). Branch count is unambiguous and
-    catches paraphrases ("process every file concurrently") that don't
-    happen to contain a literal "for each" / "each file" phrase. Falls
-    back to keyword phrasing only for the rare case of a step with no
-    branches at all describing iteration in a plain `next` chain --
-    and only when the step itself is a control/placeholder step (no
-    real AWS service). Without that guard, an ordinary Task step whose
-    description merely mentions "each file" in passing (e.g.
-    "Load each file's transformed data into OpenSearch") gets
-    mislabeled as its own Map container even though it does no
-    iteration at all -- it's just one step inside someone else's loop.
+    Delegates entirely to `_component_kind` so Map vs Choice vs Parallel
+    share one classifier (component_type first, then positive-evidence
+    text heuristics). See `_component_kind` for the full rules.
     """
-    if step.branches:
-        return len(step.branches) == 1
-    if not _is_placeholder_service(step.service):
-        return False
-    blob = f"{step.id} {step.description or ''}".lower()
-    return any(
-        k in blob
-        for k in (
-            "for each",
-            "for every",
-            "map over",
-            "iterate over",
-            "each file",
-            "each item",
-            "each element",
-            "over a list",
-            "over the list",
-        )
-    )
+    return _component_kind(step) == "map"
 
 
 def _mermaid_escape(label: str) -> str:
@@ -347,6 +552,8 @@ def _mermaid_escape(label: str) -> str:
         .replace("{", "(")
         .replace("}", ")")
         .replace("|", "/")
+        # Currency amounts must not look like empty / broken tokens in labels.
+        .replace("$", "USD ")
     )
 
 

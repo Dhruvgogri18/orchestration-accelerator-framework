@@ -16,11 +16,14 @@ from database import (
     initialize_database,
     update_chat_run_state,
     update_chat_title,
+    update_message_artifact,
+    update_message_content,
 )
 from workflow import (
     USE_MOCK,
     OrchestrationApiError,
     PreDeployCheckFailed,
+    DeployFailed,
     answer_enrichment,
     api_get_session,
     api_get_status,
@@ -151,8 +154,8 @@ button[kind="tertiary"]:focus-visible,
   outline: none !important;
 }
 
-/* Text inputs / text areas: neutral theme borders (kill Streamlit red
-   invalid / required / focus rings on placeholders + feedback). */
+/* Text inputs / text areas: look clearly editable (not disabled).
+   Kill Streamlit red invalid/required rings; white surface + dark text. */
 [data-testid="stTextInput"] input,
 [data-testid="stTextInput"] input:hover,
 [data-testid="stTextInput"] input:focus,
@@ -171,6 +174,27 @@ button[kind="tertiary"]:focus-visible,
   box-shadow: none !important;
   outline: none !important;
   caret-color: var(--brand) !important;
+  background-color: #ffffff !important;
+  color: #111827 !important;
+  opacity: 1 !important;
+  -webkit-text-fill-color: #111827 !important;
+}
+/* Hint text — readable slate, not washed-out grey that reads as disabled */
+[data-testid="stTextInput"] input::placeholder,
+[data-testid="stTextArea"] textarea::placeholder {
+  color: #64748b !important;
+  opacity: 1 !important;
+  -webkit-text-fill-color: #64748b !important;
+}
+[data-testid="stTextInput"] input::-webkit-input-placeholder,
+[data-testid="stTextArea"] textarea::-webkit-input-placeholder {
+  color: #64748b !important;
+  opacity: 1 !important;
+}
+[data-testid="stTextInput"] input::-moz-placeholder,
+[data-testid="stTextArea"] textarea::-moz-placeholder {
+  color: #64748b !important;
+  opacity: 1 !important;
 }
 [data-testid="stTextInput"] div[data-baseweb="base-input"],
 [data-testid="stTextInput"] div[data-baseweb="base-input"]:hover,
@@ -185,6 +209,7 @@ button[kind="tertiary"]:focus-visible,
   border-color: var(--border) !important;
   box-shadow: none !important;
   outline: none !important;
+  background-color: #ffffff !important;
 }
 [data-testid="stTextInput"] input:focus,
 [data-testid="stTextInput"] input:focus-visible,
@@ -195,6 +220,18 @@ button[kind="tertiary"]:focus-visible,
 [data-testid="stTextInputRootElement"]:focus-within {
   border-color: var(--brand) !important;
   box-shadow: 0 0 0 1px var(--brand) !important;
+  background-color: #ffffff !important;
+}
+/* Truly disabled fields stay muted so they are distinct from placeholders */
+[data-testid="stTextInput"] input:disabled,
+[data-testid="stTextInput"] input:disabled::placeholder,
+[data-testid="stTextArea"] textarea:disabled,
+[data-testid="stTextArea"] textarea:disabled::placeholder {
+  background-color: #f3f4f6 !important;
+  color: #9ca3af !important;
+  -webkit-text-fill-color: #9ca3af !important;
+  opacity: 1 !important;
+  cursor: not-allowed !important;
 }
 
 /* ---------------- Tabs ---------------- */
@@ -247,42 +284,62 @@ button[data-baseweb="tab"][aria-selected="true"] p {
    across the shared horizontal row.
    Approve: green outline (white bg). Reject: red outline (white bg). */
 .plan-actions-marker { display: none; }
-[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="stButton"] button,
-[data-testid="stColumn"]:has(.approve-btn-marker) button[kind="primary"],
-[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="baseButton-primary"],
-[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="stBaseButton-primary"] {
+[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="stButton"] button:not(:disabled),
+[data-testid="stColumn"]:has(.approve-btn-marker) button[kind="primary"]:not(:disabled),
+[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="baseButton-primary"]:not(:disabled),
+[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="stBaseButton-primary"]:not(:disabled) {
   background-color: #ffffff !important;
   border: 1px solid #16a34a !important;
   color: #15803d !important;
   box-shadow: none !important;
+  opacity: 1 !important;
+  cursor: pointer !important;
 }
-[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="stButton"] button:hover,
-[data-testid="stColumn"]:has(.approve-btn-marker) button[kind="primary"]:hover,
-[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="baseButton-primary"]:hover,
-[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="stBaseButton-primary"]:hover {
+[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="stButton"] button:not(:disabled):hover,
+[data-testid="stColumn"]:has(.approve-btn-marker) button[kind="primary"]:not(:disabled):hover,
+[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="baseButton-primary"]:not(:disabled):hover,
+[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="stBaseButton-primary"]:not(:disabled):hover {
   background-color: #f0fdf4 !important;
   border-color: #15803d !important;
   color: #166534 !important;
 }
-[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="stButton"] button,
-[data-testid="stColumn"]:has(.reject-btn-marker) button[kind="secondary"],
-[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="baseButton-secondary"],
-[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="stBaseButton-secondary"] {
+[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="stButton"] button:disabled,
+[data-testid="stColumn"]:has(.approve-btn-marker) button[kind="primary"]:disabled,
+[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="baseButton-primary"]:disabled,
+[data-testid="stColumn"]:has(.approve-btn-marker) [data-testid="stBaseButton-primary"]:disabled {
+  background-color: #f3f4f6 !important;
+  border: 1px solid #d1d5db !important;
+  color: #9ca3af !important;
+  box-shadow: none !important;
+  opacity: 0.65 !important;
+  cursor: not-allowed !important;
+}
+[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="stButton"] button:not(:disabled),
+[data-testid="stColumn"]:has(.reject-btn-marker) button[kind="secondary"]:not(:disabled),
+[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="baseButton-secondary"]:not(:disabled),
+[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="stBaseButton-secondary"]:not(:disabled) {
   background-color: #ffffff !important;
   border: 1px solid #dc2626 !important;
   color: #dc2626 !important;
   box-shadow: none !important;
 }
-[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="stButton"] button:hover,
-[data-testid="stColumn"]:has(.reject-btn-marker) button[kind="secondary"]:hover,
-[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="baseButton-secondary"]:hover,
-[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="stBaseButton-secondary"]:hover {
+[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="stButton"] button:not(:disabled):hover,
+[data-testid="stColumn"]:has(.reject-btn-marker) button[kind="secondary"]:not(:disabled):hover,
+[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="baseButton-secondary"]:not(:disabled):hover,
+[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="stBaseButton-secondary"]:not(:disabled):hover {
   background-color: #fef2f2 !important;
   border-color: #b91c1c !important;
   color: #b91c1c !important;
 }
+[data-testid="stColumn"]:has(.reject-btn-marker) [data-testid="stButton"] button:disabled,
+[data-testid="stColumn"]:has(.reject-btn-marker) button[kind="secondary"]:disabled {
+  background-color: #f3f4f6 !important;
+  border: 1px solid #d1d5db !important;
+  color: #9ca3af !important;
+  opacity: 0.65 !important;
+  cursor: not-allowed !important;
+}
 
-/* The visible select shell */
 [data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"] {
   min-height: 2rem !important;
 }
@@ -495,12 +552,23 @@ a, a:visited {
   color: var(--brand);
 }
 
-/* Main chat area */
+/* Main chat area — enough top padding for the title, tight bottom so the
+   empty state (welcome + examples) fits above the fixed chat input. */
 [data-testid="stMainBlockContainer"],
 .block-container {
   max-width: 920px !important;
-  padding-top: 1rem !important;
-  padding-bottom: 8rem !important;
+  padding-top: 2rem !important;
+  padding-bottom: 6rem !important;
+}
+
+/* Keep the main h1 fully visible below the app chrome */
+[data-testid="stMainBlockContainer"] h1,
+.block-container h1 {
+  margin-top: 0 !important;
+  margin-bottom: 0.5rem !important;
+  line-height: 1.2 !important;
+  overflow: visible !important;
+  font-size: 1.75rem !important;
 }
 
 /* Do not reserve layout space for helper JavaScript iframes */
@@ -602,17 +670,18 @@ a, a:visited {
   letter-spacing: 0.06em;
 }
 
-/* Only the chat history st.container scrolls */
+/* Chat history — Streamlit st.container(height=…) provides the scrollport.
+   Keep height below the remaining sidebar so the list scrolls cleanly. */
 [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"]:has(.sidebar-history-marker) {
-    height: calc(100vh - 255px) !important;
-    max-height: calc(100vh - 255px) !important;
-    min-height: 120px !important;
-
+    height: min(560px, calc(100vh - 220px)) !important;
+    max-height: min(560px, calc(100vh - 220px)) !important;
+    min-height: 180px !important;
     overflow-y: auto !important;
     overflow-x: hidden !important;
-
-    padding-right: 0.55rem !important;
-    padding-bottom: 4rem !important;
+    overscroll-behavior: contain !important;
+    -webkit-overflow-scrolling: touch !important;
+    padding-right: 0.4rem !important;
+    padding-bottom: 0.75rem !important;
     margin-bottom: 0 !important;
     box-sizing: border-box !important;
 }
@@ -739,9 +808,9 @@ a, a:visited {
   display: flex;
   justify-content: flex-start;
   align-items: flex-start;
-  gap: 0.65rem;
-  margin: 0.6rem 0 1.25rem;
-  max-width: 86%;
+  gap: 0.55rem;
+  margin: 0.35rem 0 0.65rem;
+  max-width: 90%;
 }
 .assistant-avatar {
   background: var(--brand);
@@ -750,13 +819,36 @@ a, a:visited {
 .assistant-message-bubble {
   flex: 1;
   min-width: 0;
-  padding: 0.75rem 1rem;
+  padding: 0.55rem 0.85rem;
   border-radius: 4px 18px 18px 18px;
   background: #ffffff;
   border: 1px solid #e5e7eb;
   color: var(--bubble-text);
-  line-height: 1.5;
+  line-height: 1.4;
+  font-size: 0.92rem;
   overflow-wrap: anywhere;
+}
+
+/* Empty-state example chips — compact so welcome + 3 examples fit one screen */
+.examples-marker { display: none; }
+[data-testid="stVerticalBlock"]:has(.examples-marker) {
+  gap: 0.35rem !important;
+}
+[data-testid="stVerticalBlock"]:has(.examples-marker) [data-testid="stMarkdown"] h5,
+[data-testid="stVerticalBlock"]:has(.examples-marker) h5 {
+  margin: 0.15rem 0 0.25rem !important;
+  font-size: 0.95rem !important;
+}
+[data-testid="stVerticalBlock"]:has(.examples-marker) [data-testid="stButton"] button {
+  min-height: unset !important;
+  height: auto !important;
+  padding: 0.4rem 0.75rem !important;
+  font-size: 0.82rem !important;
+  font-weight: 450 !important;
+  line-height: 1.35 !important;
+  white-space: normal !important;
+  text-align: left !important;
+  border-radius: 12px !important;
 }
 .assistant-response {
   margin: 0.75rem 0 1.6rem;
@@ -1144,9 +1236,23 @@ div[data-testid="stSpinner"] {
 )
 
 EXAMPLE_PROMPTS = [
-    "Validate an S3 file, run a Glue job, then send a Slack notification",
-    "On S3 upload, validate file type, process with Lambda, notify on failure",
-    "Scheduled nightly ETL with success and failure notifications",
+    (
+        "Build a workflow that reads a CSV file from S3, transforms it with a "
+        "Glue job, and loads the result into a database. If any step fails, "
+        "send a failure alert to our ops SNS topic. Otherwise, publish a "
+        "success message."
+    ),
+    (
+        "Create a workflow where a request is submitted, then reviewed. If "
+        "it's approved, run the approval action and publish a success "
+        "notification. If it's rejected, publish a failure alert."
+    ),
+    (
+        "Design a pipeline that validates the input, then runs two independent "
+        "processing jobs at the same time, waits for both to finish, checks "
+        "data quality on the combined output, and finally persists the "
+        "results. Send a failure alert if anything goes wrong."
+    ),
 ]
 
 components.html(
@@ -1262,23 +1368,45 @@ STAGE_PREFIX = {
 }
 
 
+WELCOME_TEXT = (
+    "Welcome to Workflow Assistant\n\n"
+    "Describe your AWS Step Functions workflow in natural language — "
+    "including steps, AWS services, and success/failure behavior.\n\n"
+    "I'll clarify requirements if needed, then create a plan with a "
+    "summary, diagram, and placeholders for your approval.\n\n"
+    "Once approved, I'll generate, validate, and visualize the final "
+    "workflow.\n\n"
+    "Describe your workflow to get started."
+)
+
+
 def create_welcome_message(chat_id):
-    mode = "mock mode" if USE_MOCK else "connected to orchestration API"
-    add_message(
-        chat_id,
-        "assistant",
-        (
-            "Welcome to the Workflow Assistant. Describe an AWS Step Functions "
-            "orchestration in natural language (steps, services, success/failure "
-            "behavior). I may ask a clarifying question, then show a plan "
-            "(summary + diagram + placeholders). You can approve the plan or "
-            f"request changes. ({mode}.)\n\n"
-            "I only help design Step Functions workflows — not general questions. "
-            "After you approve a plan, enrichment produces a workflow spec, then "
-            "ASL is generated, validated (including live AWS validation when "
-            "credentials are configured), and shown as a console-style graph."
-        ),
-    )
+    add_message(chat_id, "assistant", WELCOME_TEXT)
+
+
+def refresh_draft_welcome(chat_id) -> None:
+    """Replace a stale welcome on unused draft chats (no user messages yet).
+
+    Drafts are reused across New Chat clicks, so an older welcome string can
+    stick around in SQLite after WELCOME_TEXT changes. Rewrite it in place.
+    """
+    if not is_draft_chat(chat_id):
+        return
+    messages = get_messages(chat_id)
+    if not messages:
+        create_welcome_message(chat_id)
+        return
+    # Only touch pure welcome drafts (assistant-only, no artifacts).
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        if msg.get("artifact"):
+            continue
+        if (msg.get("content") or "") != WELCOME_TEXT:
+            try:
+                update_message_content(msg["id"], WELCOME_TEXT)
+            except Exception:
+                pass
 
 
 def set_active_chat(chat_id, focus: bool = True) -> None:
@@ -1335,16 +1463,19 @@ def ensure_active_chat():
                 st.query_params["chat"] = str(active_id)
         except Exception:
             pass
+        refresh_draft_welcome(active_id)
         return
 
     url_id = _chat_id_from_query_params()
     if url_id is not None and get_chat(url_id) is not None:
+        refresh_draft_welcome(url_id)
         set_active_chat(url_id)
         return
 
     # Prefer reusing an existing unused draft so we don't spam empty chats.
     for chat in get_chats():
         if is_draft_chat(chat["id"]):
+            refresh_draft_welcome(chat["id"])
             set_active_chat(chat["id"])
             return
 
@@ -1404,6 +1535,7 @@ def create_new_chat():
     """
     active_id = st.session_state.get("active_chat_id")
     if active_id and get_chat(active_id) is not None and is_draft_chat(active_id):
+        refresh_draft_welcome(active_id)
         set_active_chat(active_id)
         return
 
@@ -1418,6 +1550,7 @@ def create_new_chat():
         # Only reuse if this draft is at/after the current chat id —
         # avoids selecting an older empty row (38) while on chat 39.
         if int(newest["id"]) >= active_n:
+            refresh_draft_welcome(newest["id"])
             set_active_chat(newest["id"])
             return
 
@@ -1579,6 +1712,94 @@ def _escape_html(content: str) -> str:
         .replace(">", "&gt;")
         .replace("\n", "<br>")
     )
+
+
+def _sanitize_mermaid_source(code: str) -> str:
+    """Rewrite plan Mermaid so Mermaid 10.2.4 (streamlit-mermaid) accepts it.
+
+    Existing chats still store the old API syntax ([Map] / unquoted edge
+    labels / __end). Convert those in the UI so open history cards render.
+    """
+    text = (code or "").strip()
+    if not text:
+        return text
+    head = text.splitlines()[0].strip().lower() if text else ""
+    if head and not (
+        head.startswith("flowchart")
+        or head.startswith("graph ")
+        or head.startswith("graph\t")
+        or head.startswith("statediagram")
+    ):
+        text = "flowchart TD\n" + text
+
+    # __end is rejected by some 10.2.4 builds
+    text = re.sub(r"\b__end\b", "EndNode", text)
+
+    # Quote every edge label; strip existing quotes first to avoid ""doubling"".
+    def _quote_edge(m: re.Match) -> str:
+        left, label, right = m.group(1), m.group(2), m.group(3)
+        label = label.strip().strip('"').strip("'")
+        # o/x at start of an edge label are special markers in Mermaid
+        if label and label[0] in "oxOX":
+            label = " " + label
+        return f'{left}"{label}"{right}'
+
+    text = re.sub(r"(\s*-{1,2}\.?->\|)([^|\n]+)(\|)", _quote_edge, text)
+
+    # Replace [Map] / [Parallel] tags inside any quoted label with (Map)/(Parallel)
+    text = text.replace("[Map]", "(Map)").replace("[Parallel]", "(Parallel)")
+    text = text.replace("[map]", "(Map)").replace("[parallel]", "(Parallel)")
+
+    # Any remaining raw [brackets] inside "double-quoted" segments → parentheses
+    def _brackets_in_quotes(m: re.Match) -> str:
+        return '"' + m.group(1).replace("[", "(").replace("]", ")") + '"'
+
+    text = re.sub(r'"([^"]*)"', _brackets_in_quotes, text)
+
+    return text
+
+
+def _render_mermaid(code: str, height: int | None = None, *, key: str | None = None) -> None:
+    """Plan diagram via streamlit-mermaid (auto frame height = no gaps).
+
+    height=\"auto\" makes the component call setFrameHeight(svgHeight) so the
+    iframe is exactly as tall as the diagram — same tight layout as
+    st.graphviz_chart for ASL graphs. CDN components.html cannot do this.
+    """
+    _ = height  # component sizes itself from the SVG
+    code = _sanitize_mermaid_source(code)
+    try:
+        import streamlit_mermaid as stmd
+
+        kwargs = {
+            "code": code,
+            "width": "100%",
+            "height": "auto",
+            "pan": True,
+            "zoom": True,
+            "show_controls": True,
+        }
+        if key:
+            kwargs["key"] = key
+        stmd.st_mermaid(**kwargs)
+        return
+    except TypeError:
+        try:
+            import streamlit_mermaid as stmd
+
+            # Older builds: no pan/zoom kwargs
+            if key:
+                stmd.st_mermaid(code, width="100%", height="auto", key=key)
+            else:
+                stmd.st_mermaid(code, width="100%", height="auto")
+            return
+        except Exception as exc:
+            st.warning(f"Mermaid component failed ({type(exc).__name__}). Showing source.")
+            st.code(code, language="mermaid")
+            return
+    except Exception as exc:
+        st.warning(f"Mermaid component failed ({type(exc).__name__}). Showing source.")
+        st.code(code, language="mermaid")
 
 
 # Inline SVG icons for chat avatars (no external assets).
@@ -1997,7 +2218,21 @@ def reconcile_chat_with_api(chat_id) -> None:
 
     st.session_state[cache_key] = True
 
-    if state.get("locked_spec"):
+    # locked_spec is also used to store plan_history *before* the user
+    # approves. Only treat the session as approved when a real approval
+    # artifact is present (resolved_plan / workflow_spec / asl). Otherwise
+    # a freshly generated plan would flip the UI to "spec_approved" and
+    # hide Approve / Reject.
+    locked = state.get("locked_spec") or {}
+    if not isinstance(locked, dict):
+        locked = {}
+    is_approved = bool(
+        locked.get("resolved_plan")
+        or locked.get("workflow_spec")
+        or locked.get("asl")
+    )
+
+    if is_approved:
         update_chat_run_state(
             chat_id,
             run_id=session_id,
@@ -2024,64 +2259,206 @@ def render_clarifying(artifact):
             render_assistant_message(text)
 
 
+
+def _wire_live_approve_disable() -> None:
+    """Disable Approve as the user types in the feedback box (DOM-level).
+
+    Streamlit only commits text_area values on blur / Ctrl+Enter, so the
+    Python disabled= flag cannot update on every keystroke. This script
+    applies the rule in the browser: non-empty feedback -> Approve off.
+    """
+    components.html(
+        """
+<script>
+(function() {
+  const doc = window.parent.document;
+
+  function findFeedback() {
+    const areas = doc.querySelectorAll('[data-testid="stTextArea"]');
+    for (const wrap of areas) {
+      const label = (wrap.innerText || '').toLowerCase();
+      if (label.includes('request changes') || label.includes('reject feedback')) {
+        const ta = wrap.querySelector('textarea');
+        if (ta) return ta;
+      }
+    }
+    const all = doc.querySelectorAll('[data-testid="stTextArea"] textarea');
+    return all.length ? all[all.length - 1] : null;
+  }
+
+  function findApproveButtons() {
+    const buttons = [];
+    doc.querySelectorAll('button').forEach(btn => {
+      const label = (btn.innerText || btn.textContent || '').trim();
+      if (label === 'Approve plan' || label === 'Approve ASL') buttons.push(btn);
+    });
+    return buttons;
+  }
+
+  function sync() {
+    const ta = findFeedback();
+    const btns = findApproveButtons();
+    if (!ta || !btns.length) return;
+    const hasText = !!(ta.value && ta.value.trim());
+    btns.forEach(btn => {
+      if (hasText) {
+        btn.disabled = true;
+        btn.setAttribute('disabled', 'true');
+        btn.style.setProperty('opacity', '0.65', 'important');
+        btn.style.setProperty('cursor', 'not-allowed', 'important');
+        btn.style.setProperty('background-color', '#f3f4f6', 'important');
+        btn.style.setProperty('border-color', '#d1d5db', 'important');
+        btn.style.setProperty('color', '#9ca3af', 'important');
+      } else {
+        btn.disabled = false;
+        btn.removeAttribute('disabled');
+        btn.style.removeProperty('opacity');
+        btn.style.removeProperty('cursor');
+        btn.style.removeProperty('background-color');
+        btn.style.removeProperty('border-color');
+        btn.style.removeProperty('color');
+      }
+    });
+  }
+
+  function wire() {
+    const ta = findFeedback();
+    if (!ta) return;
+    if (ta.dataset.approveWire === '1') { sync(); return; }
+    ta.dataset.approveWire = '1';
+    ['input', 'keyup', 'change', 'paste'].forEach(ev => ta.addEventListener(ev, sync));
+    sync();
+  }
+
+  wire();
+  [50, 150, 400, 800, 1500].forEach(ms => setTimeout(wire, ms));
+  // Observe DOM replacements from Streamlit reruns
+  try {
+    const obs = new MutationObserver(() => wire());
+    obs.observe(doc.body, { childList: true, subtree: true });
+  } catch (e) {}
+})();
+</script>
+        """,
+        height=0,
+    )
+
+
+def _strip_plan_placeholder_prompts(summary: str) -> str:
+    """Remove pre-approve placeholder sections from plan summary markdown.
+
+    TODO_ values are collected after plan approval (enrichment / fill stage).
+    Newer API builds omit this block; this still cleans older stored summaries.
+    """
+    text = summary or ""
+    if not text.strip():
+        return text
+
+    # Header + following TODO lines (allow blank lines between).
+    text = re.sub(
+        r"(?is)(?:^|\n)[ \t]*\*?\*?Before you approve this plan[^\n]*"
+        r"(?:\n[ \t]*(?:[-*•]\s*)?(?:`|<code[^>]*>)?TODO_[A-Z0-9_]+(?:`|</code>)?[^\n]*)*",
+        "\n",
+        text,
+    )
+    text = re.sub(
+        r"(?is)(?:^|\n)[ \t]*\*?\*?These values still need to be filled in[^\n]*"
+        r"(?:\n[ \t]*(?:[-*•]\s*)?(?:`|<code[^>]*>)?TODO_[A-Z0-9_]+(?:`|</code>)?[^\n]*)*",
+        "\n",
+        text,
+    )
+    text = re.sub(
+        r"(?is)(?:^|\n)[ \t]*\*?\*?Placeholders?\s*(?:\(optional[^)]*\))?[^\n]*"
+        r"(?:\n[ \t]*(?:[-*•]\s*)?(?:`|<code[^>]*>)?TODO_[A-Z0-9_]+(?:`|</code>)?[^\n]*)*",
+        "\n",
+        text,
+    )
+    # Any leftover TODO-only list lines.
+    text = re.sub(
+        r"(?im)^[ \t]*(?:[-*•]\s*)?(?:`|<code[^>]*>)?TODO_[A-Z0-9_]+(?:`|</code>)?[ \t]*\n?",
+        "",
+        text,
+    )
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
 def render_plan_review(message_id, artifact, chat_id):
     session_id = artifact.get("session_id") or artifact.get("run_id")
     busy = is_chat_busy(chat_id)
 
     messages = get_messages(chat_id)
+    # Chronological scan: a new plan_review reopens the review UI; a later
+    # spec_approved freezes the plan card. Do not rely on chat.stage alone —
+    # the API stores plan_history on locked_spec before the user approves,
+    # and reconcile used to mis-label that as "spec_approved".
     latest_plan_msg_id = None
-    for m in reversed(messages):
+    has_approval_after_plan = False
+    for m in messages:
         art = m.get("artifact") or {}
-        if art.get("stage") == "plan_review":
+        stage = art.get("stage")
+        if stage == "plan_review":
             latest_plan_msg_id = m["id"]
-            break
+            has_approval_after_plan = False
+        elif stage == "spec_approved" and latest_plan_msg_id is not None:
+            has_approval_after_plan = True
 
-    chat = get_chat(chat_id)
-    chat_stage = (chat or {}).get("stage")
-    # Only the current open plan is interactive. After approve/reject (or a
-    # newer plan), freeze placeholders and hide actions on this card.
     is_active_plan = (
-        chat_stage == "plan_review" and message_id == latest_plan_msg_id
+        message_id == latest_plan_msg_id and not has_approval_after_plan
     )
     controls_enabled = is_active_plan and not busy
 
     if artifact.get("summary"):
-        st.markdown(artifact["summary"])
-
-    placeholders = artifact.get("placeholders") or []
-    # Deduplicate while preserving order — duplicate tokens would collide on key=.
-    seen_tokens: list[str] = []
-    for token in placeholders:
-        if token and token not in seen_tokens:
-            seen_tokens.append(token)
-    overrides = {}
-    if seen_tokens:
-        st.markdown("**Placeholders (optional overrides before approve)**")
-        for idx, token in enumerate(seen_tokens):
-            overrides[token] = st.text_input(
-                token,
-                value="",
-                key=f"ph_{chat_id}_{message_id}_{idx}_{token}",
-                placeholder=f"Value for {token}",
-                disabled=not controls_enabled,
+        # Placeholders are collected after approve (enrichment / fill stage),
+        # not during plan review — strip any pre-approve TODO prompts from
+        # the summary so they are not shown twice in the wrong phase.
+        summary_text = artifact["summary"]
+        try:
+            summary_text = _strip_plan_placeholder_prompts(summary_text)
+        except NameError:
+            # Defensive: if the helper is missing in a partial deploy, still
+            # drop obvious TODO lines instead of crashing the page.
+            summary_text = re.sub(
+                r"(?im)^[ \t]*Before you approve this plan[^\n]*\n"
+                r"(?:[ \t]*[-*•]\s*`?TODO_[A-Z0-9_]+`?[^\n]*\n?)*",
+                "",
+                summary_text or "",
             )
+            summary_text = re.sub(
+                r"(?im)^[ \t]*[-*•]\s*`?TODO_[A-Z0-9_]+`?[^\n]*\n?",
+                "",
+                summary_text,
+            )
+            summary_text = re.sub(r"\n{3,}", "\n\n", summary_text).strip()
+        st.markdown(summary_text)
 
-    # Collapsible diagram only — plan JSON is internal, not shown to users.
+    # Plan diagram: Mermaid (Map/Parallel/Choice shapes). ASL graphs stay Graphviz.
+    # Height is estimated from diagram size so the pane grows like graphviz_chart.
     with st.expander("Diagram", expanded=True):
         dot = artifact.get("graph_dot")
         if dot:
-            head = (dot or "").lstrip()[:32].lower()
-            if head.startswith("flowchart") or head.startswith("statediagram"):
+            head = (dot or "").lstrip()[:48].lower()
+            is_mermaid = head.startswith("flowchart") or head.startswith(
+                "statediagram"
+            )
+            if is_mermaid:
                 try:
-                    import streamlit_mermaid as stmd
-                    stmd.st_mermaid(dot, height=520)
-                except Exception:
-                    st.markdown(f"```mermaid\n{dot}\n```")
+                    _render_mermaid(
+                        dot,
+                        key=f"plan_mermaid_{chat_id}_{message_id}",
+                    )
+                except Exception as exc:
+                    st.warning(
+                        "Mermaid could not be rendered "
+                        f"({type(exc).__name__}). Showing source."
+                    )
+                    st.code(dot, language="mermaid")
             else:
+                # Legacy DOT payload — still show it.
                 try:
                     st.graphviz_chart(dot)
                 except Exception:
-                    st.code(dot)
+                    st.code(dot, language="dot")
         else:
             st.info(
                 "No diagram was returned for this plan. "
@@ -2089,19 +2466,30 @@ def render_plan_review(message_id, artifact, chat_id):
             )
 
     if not is_active_plan:
-        st.caption("This plan is no longer active — placeholders and actions are locked.")
+        st.caption("This plan is no longer active — actions are locked.")
         return
 
     if busy:
         st.caption("Working on your request… actions are paused until it finishes.")
 
+    fb_key = f"reject_fb_{message_id}"
     feedback = st.text_area(
         "Request changes",
-        key=f"reject_fb_{message_id}",
+        key=fb_key,
         placeholder="Optional: describe changes, then Reject — or Approve as-is.",
         height=80,
         disabled=not controls_enabled,
     )
+    # Prefer session_state (updated as the user types) over the return value.
+    feedback_text = str(
+        st.session_state.get(fb_key, feedback) or ""
+    ).strip()
+    # Typing feedback means the user is requesting changes — lock Approve
+    # so they don't accidentally approve while drafting a reject message.
+    can_approve_plan = controls_enabled and not feedback_text
+    can_reject_plan = controls_enabled  # reject still needs non-empty text on click
+    if feedback_text and controls_enabled:
+        st.caption("Clear the feedback box to enable **Approve plan**.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -2114,23 +2502,15 @@ def render_plan_review(message_id, artifact, chat_id):
             key=f"approve_plan_{message_id}",
             type="primary",
             use_container_width=True,
-            disabled=not controls_enabled,
+            disabled=not can_approve_plan,
         ):
-            clean = {k: v.strip() for k, v in overrides.items() if v and v.strip()}
-            # Show the user bubble immediately (once). process_pending_approve
-            # must NOT add_message again or the action appears twice.
-            if clean:
-                lines = ["Approve plan", ""] + [
-                    f"{k} = {v}" for k, v in clean.items()
-                ]
-                user_text = "\n".join(lines)
-            else:
-                user_text = "Approve plan"
-            add_message(chat_id, "user", user_text)
+            # Placeholders are filled after approve (enrichment / fill stage),
+            # not as overrides at plan-review time.
+            add_message(chat_id, "user", "Approve plan")
             st.session_state.pending_approve = {
                 "chat_id": chat_id,
                 "session_id": session_id,
-                "overrides": clean,
+                "overrides": {},
             }
             st.rerun()
 
@@ -2150,6 +2530,9 @@ def render_plan_review(message_id, artifact, chat_id):
                 st.warning("Enter feedback first.")
             else:
                 queue_user_prompt(chat_id, feedback.strip())
+
+    if controls_enabled:
+        _wire_live_approve_disable()
 
 
 def _find_todo_placeholders_in_value(node, seen=None) -> list[str]:
@@ -2185,6 +2568,50 @@ def _latest_spec_approved_message_id(chat_id):
     for m in reversed(messages):
         art = m.get("artifact") or {}
         if art.get("stage") == "spec_approved":
+            return m["id"]
+    return None
+
+
+def _first_spec_approved_message_id(chat_id):
+    """Return the message id of the earliest plan-approval card in this chat.
+
+    Used so the plan-approved banner is shown only once — on the first
+    approval turn — not on later ASL / placeholder / deploy cards.
+    """
+    messages = get_messages(chat_id)
+    for m in messages:
+        art = m.get("artifact") or {}
+        if art.get("stage") == "spec_approved":
+            return m["id"]
+    return None
+
+
+def _latest_asl_carrying_artifact(chat_id):
+    """Return the newest spec_approved artifact that still has ASL payload.
+
+    Deploy / approve follow-up cards sometimes omit asl; callers use this to
+    copy graph + definition onto the new card so the UI does not regress to
+    "ASL not generated yet."
+    """
+    messages = get_messages(chat_id)
+    for m in reversed(messages):
+        art = m.get("artifact") or {}
+        if art.get("stage") != "spec_approved":
+            continue
+        asl = art.get("asl") or art.get("asl_json")
+        if asl:
+            return art
+    return None
+
+
+def _latest_asl_carrying_message_id(chat_id):
+    """Message id of the newest card that still carries an ASL definition."""
+    messages = get_messages(chat_id)
+    for m in reversed(messages):
+        art = m.get("artifact") or {}
+        if art.get("stage") != "spec_approved":
+            continue
+        if art.get("asl") or art.get("asl_json"):
             return m["id"]
     return None
 
@@ -2244,7 +2671,32 @@ def render_spec_approved(message_id, artifact, chat_id):
     regenerate/revalidate, and Stage 5 deploy controls are interactive on the
     latest approved message only.
     """
-    st.success("Plan approved and locked on the server.")
+    # Only the first plan-approval card shows this banner; later cards
+    # (placeholders, ASL review, deploy) stay quiet.
+    if message_id == _first_spec_approved_message_id(chat_id):
+        st.success("Plan approved and locked on the server.")
+
+    # Legacy deploy-failure / follow-up cards were stored without asl.
+    # Backfill from the newest earlier card that still has ASL and persist
+    # so this chat recovers without requiring a new conversation.
+    if not (artifact.get("asl") or artifact.get("asl_json")):
+        prev = _latest_asl_carrying_artifact(chat_id)
+        if prev:
+            artifact = dict(artifact or {})
+            artifact["asl"] = prev.get("asl") or prev.get("asl_json")
+            artifact["asl_json"] = artifact["asl"]
+            if not artifact.get("graph_dot") and prev.get("graph_dot"):
+                artifact["graph_dot"] = prev.get("graph_dot")
+            if not artifact.get("validations") and prev.get("validations"):
+                artifact["validations"] = prev.get("validations")
+            if artifact.get("pre_deploy_reasons") or artifact.get(
+                "deploy_failure_reasons"
+            ):
+                artifact["asl_approved"] = True
+            try:
+                update_message_artifact(message_id, artifact)
+            except Exception:
+                pass
 
     enrichment_question = artifact.get("enrichment_question")
     enrichment_error = artifact.get("enrichment_error")
@@ -2256,25 +2708,32 @@ def render_spec_approved(message_id, artifact, chat_id):
     is_active = message_id == _latest_spec_approved_message_id(chat_id)
     controls_enabled = is_active and not busy and bool(session_id)
 
-    # Prefer API-reported spec_placeholders (workflow_spec TODOs). Fall back
-    # to plan remaining + ASL/validation scans so older messages still work.
+    # Deploy-blocking tokens only. Prefer API spec_placeholders, then live
+    # ASL / validation scans. Do NOT fall back to plan-level
+    # remaining_placeholders when the API already reported an empty
+    # spec_placeholders list — that list is often stale after a successful
+    # fill and would re-prompt for values the user just applied.
     remaining: list[str] = []
-    for token in list(artifact.get("spec_placeholders") or []):
+    spec_ph_raw = artifact.get("spec_placeholders")
+    spec_ph_reported = isinstance(spec_ph_raw, list)
+    for token in list(spec_ph_raw or []):
         if token and token not in remaining:
             remaining.append(token)
-    if not remaining:
+    if asl:
+        for token in _find_todo_placeholders_in_value(asl):
+            if token not in remaining:
+                remaining.append(token)
+    vals = artifact.get("validations") or {}
+    for token in vals.get("unresolved_placeholders") or []:
+        if token and token not in remaining:
+            remaining.append(token)
+    # Legacy cards / pre-fill responses with no spec_placeholders field:
+    # fall back to plan remaining so the form still appears.
+    if not remaining and not spec_ph_reported:
         for token in (
             list(artifact.get("remaining_placeholders") or [])
             + list(artifact.get("placeholders") or [])
         ):
-            if token and token not in remaining:
-                remaining.append(token)
-        if asl:
-            for token in _find_todo_placeholders_in_value(asl):
-                if token not in remaining:
-                    remaining.append(token)
-        vals = artifact.get("validations") or {}
-        for token in vals.get("unresolved_placeholders") or []:
             if token and token not in remaining:
                 remaining.append(token)
 
@@ -2292,15 +2751,63 @@ def render_spec_approved(message_id, artifact, chat_id):
                 "Provide concrete values (resource names, ARNs, bucket keys, etc.). "
                 "Applying them re-runs enrichment and regenerates ASL."
             )
+            ph_details = artifact.get("placeholder_details") or {}
+            if not isinstance(ph_details, dict):
+                ph_details = {}
+
+            def _fallback_desc(tok: str) -> str:
+                raw = tok[5:] if tok.upper().startswith("TODO_") else tok
+                parts = [p for p in raw.replace("-", "_").split("_") if p]
+                acronyms = {
+                    "ARN", "AWS", "S3", "SNS", "SQS", "IAM", "API", "URL",
+                    "ID", "ETL", "CSV", "JSON", "DB", "RDS", "KMS", "SES",
+                }
+                words = []
+                for i, w in enumerate(parts):
+                    up = w.upper()
+                    if up in acronyms:
+                        words.append(up)
+                    elif i == 0:
+                        words.append(w.capitalize())
+                    else:
+                        words.append(w.lower())
+                return " ".join(words) if words else tok
+
+            import re as _re
+
+            def _input_placeholder(desc: str, tok: str) -> str:
+                """Short plain-text placeholder for the text_input.
+
+                `desc` is markdown (it uses backticks for inline code,
+                e.g. an "e.g. `arn:aws:...`" example) and is already
+                shown in full via st.markdown() above -- reusing the
+                whole sentence here would repeat it verbatim with the
+                backtick characters shown literally, since placeholder
+                text isn't markdown-rendered. Prefer just the example
+                value if the description has one; otherwise fall back
+                to a short prompt.
+                """
+                m = _re.search(r"e\.g\.\s*`([^`]+)`", desc)
+                if m:
+                    return m.group(1)
+                return f"Enter a value for {tok}"
+
             ph_overrides: dict[str, str] = {}
             for idx, token in enumerate(remaining):
+                desc = str(ph_details.get(token) or "").strip() or _fallback_desc(
+                    token
+                )
+                # Token + short description of what the user should enter.
+                st.markdown(f"**`{token}`**  \n{desc}")
                 ph_overrides[token] = st.text_input(
-                    token,
+                    f"Value for {token}",
                     value="",
                     key=f"post_ph_{chat_id}_{message_id}_{idx}_{token}",
-                    placeholder=f"Value for {token}",
+                    placeholder=_input_placeholder(desc, token),
                     disabled=not controls_enabled,
+                    label_visibility="collapsed",
                 )
+                st.markdown("")  # spacing between fields
             filled = {
                 k: v.strip() for k, v in ph_overrides.items() if v and v.strip()
             }
@@ -2338,10 +2845,8 @@ def render_spec_approved(message_id, artifact, chat_id):
                     "overrides": filled,
                 }
                 st.rerun()
-    elif remaining and not is_active:
-        st.warning("Unresolved placeholders (read-only on older cards):")
-        for p in remaining:
-            st.markdown(f"- `{p}`")
+    # Older cards with unresolved placeholders stay silent — no read-only
+    # token list. Only the active card shows the fill form above.
 
     # --- Enrichment question section (Stage 3.5 pause) ---
     if enrichment_question:
@@ -2357,6 +2862,16 @@ def render_spec_approved(message_id, artifact, chat_id):
             "The plan is still locked. Fix enrichment (or re-approve) before ASL "
             "can be generated."
         )
+        return
+
+    # ASL graph / definition / review only after every placeholder is resolved.
+    # Incomplete cards keep the fill form (or read-only list) and stop here.
+    if remaining:
+        if is_active:
+            st.info(
+                "ASL graph and definition will appear after all placeholders "
+                "are filled and applied."
+            )
         return
 
     if asl_error:
@@ -2385,14 +2900,18 @@ def render_spec_approved(message_id, artifact, chat_id):
             st.caption("AWS ValidateStateMachine reported issues (see errors above).")
 
     # --- ASL graph (console-style) ---
-    dot = artifact.get("graph_dot")
-    if asl and not dot:
+    # Prefer a client-side graph built from the ASL so nested Map/Parallel/
+    # Choice/Catch paths are shown even when the API graph_dot is incomplete.
+    dot = None
+    if asl:
         try:
             from workflow import build_graphviz_dot
 
             dot = build_graphviz_dot(asl)
         except Exception:
-            dot = None
+            dot = artifact.get("graph_dot")
+    if not dot:
+        dot = artifact.get("graph_dot")
 
     if dot:
         with st.expander("ASL graph", expanded=True):
@@ -2404,32 +2923,27 @@ def render_spec_approved(message_id, artifact, chat_id):
     elif asl:
         st.caption("ASL is present but no graph DOT was returned.")
 
-    # --- ASL JSON (downloadable definition from backend) ---
+    # --- ASL JSON (download only on the latest card that has ASL) ---
     if asl:
         with st.expander("ASL definition (JSON)", expanded=False):
             st.json(asl)
-            # Download bytes come from GET /session/{id}/asl/download on the
-            # API — not from serializing the in-memory UI artifact.
-            if not session_id:
-                st.caption("No session id — cannot download from backend.")
-            elif not is_active:
-                st.caption("Only the latest approved plan can download ASL.")
-            else:
+            # Download only on the latest approved card (is_active).
+            if is_active:
+                def _local_asl_download_bytes(asl_obj):
+                    name = "workflow"
+                    if isinstance(asl_obj, dict) and asl_obj.get("Comment"):
+                        name = str(asl_obj["Comment"]).split(":")[0].strip() or name
+                    return (
+                        json.dumps(asl_obj, indent=2).encode("utf-8"),
+                        f"{name}.asl.json",
+                    )
+
                 from workflow import USE_MOCK, api_download_asl, OrchestrationApiError
 
-                if USE_MOCK:
-                    # Mock path has no HTTP API; fall back to local bytes.
-                    name = "workflow"
-                    if isinstance(asl, dict) and asl.get("Comment"):
-                        name = str(asl["Comment"]).split(":")[0].strip() or name
-                    st.download_button(
-                        "Download ASL JSON",
-                        data=json.dumps(asl, indent=2),
-                        file_name=f"{name}.asl.json",
-                        mime="application/json",
-                        key=f"download_asl_{message_id}",
-                    )
-                else:
+                content = None
+                filename = None
+                # Prefer backend (locked session ASL); fall back to in-memory.
+                if session_id and not USE_MOCK:
                     cache_key = f"asl_download_{session_id}"
                     cached = st.session_state.get(cache_key)
                     if cached is None:
@@ -2437,18 +2951,24 @@ def render_spec_approved(message_id, artifact, chat_id):
                             content, filename = api_download_asl(session_id)
                             st.session_state[cache_key] = (content, filename)
                             cached = (content, filename)
-                        except OrchestrationApiError as exc:
-                            st.warning(f"Could not fetch ASL from backend: {exc}")
+                        except OrchestrationApiError:
                             cached = None
                     if cached is not None:
                         content, filename = cached
-                        st.download_button(
-                            "Download ASL JSON",
-                            data=content,
-                            file_name=filename,
-                            mime="application/json",
-                            key=f"download_asl_{message_id}",
-                        )
+                if content is None:
+                    content, filename = _local_asl_download_bytes(asl)
+
+                st.download_button(
+                    "Download ASL JSON",
+                    data=content,
+                    file_name=filename or "workflow.asl.json",
+                    mime="application/json",
+                    key=f"download_asl_{message_id}",
+                )
+            else:
+                st.caption(
+                    "Download is available on the latest ASL card only."
+                )
     else:
         st.info("ASL not generated yet.")
 
@@ -2461,6 +2981,8 @@ def render_spec_approved(message_id, artifact, chat_id):
             isinstance(artifact.get("deployment"), dict)
             and artifact["deployment"].get("state_machine_arn")
         )
+        or artifact.get("pre_deploy_reasons")
+        or artifact.get("deploy_failure_reasons")
     )
     deploy_prompt_key = f"deploy_prompt_{session_id}" if session_id else None
     show_deploy_form = bool(
@@ -2476,13 +2998,20 @@ def render_spec_approved(message_id, artifact, chat_id):
             "Approve if this definition looks right. Reject to request changes "
             "(sends feedback and rebuilds the plan)."
         )
+        asl_fb_key = f"asl_reject_fb_{message_id}"
         reject_fb = st.text_area(
             "Reject feedback (optional unless you reject)",
-            key=f"asl_reject_fb_{message_id}",
+            key=asl_fb_key,
             placeholder="What should change in the ASL / workflow?",
             height=70,
             disabled=not controls_enabled,
         )
+        asl_fb_text = str(
+            st.session_state.get(asl_fb_key, reject_fb) or ""
+        ).strip()
+        can_approve_asl = controls_enabled and not asl_fb_text
+        if asl_fb_text and controls_enabled:
+            st.caption("Clear the feedback box to enable **Approve ASL**.")
         c_ok, c_no = st.columns(2)
         with c_ok:
             st.markdown(
@@ -2494,7 +3023,7 @@ def render_spec_approved(message_id, artifact, chat_id):
                 key=f"approve_asl_{message_id}",
                 type="primary",
                 use_container_width=True,
-                disabled=not controls_enabled,
+                disabled=not can_approve_asl,
             ):
                 add_message(chat_id, "user", "Approve ASL")
                 st.session_state[asl_approved_key] = True
@@ -2544,6 +3073,9 @@ def render_spec_approved(message_id, artifact, chat_id):
                         st.session_state.pop(deploy_prompt_key, None)
                     queue_user_prompt(chat_id, fb)
 
+        if controls_enabled:
+            _wire_live_approve_disable()
+
         if busy:
             st.caption("Working… actions are paused until the current request finishes.")
 
@@ -2563,10 +3095,52 @@ def render_spec_approved(message_id, artifact, chat_id):
             f"Region `{deployment.get('region')}` · role `{deployment.get('role_arn')}`"
         )
 
+    deploy_skipped_key = f"deploy_skipped_{session_id}" if session_id else None
+    deploy_skipped = bool(
+        deploy_skipped_key and st.session_state.get(deploy_skipped_key)
+    )
+    already_deployed = bool(
+        isinstance(deployment, dict) and deployment.get("state_machine_arn")
+    )
+    # Prior deploy attempt failed (pre-checks or AWS) — always offer retry.
+    has_deploy_failure = bool(
+        artifact.get("pre_deploy_reasons") or artifact.get("deploy_failure_reasons")
+    )
     wants_deploy = asl_approved and (
         show_deploy_form
         or artifact.get("ask_deploy")
         or st.session_state.get(deploy_prompt_key)
+        or has_deploy_failure
+    )
+    show_form = bool(session_id and st.session_state.get(f"show_deploy_form_{session_id}"))
+    # After a failed deploy, open the form on the active card immediately so
+    # the user can fix role ARN / name and retry without hunting for a button.
+    if (
+        is_active
+        and session_id
+        and asl
+        and asl_approved
+        and has_deploy_failure
+        and not already_deployed
+        and not show_form
+    ):
+        st.session_state[f"show_deploy_form_{session_id}"] = True
+        show_form = True
+
+    # Single "Deploy to AWS" entry when approved but form is closed:
+    # covers "Not now", page refresh after failure, and lost session flags.
+    offer_deploy_entry = (
+        is_active
+        and session_id
+        and asl
+        and asl_approved
+        and not already_deployed
+        and not show_form
+        and (
+            deploy_skipped
+            or has_deploy_failure
+            or not wants_deploy
+        )
     )
 
     if (
@@ -2575,9 +3149,9 @@ def render_spec_approved(message_id, artifact, chat_id):
         and asl
         and asl_approved
         and wants_deploy
-        and not (
-            isinstance(deployment, dict) and deployment.get("state_machine_arn")
-        )
+        and not already_deployed
+        and not show_form
+        and not has_deploy_failure
     ):
         st.markdown("#### Deploy this ASL?")
         st.caption(
@@ -2592,6 +3166,8 @@ def render_spec_approved(message_id, artifact, chat_id):
                 use_container_width=True,
                 disabled=not controls_enabled,
             ):
+                if deploy_skipped_key:
+                    st.session_state.pop(deploy_skipped_key, None)
                 st.session_state[f"show_deploy_form_{session_id}"] = True
                 st.rerun()
         with c_skip:
@@ -2604,6 +3180,8 @@ def render_spec_approved(message_id, artifact, chat_id):
                 if deploy_prompt_key:
                     st.session_state[deploy_prompt_key] = False
                 st.session_state.pop(f"show_deploy_form_{session_id}", None)
+                if deploy_skipped_key:
+                    st.session_state[deploy_skipped_key] = True
                 add_message(chat_id, "user", "Not now — skip deploy")
                 apply_run_result(
                     chat_id,
@@ -2612,8 +3190,8 @@ def render_spec_approved(message_id, artifact, chat_id):
                         "run_id": session_id,
                         "stage": "spec_approved",
                         "assistant_text": (
-                            "Okay — deploy skipped. You can deploy later from this "
-                            "approved ASL card when you're ready."
+                            "Okay — deploy skipped. Use **Deploy to AWS** on this "
+                            "approved ASL card whenever you're ready."
                         ),
                         "asl": asl,
                         "asl_json": asl,
@@ -2625,56 +3203,113 @@ def render_spec_approved(message_id, artifact, chat_id):
                 )
                 st.rerun()
 
-        show_form = st.session_state.get(f"show_deploy_form_{session_id}")
-        if show_form:
-            with st.expander("Deploy to AWS Step Functions", expanded=True):
-                st.caption(
-                    "Optional overrides — leave blank to use server defaults "
-                    "(plan name slug + AWS_STATE_MACHINE_ROLE_ARN)."
+    if (
+        is_active
+        and session_id
+        and asl
+        and asl_approved
+        and show_form
+        and not already_deployed
+    ):
+        form_title = (
+            "Retry deploy to AWS Step Functions"
+            if has_deploy_failure
+            else "Deploy to AWS Step Functions"
+        )
+        with st.expander(form_title, expanded=True):
+            st.caption(
+                "Optional overrides — leave blank to use server defaults "
+                "(plan name slug + AWS_STATE_MACHINE_ROLE_ARN). "
+                "Your previous failure was missing an execution role ARN — "
+                "paste one below or set AWS_STATE_MACHINE_ROLE_ARN on the API."
+                if has_deploy_failure
+                else "Optional overrides — leave blank to use server defaults "
+                "(plan name slug + AWS_STATE_MACHINE_ROLE_ARN)."
+            )
+            sm_name = st.text_input(
+                "State machine name (optional)",
+                value="",
+                key=f"deploy_name_{message_id}",
+                placeholder="defaults to plan name slug",
+                disabled=not controls_enabled,
+            )
+            role_arn = st.text_input(
+                "Execution role ARN (optional)",
+                value="",
+                key=f"deploy_role_{message_id}",
+                placeholder="defaults to server AWS_STATE_MACHINE_ROLE_ARN",
+                disabled=not controls_enabled,
+            )
+            force = st.checkbox(
+                "Force deploy (skip pre-deploy checks)",
+                value=False,
+                key=f"deploy_force_{message_id}",
+                disabled=not controls_enabled,
+            )
+            if st.button(
+                "Deploy workflow" if not has_deploy_failure else "Retry deploy",
+                key=f"deploy_btn_{message_id}",
+                type="primary",
+                use_container_width=True,
+                disabled=not controls_enabled,
+            ):
+                add_message(
+                    chat_id,
+                    "user",
+                    "Retry deploy" if has_deploy_failure else "Deploy workflow",
                 )
-                sm_name = st.text_input(
-                    "State machine name (optional)",
-                    value="",
-                    key=f"deploy_name_{message_id}",
-                    placeholder="defaults to plan name slug",
-                    disabled=not controls_enabled,
-                )
-                role_arn = st.text_input(
-                    "Execution role ARN (optional)",
-                    value="",
-                    key=f"deploy_role_{message_id}",
-                    placeholder="defaults to server AWS_STATE_MACHINE_ROLE_ARN",
-                    disabled=not controls_enabled,
-                )
-                force = st.checkbox(
-                    "Force deploy (skip pre-deploy checks)",
-                    value=False,
-                    key=f"deploy_force_{message_id}",
-                    disabled=not controls_enabled,
-                )
-                if st.button(
-                    "Deploy workflow",
-                    key=f"deploy_btn_{message_id}",
-                    type="primary",
-                    use_container_width=True,
-                    disabled=not controls_enabled,
-                ):
-                    add_message(chat_id, "user", "Deploy workflow")
-                    st.session_state.pending_deploy = {
-                        "chat_id": chat_id,
-                        "session_id": session_id,
-                        "state_machine_name": (sm_name or "").strip() or None,
-                        "role_arn": (role_arn or "").strip() or None,
-                        "force": bool(force),
-                    }
-                    st.rerun()
+                st.session_state.pending_deploy = {
+                    "chat_id": chat_id,
+                    "session_id": session_id,
+                    "state_machine_name": (sm_name or "").strip() or None,
+                    "role_arn": (role_arn or "").strip() or None,
+                    "force": bool(force),
+                }
+                st.rerun()
 
-    # Show last pre-deploy failure reasons if present on this artifact
+    if offer_deploy_entry:
+        st.markdown("#### Deploy")
+        st.caption(
+            "Deploy when ready — opens the deploy form with optional name / role overrides."
+        )
+        if st.button(
+            "Deploy to AWS",
+            key=f"deploy_later_{message_id}",
+            type="primary",
+            use_container_width=True,
+            disabled=not controls_enabled,
+        ):
+            if deploy_prompt_key:
+                st.session_state[deploy_prompt_key] = True
+            if deploy_skipped_key:
+                st.session_state.pop(deploy_skipped_key, None)
+            st.session_state[f"show_deploy_form_{session_id}"] = True
+            st.rerun()
+
+    intent = artifact.get("intent") or (artifact.get("api_raw") or {}).get("intent")
+    if intent == "revise_plan":
+        st.caption("Plan was revised from your feedback — review and approve again to refresh ASL.")
+
+    # Show last pre-deploy / AWS deploy failure reasons if present
     pre_reasons = artifact.get("pre_deploy_reasons")
     if pre_reasons:
-        st.error("Pre-deploy checks failed:")
+        st.error("Pre-deploy checks failed — resolve these before deploying:")
         for r in pre_reasons:
             st.markdown(f"- {r}")
+
+    deploy_reasons = artifact.get("deploy_failure_reasons")
+    if deploy_reasons:
+        code = artifact.get("deploy_error_code")
+        header = "Deploy to AWS failed"
+        if code:
+            header += f" ({code})"
+        st.error(header + ":")
+        for r in deploy_reasons:
+            st.markdown(f"- {r}")
+        st.caption(
+            "These come from AWS or credentials — not a Python traceback. "
+            "Fix the issue above, then deploy again."
+        )
 
 
 def render_out_of_scope(artifact):
@@ -2704,12 +3339,164 @@ def render_artifact(message_id, artifact, chat_id):
         st.json(artifact)
 
 
+def _render_read_only_diagrams(message_id, artifact, chat_id) -> None:
+    """Show plan / ASL graphs and ASL JSON without interactive controls.
+
+    Used while a request is in flight so diagrams stay visible, but we avoid
+    text inputs / buttons that would collide on widget keys across reruns.
+    """
+    if not artifact:
+        return
+    stage = artifact.get("stage")
+
+    if stage == "plan_review":
+        summary = artifact.get("summary")
+        if summary:
+            st.markdown(_strip_plan_placeholder_prompts(summary))
+        with st.expander("Diagram", expanded=True):
+            dot = artifact.get("graph_dot")
+            if dot:
+                head = (dot or "").lstrip()[:48].lower()
+                is_mermaid = head.startswith("flowchart") or head.startswith(
+                    "statediagram"
+                )
+                if is_mermaid:
+                    try:
+                        _render_mermaid(
+                            dot,
+                            key=f"plan_mermaid_ro_{chat_id}_{message_id}",
+                        )
+                    except Exception as exc:
+                        st.warning(
+                            "Mermaid could not be rendered "
+                            f"({type(exc).__name__}). Showing source."
+                        )
+                        st.code(dot, language="mermaid")
+                else:
+                    try:
+                        st.graphviz_chart(dot)
+                    except Exception:
+                        st.code(dot, language="dot")
+            else:
+                st.info(
+                    "No diagram was returned for this plan. "
+                    "You can still approve or request changes after this request finishes."
+                )
+        st.caption("Working on your request… actions are paused until it finishes.")
+        return
+
+    if stage == "spec_approved":
+        if message_id == _first_spec_approved_message_id(chat_id):
+            st.success("Plan approved and locked on the server.")
+
+        asl = artifact.get("asl") or artifact.get("asl_json")
+        # Mirror interactive cards: hide ASL until placeholders are resolved.
+        remaining_ro: list[str] = []
+        for token in list(artifact.get("spec_placeholders") or []):
+            if token and token not in remaining_ro:
+                remaining_ro.append(token)
+        if asl:
+            for token in _find_todo_placeholders_in_value(asl):
+                if token not in remaining_ro:
+                    remaining_ro.append(token)
+        for token in (artifact.get("validations") or {}).get(
+            "unresolved_placeholders"
+        ) or []:
+            if token and token not in remaining_ro:
+                remaining_ro.append(token)
+        if not remaining_ro and not isinstance(
+            artifact.get("spec_placeholders"), list
+        ):
+            for token in (
+                list(artifact.get("remaining_placeholders") or [])
+                + list(artifact.get("placeholders") or [])
+            ):
+                if token and token not in remaining_ro:
+                    remaining_ro.append(token)
+
+        if remaining_ro:
+            # Placeholders still open — hide ASL; list only appears on the
+            # interactive active card, not during in-flight read-only paint.
+            st.caption("Working on your request… actions are paused until it finishes.")
+            return
+
+        asl_error = artifact.get("asl_error")
+        if asl_error:
+            st.error(f"ASL generation error: {asl_error}")
+
+        vals = artifact.get("validations") or {}
+        if vals:
+            ok = vals.get("ok")
+            errs = vals.get("errors") or []
+            if ok is True:
+                st.success("ASL validations passed.")
+            elif ok is False:
+                st.warning(f"ASL has {len(errs)} validation issue(s).")
+
+        dot = None
+        if asl:
+            try:
+                from workflow import build_graphviz_dot
+
+                dot = build_graphviz_dot(asl)
+            except Exception:
+                dot = artifact.get("graph_dot")
+        if not dot:
+            dot = artifact.get("graph_dot")
+
+        if dot:
+            with st.expander("ASL graph", expanded=True):
+                try:
+                    st.graphviz_chart(dot)
+                except Exception as exc:
+                    st.warning(f"Could not render graph: {exc}")
+                    st.code(dot, language="dot")
+        elif asl:
+            st.caption("ASL is present but no graph DOT was returned.")
+
+        if asl:
+            with st.expander("ASL definition (JSON)", expanded=False):
+                st.json(asl)
+                if message_id == _latest_spec_approved_message_id(chat_id):
+                    name = "workflow"
+                    if isinstance(asl, dict) and asl.get("Comment"):
+                        name = str(asl["Comment"]).split(":")[0].strip() or name
+                    st.download_button(
+                        "Download ASL JSON",
+                        data=json.dumps(asl, indent=2),
+                        file_name=f"{name}.asl.json",
+                        mime="application/json",
+                        key=f"download_asl_ro_{chat_id}_{message_id}",
+                    )
+        else:
+            st.info("ASL not generated yet.")
+
+        pre_reasons = artifact.get("pre_deploy_reasons")
+        if pre_reasons:
+            st.error("Pre-deploy checks failed — resolve these before deploying:")
+            for r in pre_reasons:
+                st.markdown(f"- {r}")
+
+        deploy_reasons = artifact.get("deploy_failure_reasons")
+        if deploy_reasons:
+            code = artifact.get("deploy_error_code")
+            header = "Deploy to AWS failed"
+            if code:
+                header += f" ({code})"
+            st.error(header + ":")
+            for r in deploy_reasons:
+                st.markdown(f"- {r}")
+
+        st.caption("Working on your request… actions are paused until it finishes.")
+        return
+
+
 def render_chat_thread(chat_id, *, simplify: bool = False) -> None:
     """Paint only this chat's messages.
 
-    ``simplify=True`` (used while an API call is in flight) renders plain
-    text bubbles only — no plan diagrams / ASL graphs — so heavy widgets
-    from another chat cannot linger in the element tree.
+    ``simplify=True`` (used while an API call is in flight) still shows plan /
+    ASL diagrams and JSON expanders so they do not disappear while waiting,
+    but skips interactive controls to avoid widget-key collisions.
     """
     for message in get_messages(chat_id):
         mid = message.get("id")
@@ -2727,10 +3514,16 @@ def render_chat_thread(chat_id, *, simplify: bool = False) -> None:
         stage = (artifact or {}).get("stage") if artifact else None
 
         if simplify:
-            # Plain text only while waiting — avoids graphviz/expanders.
             text = message.get("content") or ""
             if stage == "clarifying" and artifact:
                 render_clarifying(artifact)
+            elif stage in ("plan_review", "spec_approved") and artifact:
+                st.markdown(
+                    '<div class="assistant-response">', unsafe_allow_html=True
+                )
+                render_assistant_block_start()
+                _render_read_only_diagrams(mid, artifact, chat_id)
+                st.markdown("</div>", unsafe_allow_html=True)
             elif text:
                 render_assistant_message(text)
             continue
@@ -2758,7 +3551,6 @@ def render_chat_thread(chat_id, *, simplify: bool = False) -> None:
         else:
             st.markdown(message["content"])
         st.markdown("</div>", unsafe_allow_html=True)
-
 
 def queue_user_prompt(active_chat_id, user_prompt):
     # Only block if THIS chat already has a request in flight. Other chats
@@ -2876,7 +3668,19 @@ def process_pending_fill_placeholders(region, env):
     if status == "running":
         return
     if status == "error":
-        fail_in_flight(f"Could not apply placeholders. {err}", chat_id=chat_id)
+        # If the server already cleared the pending list (or the UI only
+        # found tokens by scanning ASL), retry by forcing ASL regen after
+        # a second fill attempt is not available — show a clear message.
+        msg = str(err or "")
+        if "no pending placeholders" in msg.lower() or "no unresolved placeholder" in msg.lower():
+            fail_in_flight(
+                "Placeholders were already applied on the server. "
+                "Refresh the latest assistant card, or use Generate ASL "
+                "if the definition looks stale.",
+                chat_id=chat_id,
+            )
+        else:
+            fail_in_flight(f"Could not apply placeholders. {msg}", chat_id=chat_id)
         st.session_state.pop("pending_fill_placeholders", None)
         return
 
@@ -2999,26 +3803,63 @@ def process_pending_deploy(region, env):
     if status == "running":
         return
     if status == "error":
-        # Surface structured pre-deploy checklist when available.
-        if isinstance(err, PreDeployCheckFailed) or (
-            hasattr(err, "reasons") and getattr(err, "reasons", None)
-        ):
-            reasons = list(getattr(err, "reasons", []) or [])
+        # Surface structured checklists for both pre-deploy (422) and
+        # AWS-side deploy failures (502) — never a raw traceback.
+        reasons = list(getattr(err, "reasons", []) or [])
+        is_pre = isinstance(err, PreDeployCheckFailed) or (
+            type(err).__name__ == "PreDeployCheckFailed"
+        )
+        is_aws = isinstance(err, DeployFailed) or (
+            type(err).__name__ == "DeployFailed"
+        )
+        if reasons and (is_pre or is_aws or hasattr(err, "reasons")):
+            error_code = getattr(err, "error_code", None)
+            if is_aws or (not is_pre and error_code):
+                title = "Deploy to AWS failed"
+                if error_code:
+                    title += f" ({error_code})"
+                assistant = (
+                    title
+                    + " — see the issues below. Fix credentials, IAM, "
+                    "name, or definition, then try again."
+                )
+                key = "deploy_failure_reasons"
+            else:
+                assistant = (
+                    "Pre-deploy checks failed — fix the items below or force deploy."
+                )
+                key = "pre_deploy_reasons"
+            # Preserve ASL / graph from the previous approved card so the
+            # new failure message does not show "ASL not generated yet."
+            prev = _latest_asl_carrying_artifact(chat_id) or {}
+            asl = prev.get("asl") or prev.get("asl_json")
             art = {
                 "session_id": session_id,
                 "run_id": session_id,
                 "stage": "spec_approved",
-                "assistant_text": "Pre-deploy checks failed — fix the items below or force deploy.",
-                "pre_deploy_reasons": reasons,
-                "asl": None,
+                "assistant_text": assistant,
+                key: reasons,
+                "deploy_error_code": error_code,
+                "asl": asl,
+                "asl_json": asl,
+                "graph_dot": prev.get("graph_dot"),
+                "validations": prev.get("validations") or {},
+                "asl_approved": True,
+                "remaining_placeholders": [],
+                "enrichment_question": None,
+                "enrichment_error": None,
+                "asl_error": None,
             }
-            # Keep previous ASL on the thread by not wiping; just add the error note.
             apply_run_result(chat_id, art)
             update_chat_run_state(
                 chat_id, run_id=session_id, stage="spec_approved", deploy_status="blocked"
             )
         else:
-            fail_in_flight(f"Deploy failed. {err}", chat_id=chat_id)
+            # Last resort: still avoid dumping a huge exception object.
+            msg = str(err) if err else "Unknown deploy error"
+            if len(msg) > 400:
+                msg = msg[:397] + "..."
+            fail_in_flight(f"Deploy failed. {msg}", chat_id=chat_id)
         st.session_state.pop("pending_deploy", None)
         _finish_in_flight(chat_id)
         return
@@ -3026,6 +3867,8 @@ def process_pending_deploy(region, env):
     st.session_state.pop("pending_deploy", None)
     arn = (result or {}).get("state_machine_arn")
     action = (result or {}).get("action") or "ok"
+    prev = _latest_asl_carrying_artifact(chat_id) or {}
+    asl = prev.get("asl") or prev.get("asl_json")
     art = {
         "session_id": session_id,
         "run_id": session_id,
@@ -3035,6 +3878,11 @@ def process_pending_deploy(region, env):
             f"`{arn}`"
         ),
         "deployment": result,
+        "asl": asl,
+        "asl_json": asl,
+        "graph_dot": prev.get("graph_dot"),
+        "validations": prev.get("validations") or {},
+        "asl_approved": True,
         "remaining_placeholders": [],
         "enrichment_question": None,
         "enrichment_error": None,
@@ -3046,6 +3894,38 @@ def process_pending_deploy(region, env):
     )
     _finish_in_flight(chat_id)
 
+
+
+def _looks_like_deploy_request(text: str) -> bool:
+    """True for short chat phrases that mean "open / run deploy", not plan edits."""
+    t = (text or "").strip().lower()
+    if not t or len(t) > 80:
+        return False
+    # Normalize punctuation / extra spaces.
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    exact = {
+        "deploy",
+        "deploy workflow",
+        "deploy it",
+        "deploy now",
+        "retry deploy",
+        "redeploy",
+        "re deploy",
+        "deploy to aws",
+        "deploy to step functions",
+        "try deploy again",
+        "retry deployment",
+    }
+    if t in exact:
+        return True
+    # Mild variants: "please deploy", "can you deploy", "deploy again"
+    if re.fullmatch(
+        r"(please |can you |could you )?(re)?deploy( workflow| it| now| again)?",
+        t,
+    ):
+        return True
+    return False
 
 
 def process_user_prompt(active_chat_id, user_prompt, region, env):
@@ -3074,23 +3954,68 @@ def process_user_prompt(active_chat_id, user_prompt, region, env):
             return
         _remember_session_id(active_chat_id, session_id)
 
-    if chat and chat.get("stage") == "plan_review" and session_id and not USE_MOCK:
-        status, result, err = run_with_live_status(
-            active_chat_id,
-            lambda: reject_plan(session_id, user_prompt, region=region, env=env),
+    # Chat shortcut: "deploy" / "retry deploy" opens the deploy form (or runs
+    # deploy) when ASL is already approved — without going through the LLM.
+    if session_id and _looks_like_deploy_request(user_prompt):
+        prev = _latest_asl_carrying_artifact(active_chat_id) or {}
+        asl = prev.get("asl") or prev.get("asl_json")
+        already = bool(
+            isinstance(prev.get("deployment"), dict)
+            and prev["deployment"].get("state_machine_arn")
         )
-        if status == "running":
+        asl_ok = bool(
+            asl
+            or prev.get("asl_approved")
+            or st.session_state.get(f"asl_approved_{session_id}")
+        )
+        if asl and asl_ok and not already:
+            st.session_state[f"deploy_prompt_{session_id}"] = True
+            st.session_state[f"show_deploy_form_{session_id}"] = True
+            st.session_state.pop(f"deploy_skipped_{session_id}", None)
+            # Drop the pending prompt so we are not busy; surface guidance.
+            prompts = _pending_prompts()
+            prompts.pop(active_chat_id, None)
+            st.session_state.pending_prompts = prompts
+            apply_run_result(
+                active_chat_id,
+                {
+                    "session_id": session_id,
+                    "run_id": session_id,
+                    "stage": "spec_approved",
+                    "assistant_text": (
+                        "Opening the **deploy** form on the approved ASL card. "
+                        "Set an execution role ARN if the server does not have "
+                        "`AWS_STATE_MACHINE_ROLE_ARN`, then click **Deploy workflow** "
+                        "(or **Retry deploy**)."
+                    ),
+                    "asl": asl,
+                    "asl_json": asl,
+                    "graph_dot": prev.get("graph_dot"),
+                    "validations": prev.get("validations") or {},
+                    "asl_approved": True,
+                    "ask_deploy": True,
+                    "pre_deploy_reasons": prev.get("pre_deploy_reasons"),
+                    "deploy_failure_reasons": prev.get("deploy_failure_reasons"),
+                    "deploy_error_code": prev.get("deploy_error_code"),
+                },
+            )
+            _finish_in_flight(active_chat_id)
             return
-        if status == "error":
+        if already:
+            prompts = _pending_prompts()
+            prompts.pop(active_chat_id, None)
+            st.session_state.pending_prompts = prompts
             fail_in_flight(
-                f"Could not send the change request. {err}",
+                "This workflow is already deployed. "
+                "Revise the plan / ASL if you need a new definition, then deploy again.",
                 chat_id=active_chat_id,
             )
             return
-        apply_run_result(active_chat_id, result)
-        _finish_in_flight(active_chat_id)
-        return
+        # No approved ASL yet — fall through to normal chat so the router can reply.
 
+    # Free-text always goes through POST /message (LangGraph router).
+    # That router picks patch_params for value-only edits and revise_plan
+    # only for structural changes — never force /reject here.
     status, result, err = run_with_live_status(
         active_chat_id,
         lambda: send_message(user_prompt, run_id=session_id, region=region, env=env),
@@ -3109,80 +4034,38 @@ def process_user_prompt(active_chat_id, user_prompt, region, env):
     _finish_in_flight(active_chat_id)
 
 
-def _chat_input_resize_script(nonce: str, *, focus: bool) -> str:
-    """After send, clear leftover expanded height on an empty chat textarea.
-
-    Does not force a tiny fixed height (that made the box look distorted and
-    scrollable). Only removes inline height Streamlit left behind, and
-    optionally focuses the input. No MutationObserver.
-    """
-    focus_js = "true" if focus else "false"
-    return f"""
-        <script>
-        (function() {{
-          const shouldFocus = {focus_js};
-          const doc = window.parent.document;
-          let attempts = 0;
-
-          function findInput() {{
-            const root = doc.querySelector('[data-testid="stChatInput"]');
-            if (!root) return null;
-            return root.querySelector("textarea") || root.querySelector("input");
-          }}
-
-          function resetIfEmpty(input) {{
-            if (!input) return;
-            const empty = !input.value || !String(input.value).trim();
-            if (!empty) return;
-            try {{
-              // Remove Streamlit auto-grow inline height; let CSS/layout size it.
-              input.style.removeProperty("height");
-              input.style.removeProperty("min-height");
-              input.style.removeProperty("max-height");
-              input.rows = 1;
-              // Clear expanded height on immediate wrappers only.
-              let el = input.parentElement;
-              for (let i = 0; i < 3 && el; i++) {{
-                if (el.style) {{
-                  el.style.removeProperty("height");
-                  el.style.removeProperty("min-height");
-                }}
-                el = el.parentElement;
-              }}
-            }} catch (e) {{}}
-          }}
-
-          function run() {{
-            const input = findInput();
-            if (!input) {{
-              attempts += 1;
-              if (attempts < 40) setTimeout(run, 50);
-              return;
-            }}
-            resetIfEmpty(input);
-            if (shouldFocus) {{
-              try {{ input.focus({{ preventScroll: true }}); }}
-              catch (e) {{ try {{ input.focus(); }} catch (e2) {{}} }}
-            }}
-          }}
-
-          setTimeout(run, 0);
-          setTimeout(run, 150);
-          setTimeout(run, 400);
-          setTimeout(run, 800);
-        }})();
-        </script>
-        """
-
-
-def focus_chat_input(active_chat_id):
-    """Focus the chat box when requested; collapse expanded empty height after send."""
+def focus_chat_input(active_chat_id=None):
+    """Focus chat input after New Chat / history switch (MVP-style script)."""
     want_focus = bool(st.session_state.pop("focus_chat_input", False))
-    st.session_state._focus_tick = st.session_state.get("_focus_tick", 0) + 1
-    nonce = f"{active_chat_id}-{st.session_state.get('_focus_tick', 0)}-{int(want_focus)}"
+    if active_chat_id is not None and st.session_state.get("_focused_chat") != active_chat_id:
+        want_focus = True
+        st.session_state._focused_chat = active_chat_id
+    if not want_focus:
+        return
 
     components.html(
-        _chat_input_resize_script(nonce, focus=want_focus),
+        """
+        <script>
+        (function () {
+          const doc = window.parent.document;
+          function run() {
+            const root = doc.querySelector('[data-testid="stChatInput"]');
+            const input = root && (root.querySelector('textarea') || root.querySelector('input'));
+            if (!input || input.disabled) return;
+            try {
+              const ae = doc.activeElement;
+              const side = doc.querySelector('[data-testid="stSidebar"]');
+              if (ae && side && side.contains(ae)) ae.blur();
+            } catch (e) {}
+            try { input.focus({ preventScroll: true }); }
+            catch (e) { try { input.focus(); } catch (e2) {} }
+          }
+          run();
+          setTimeout(run, 100);
+          setTimeout(run, 300);
+        })();
+        </script>
+        """,
         height=0,
     )
 
@@ -3221,18 +4104,6 @@ if "api_unreachable" not in st.session_state:
 with st.sidebar:
     st.title("Workflow Assistant")
 
-    if USE_MOCK:
-        st.caption("Mock mode — set USE_MOCK_API=false for real API")
-    else:
-        st.caption("Live API mode")
-
-    st.selectbox("Environment", options=["dev", "test"], key="deploy_env")
-    st.selectbox(
-        "AWS region",
-        options=["ap-south-1", "us-east-1", "eu-west-1"],
-        key="aws_region",
-    )
-
     if st.button("New Chat", type="primary", use_container_width=True):
         create_new_chat()
         st.rerun()
@@ -3243,7 +4114,9 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    with st.container(height=400, border=False):
+    # Scrollable history region (Streamlit height= enables the scrollport;
+    # CSS caps it at min(560px, 100vh - 220px)).
+    with st.container(height=560, border=False):
         st.markdown(
             '<div class="sidebar-history-marker" style="display:none"></div>',
             unsafe_allow_html=True,
@@ -3253,7 +4126,7 @@ with st.sidebar:
             if is_draft_chat(chat["id"]):
                 continue
             render_sidebar_chat(chat)
-        st.markdown('<div style="height: 4rem;"></div>', unsafe_allow_html=True)
+        st.markdown('<div style="height: 0.75rem;"></div>', unsafe_allow_html=True)
 
 active_chat_id = st.session_state.active_chat_id
 if not get_chat(active_chat_id):
@@ -3261,11 +4134,11 @@ if not get_chat(active_chat_id):
     ensure_active_chat()
     active_chat_id = st.session_state.active_chat_id
 
-region = st.session_state.get("aws_region", "ap-south-1")
-env = st.session_state.get("deploy_env", "dev")
+# Defaults only — env/region UI was removed; API uses server-side config.
+region = "ap-south-1"
+env = "dev"
 
 st.title("Workflow Assistant")
-st.caption("Chat → plan → approve plan → fill placeholders → approve ASL → deploy")
 
 if st.session_state.get("api_unreachable") and not USE_MOCK:
     detail = st.session_state.get("api_error_detail") or "API unreachable"
@@ -3284,8 +4157,8 @@ _examples_slot = st.empty()
 _busy_now = is_chat_busy(active_chat_id)
 
 if _busy_now:
-    # In-flight: plain bubbles only + typing, then run the API. Never paint
-    # the full interactive thread in the same run (avoids duplicate widget keys).
+    # In-flight: diagrams / ASL JSON stay visible (read-only), interactive
+    # controls are skipped to avoid duplicate widget keys, then run the API.
     with _thread_slot.container():
         render_chat_thread(active_chat_id, simplify=True)
 
@@ -3364,6 +4237,10 @@ _examples_dismissed = st.session_state.get(f"examples_dismissed_{active_chat_id}
 
 if not has_user and not _examples_dismissed:
     with _examples_slot.container():
+        st.markdown(
+            '<div class="examples-marker"></div>',
+            unsafe_allow_html=True,
+        )
         st.markdown("##### Try an example")
         for i, example in enumerate(EXAMPLE_PROMPTS):
             if st.button(

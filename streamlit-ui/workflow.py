@@ -1,6 +1,5 @@
 """
 UI orchestration client.
-
 USE_MOCK_API=true -> local mock (dev without API)
 USE_MOCK_API=false -> real FastAPI session endpoints
 """
@@ -38,9 +37,46 @@ class PreDeployCheckFailed(OrchestrationApiError):
         super().__init__("Pre-deploy checks failed: " + "; ".join(reasons))
 
 
+class DeployFailed(OrchestrationApiError):
+    """Raised when POST /session/{id}/deploy reaches AWS and AWS (or the
+    API's credential setup) rejects the call — 502 with a structured
+    {"reasons": [...], "error_code": ...} body. Distinct from
+    PreDeployCheckFailed (local checks before any AWS write).
+    """
+
+    def __init__(self, reasons: list[str], error_code: str | None = None):
+        self.reasons = list(reasons or []) or ["Deploy failed."]
+        self.error_code = error_code
+        prefix = f"Deploy failed ({error_code}): " if error_code else "Deploy failed: "
+        super().__init__(prefix + "; ".join(self.reasons))
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
+
+
+def _humanize_api_error(status_code: int, path: str, detail) -> str:
+    """Turn FastAPI detail strings into short, user-facing messages."""
+    text = detail if isinstance(detail, str) else str(detail)
+    lower = text.lower()
+    if status_code == 409 and "no spec-level placeholders" in lower:
+        return (
+            "There are no pending placeholders to fill on the workflow "
+            "specification. If the form still shows tokens, try "
+            "regenerating ASL, or start a new chat for a clean session."
+        )
+    if status_code == 409 and "no workflow_spec" in lower:
+        return (
+            "No workflow specification is locked yet. Approve the plan "
+            "first, then fill any placeholders."
+        )
+    if status_code == 409 and "placeholder" in lower:
+        return text  # already written for humans in session_service
+    if status_code == 409:
+        return text
+    return f"Request failed ({status_code}): {text}"
+
 
 def _request(method: str, path: str, payload: dict | None = None) -> dict:
     url = f"{API_BASE_URL}{path}"
@@ -68,8 +104,26 @@ def _request(method: str, path: str, payload: dict | None = None) -> dict:
             and isinstance(detail.get("reasons"), list)
         ):
             raise PreDeployCheckFailed(detail["reasons"])
+        # Deploy path (502): API returns structured reasons from
+        # DeploymentError — never show a raw traceback to the user.
+        if (
+            response.status_code == 502
+            and isinstance(detail, dict)
+            and isinstance(detail.get("reasons"), list)
+        ):
+            raise DeployFailed(
+                detail.get("reasons") or ["Deploy failed."],
+                error_code=detail.get("error_code"),
+            )
+        # Flatten common FastAPI detail shapes into a short string.
+        if isinstance(detail, dict) and "message" in detail:
+            msg = detail.get("message")
+            reasons = detail.get("reasons")
+            if isinstance(reasons, list) and reasons:
+                raise DeployFailed(reasons, error_code=detail.get("error_code"))
+            raise OrchestrationApiError(_humanize_api_error(response.status_code, path, msg))
         raise OrchestrationApiError(
-            f"API {method} {path} failed ({response.status_code}): {detail}"
+            _humanize_api_error(response.status_code, path, detail)
         )
     return data if isinstance(data, dict) else {"data": data}
 
@@ -99,6 +153,7 @@ def _empty_artifact(session_id: str = "", stage: str = "failed", text: str = "")
         "deployment": None,
         "remaining_placeholders": [],
         "spec_placeholders": [],
+        "placeholder_details": {},
         "api_raw": None,
     }
 
@@ -108,6 +163,10 @@ def _normalize_message_response(session_id: str, data: dict) -> dict:
     status = data.get("status")
     art = _empty_artifact(session_id)
     art["api_raw"] = data
+    if data.get("phase"):
+        art["phase"] = data.get("phase")
+    if data.get("intent"):
+        art["intent"] = data.get("intent")
 
     if status == "needs_clarification":
         q = data.get("question") or ""
@@ -129,6 +188,45 @@ def _normalize_message_response(session_id: str, data: dict) -> dict:
 
     if status == "ready":
         plan = data.get("plan")
+        asl = data.get("asl")
+        # Value-only patch after ASL exists: stay on ASL review surface.
+        # Structural revise returns ready *without* asl (locked ASL cleared).
+        has_asl = isinstance(asl, dict) and bool(asl)
+        intent = (data.get("intent") or "").strip()
+        phase = (data.get("phase") or "").strip()
+        if has_asl and (
+            intent == "patch_params"
+            or phase in ("asl_review", "spec_placeholders", "deployed")
+        ):
+            art["stage"] = "spec_approved"
+            art["plan"] = plan
+            art["workflow_spec"] = data.get("workflow_spec") or plan
+            remaining = list(
+                data.get("remaining_placeholders")
+                or data.get("placeholders")
+                or []
+            )
+            art["placeholders"] = remaining
+            art["remaining_placeholders"] = remaining
+            art["spec_placeholders"] = list(data.get("spec_placeholders") or [])
+            details_raw = data.get("placeholder_details") or {}
+            art["placeholder_details"] = (
+                {str(k): str(v) for k, v in details_raw.items()}
+                if isinstance(details_raw, dict)
+                else {}
+            )
+            art["asl"] = asl
+            art["asl_json"] = asl
+            art["graph_dot"] = data.get("asl_graph_dot") or data.get("diagram_dot")
+            art["validations"] = data.get("asl_validations") or {}
+            art["asl_error"] = data.get("asl_error")
+            art["assistant_text"] = data.get("message") or (
+                "Updated values without redesigning the workflow. "
+                "ASL refreshed."
+            )
+            art["summary"] = data.get("summary_markdown")
+            return art
+
         art["stage"] = "plan_review"
         art["plan"] = plan
         art["workflow_spec"] = plan  # render as JSON in UI
@@ -137,7 +235,8 @@ def _normalize_message_response(session_id: str, data: dict) -> dict:
         art["placeholders"] = list(data.get("placeholders") or [])
         name = (plan or {}).get("name") if isinstance(plan, dict) else None
         art["assistant_text"] = (
-            data.get("summary_markdown")
+            data.get("message")
+            or data.get("summary_markdown")
             or (f"Plan ready: **{name}**. Review and approve, or request changes.")
         )
         return art
@@ -164,9 +263,15 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
     # Prefer this over plan remaining + ASL scan when the API provides it.
     spec_ph = list(data.get("spec_placeholders") or [])
     art["spec_placeholders"] = spec_ph
+    # token → short description for the fill form labels
+    details_raw = data.get("placeholder_details") or {}
+    art["placeholder_details"] = (
+        {str(k): str(v) for k, v in details_raw.items()}
+        if isinstance(details_raw, dict)
+        else {}
+    )
     art["enrichment_error"] = data.get("enrichment_error")
     art["enrichment_question"] = data.get("enrichment_question")
-
     parts = [
         "Plan **approved**. Resolved specification is locked on the server.",
         "",
@@ -176,15 +281,19 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
         parts.extend(f"- `{p}`" for p in remaining)
     else:
         parts.append("All known plan placeholders were resolved (or none were present).")
-
     if spec_ph:
         parts.append("")
         parts.append(
             f"**{len(spec_ph)} workflow-spec placeholder(s)** must be filled "
             "before ASL can be generated:"
         )
-        parts.extend(f"- `{p}`" for p in spec_ph)
-
+        ph_details = art["placeholder_details"]
+        for p in spec_ph:
+            desc = (ph_details.get(p) or "").strip()
+            if desc:
+                parts.append(f"- `{p}` — {desc}")
+            else:
+                parts.append(f"- `{p}`")
     if data.get("enrichment_question"):
         parts.append("")
         parts.append(
@@ -201,13 +310,11 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
     else:
         parts.append("")
         parts.append("Enrichment did not return a workflow_spec.")
-
     # Stage 4 ASL
     art["asl"] = data.get("asl")
     art["asl_json"] = data.get("asl")
     art["graph_dot"] = data.get("asl_graph_dot") or art.get("graph_dot")
     art["validations"] = data.get("asl_validations") or art.get("validations")
-
     if data.get("asl_error"):
         parts.append("")
         parts.append(f"ASL generation error: {data['asl_error']}")
@@ -224,7 +331,6 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
     else:
         parts.append("")
         parts.append("ASL not generated yet (waiting on enrichment).")
-
     art["assistant_text"] = "\n".join(parts)
     return art
 
@@ -232,6 +338,7 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Real API
 # ---------------------------------------------------------------------------
+
 
 def create_session() -> str:
     data = _request("POST", "/session")
@@ -328,7 +435,6 @@ def api_validate_asl(session_id: str, asl: dict | None = None) -> dict:
 
 def api_download_asl(session_id: str) -> tuple[bytes, str]:
     """GET /session/{id}/asl/download — fetch ASL JSON bytes from the backend.
-
     Returns (content_bytes, filename). Raises OrchestrationApiError on failure.
     """
     url = f"{API_BASE_URL}/session/{session_id}/asl/download"
@@ -336,7 +442,6 @@ def api_download_asl(session_id: str) -> tuple[bytes, str]:
         response = requests.get(url, timeout=API_TIMEOUT)
     except requests.RequestException as exc:
         raise OrchestrationApiError(f"Could not reach API at {url}: {exc}") from exc
-
     if not response.ok:
         try:
             detail = response.json().get("detail", response.text)
@@ -346,7 +451,6 @@ def api_download_asl(session_id: str) -> tuple[bytes, str]:
             f"API GET /session/{session_id}/asl/download failed "
             f"({response.status_code}): {detail}"
         )
-
     filename = "workflow.asl.json"
     cd = response.headers.get("Content-Disposition") or ""
     # attachment; filename="foo.asl.json"
@@ -366,7 +470,6 @@ def api_deploy_workflow(
 ) -> dict:
     """POST /session/{id}/deploy — Stage 5: create-or-update the session's
     locked ASL as a real Step Functions state machine.
-
     Raises PreDeployCheckFailed (with `.reasons`) if the API's pre-deploy
     checks block the deploy (422) -- validation not passing, leftover
     TODO_ placeholders anywhere in the ASL, or no execution role
@@ -430,6 +533,7 @@ def _apply_asl_payload_to_artifact(art: dict, data: dict) -> dict:
 # Public functions used by app.py
 # ---------------------------------------------------------------------------
 
+
 def ensure_session(session_id: str | None) -> str:
     """Return existing session_id or create a new backend session."""
     if USE_MOCK:
@@ -453,7 +557,6 @@ def send_message(
     _ = region, env
     if USE_MOCK:
         return _mock_send_message(message, run_id=run_id or None)
-
     if not run_id:
         run_id = create_session()
     return api_send_message(run_id, message)
@@ -635,22 +738,182 @@ def revalidate_asl(asl: Any, session_id: str | None = None) -> dict:
 
 
 def build_graphviz_dot(asl_definition: dict) -> str:
-    """Kept for optional local ASL graphs later; plan diagrams come from API."""
+    """Build a Graphviz DOT diagram from an ASL definition.
+
+    Walks top-level states and nested Map/Parallel branches so the UI
+    graph matches the full workflow (not just StartAt → Next chains).
+    """
+    if not isinstance(asl_definition, dict):
+        return "digraph G {}"
+
     try:
-        states = asl_definition["States"]
+        root_states = asl_definition["States"]
         start = asl_definition["StartAt"]
     except Exception:
         return "digraph G {}"
 
-    lines = [
+    def _esc(s: str) -> str:
+        return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+    def _resource_label(state: dict) -> str:
+        resource = state.get("Resource") or ""
+        if not isinstance(resource, str):
+            return ""
+        # arn:aws:states:::lambda:invoke → lambda:invoke
+        if "states:::" in resource:
+            return resource.split("states:::")[-1]
+        if resource.startswith("arn:"):
+            parts = resource.split(":")
+            return parts[-1] if parts else resource
+        return resource[:40]
+
+    def _node_style(state_type: str) -> str:
+        t = (state_type or "").lower()
+        if t == "map":
+            return 'shape=box, style="rounded,filled", fillcolor="#fce7f3", color="#db2777"'
+        if t == "parallel":
+            return 'shape=box, style="rounded,filled", fillcolor="#ede9fe", color="#7c3aed"'
+        if t == "choice":
+            return 'shape=diamond, style="filled", fillcolor="#fef3c7", color="#d97706"'
+        if t in ("succeed", "pass"):
+            return 'shape=box, style="rounded,filled", fillcolor="#dcfce7", color="#16a34a"'
+        if t == "fail":
+            return 'shape=box, style="rounded,filled", fillcolor="#fee2e2", color="#dc2626"'
+        if t == "wait":
+            return 'shape=box, style="rounded,filled", fillcolor="#e0f2fe", color="#0284c8"'
+        return 'shape=box, style="rounded,filled", fillcolor="#e0e7ff", color="#4f46e5"'
+
+    lines: list[str] = [
         "digraph Workflow {",
-        'rankdir="TB";',
-        f'start -> "{start}";',
+        '  rankdir="TB";',
+        '  graph [pad="0.3", nodesep="0.45", ranksep="0.55"];',
+        '  node [fontname="Helvetica", fontsize=11];',
+        '  edge [fontname="Helvetica", fontsize=9, color="#64748b"];',
+        '  "Start" [shape=circle, style="filled", fillcolor="#1f2937", fontcolor="#ffffff", width=0.7, fixedsize=true];',
+        f'  "Start" -> "{_esc(start)}";',
     ]
-    for name, state in states.items():
-        lines.append(f'"{name}" [label="{name}"];')
-        if "Next" in state:
-            lines.append(f'"{name}" -> "{state["Next"]}";')
+    emitted_nodes: set[str] = set()
+    emitted_edges: set[tuple[str, str, str]] = set()
+
+    def _emit_node(name: str, state: dict) -> None:
+        if name in emitted_nodes:
+            return
+        emitted_nodes.add(name)
+        stype = state.get("Type") or "Task"
+        label_parts = [name, f"[{stype}]"]
+        res = _resource_label(state)
+        if res:
+            label_parts.append(res)
+        comment = state.get("Comment")
+        if isinstance(comment, str) and comment.strip():
+            short = comment.strip()
+            if len(short) > 48:
+                short = short[:45] + "..."
+            label_parts.append(short)
+        label = "\\n".join(_esc(p) for p in label_parts)
+        lines.append(f'  "{_esc(name)}" [label="{label}", {_node_style(stype)}];')
+
+    def _emit_edge(src: str, dst: str, label: str = "") -> None:
+        key = (src, dst, label)
+        if key in emitted_edges:
+            return
+        emitted_edges.add(key)
+        if label:
+            lines.append(
+                f'  "{_esc(src)}" -> "{_esc(dst)}" [label="{_esc(label)}"];'
+            )
+        else:
+            lines.append(f'  "{_esc(src)}" -> "{_esc(dst)}";')
+
+    def _walk_states(states: dict, *, cluster: str | None = None) -> None:
+        if not isinstance(states, dict):
+            return
+        cluster_id = None
+        if cluster:
+            cluster_id = f"cluster_{abs(hash(cluster)) % 10_000_000}"
+            lines.append(f"  subgraph {cluster_id} {{")
+            lines.append("    style=rounded;")
+            lines.append('    color="#cbd5e1";')
+            lines.append(f'    label="{_esc(cluster)}";')
+            lines.append('    fontsize=10;')
+
+        for name, state in states.items():
+            if not isinstance(state, dict):
+                continue
+            _emit_node(name, state)
+            stype = (state.get("Type") or "").lower()
+
+            if "Next" in state and state["Next"]:
+                _emit_edge(name, state["Next"])
+
+            # Choice branches
+            if stype == "choice":
+                for i, choice in enumerate(state.get("Choices") or []):
+                    if not isinstance(choice, dict):
+                        continue
+                    nxt = choice.get("Next")
+                    if not nxt:
+                        continue
+                    # Prefer a short human label when present
+                    lbl = choice.get("Comment") or choice.get("Variable") or f"case {i + 1}"
+                    if isinstance(lbl, str) and len(lbl) > 24:
+                        lbl = lbl[:21] + "..."
+                    _emit_edge(name, nxt, str(lbl))
+                default = state.get("Default")
+                if default:
+                    _emit_edge(name, default, "default")
+
+            # Catch edges (error paths)
+            for catch in state.get("Catch") or []:
+                if not isinstance(catch, dict):
+                    continue
+                nxt = catch.get("Next")
+                if not nxt:
+                    continue
+                errs = catch.get("ErrorEquals") or []
+                if isinstance(errs, list) and errs:
+                    lbl = ",".join(str(e) for e in errs[:2])
+                    if len(errs) > 2:
+                        lbl += "…"
+                else:
+                    lbl = "catch"
+                _emit_edge(name, nxt, f"catch:{lbl}")
+
+            # Map iterator / ItemProcessor
+            if stype == "map":
+                iterator = (
+                    state.get("ItemProcessor")
+                    or state.get("Iterator")
+                    or {}
+                )
+                if isinstance(iterator, dict):
+                    inner_states = iterator.get("States") or {}
+                    inner_start = iterator.get("StartAt")
+                    if inner_start and isinstance(inner_states, dict):
+                        _emit_edge(name, inner_start, "iterator")
+                        _walk_states(
+                            inner_states,
+                            cluster=f"{name} iterator",
+                        )
+
+            # Parallel branches
+            if stype == "parallel":
+                for bi, branch in enumerate(state.get("Branches") or []):
+                    if not isinstance(branch, dict):
+                        continue
+                    b_states = branch.get("States") or {}
+                    b_start = branch.get("StartAt")
+                    if b_start and isinstance(b_states, dict):
+                        _emit_edge(name, b_start, f"branch {bi + 1}")
+                        _walk_states(
+                            b_states,
+                            cluster=f"{name} branch {bi + 1}",
+                        )
+
+        if cluster_id:
+            lines.append("  }")
+
+    _walk_states(root_states)
     lines.append("}")
     return "\n".join(lines)
 
@@ -736,7 +999,6 @@ def _mock_send_message(message: str, run_id: str | None = None) -> dict:
 
     _mock_pause()
     text = (message or "").strip()
-
     if _looks_out_of_scope(text):
         sid = run_id or str(uuid.uuid4())
         if sid not in _MOCK_RUNS:
@@ -752,7 +1014,6 @@ def _mock_send_message(message: str, run_id: str | None = None) -> dict:
             **_empty_artifact(sid, "out_of_scope", msg),
             "assistant_text": msg,
         }
-
     if not run_id or run_id not in _MOCK_RUNS:
         sid = run_id or str(uuid.uuid4())
         _MOCK_RUNS[sid] = {"session_id": sid, "n": 0}
@@ -760,7 +1021,6 @@ def _mock_send_message(message: str, run_id: str | None = None) -> dict:
             **_empty_artifact(sid, "clarifying", "What should happen on failure?"),
             "clarifying_questions": ["What should happen on failure?"],
         }
-
     run = _MOCK_RUNS[run_id]
     run["n"] += 1
     if run["n"] == 1 and len(text) < 3:
@@ -768,7 +1028,6 @@ def _mock_send_message(message: str, run_id: str | None = None) -> dict:
             **_empty_artifact(run_id, "clarifying", "Please add a bit more detail."),
             "clarifying_questions": ["Please add a bit more detail."],
         }
-
     plan = {
         "name": "mock-s3-workflow",
         "summary": "Validate S3 object, process, notify.",

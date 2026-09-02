@@ -76,6 +76,308 @@ def find_asl_placeholders(node: Any, _seen: list[str] | None = None) -> list[str
     return out
 
 
+def _humanize_todo_token(token: str) -> str:
+    """TODO_SUCCESS_TOPIC_ARN → 'Success topic ARN'."""
+    raw = (token or "").strip()
+    if raw.upper().startswith("TODO_"):
+        raw = raw[5:]
+    words = [w for w in raw.replace("-", "_").split("_") if w]
+    if not words:
+        return token
+    # Keep common acronyms uppercase.
+    acronyms = {
+        "ARN",
+        "AWS",
+        "S3",
+        "SNS",
+        "SQS",
+        "IAM",
+        "API",
+        "URL",
+        "URI",
+        "ID",
+        "ETL",
+        "CSV",
+        "JSON",
+        "DB",
+        "RDS",
+        "ECS",
+        "EKS",
+        "VPC",
+        "KMS",
+        "SES",
+        "SFN",
+    }
+    out: list[str] = []
+    for i, w in enumerate(words):
+        up = w.upper()
+        if up in acronyms:
+            out.append(up)
+        elif i == 0:
+            out.append(w.capitalize())
+        else:
+            out.append(w.lower())
+    return " ".join(out)
+
+
+# Known AWS integrations we can recognize from resource/description text,
+# used to give ARN-style placeholders a concrete label + example instead
+# of a generic "AWS resource ARN". Checked in order, so this list stays
+# short and specific rather than trying to be exhaustive.
+_SERVICE_ARN_HINTS: list[tuple[str, str, str]] = [
+    ("lambda", "Lambda function", "arn:aws:lambda:us-east-1:123456789012:function:MyFunction"),
+    ("dynamodb", "DynamoDB table", "arn:aws:dynamodb:us-east-1:123456789012:table/MyTable"),
+    ("sns", "SNS topic", "arn:aws:sns:us-east-1:123456789012:MyTopic"),
+    ("sqs", "SQS queue", "arn:aws:sqs:us-east-1:123456789012:MyQueue"),
+    ("s3", "S3 bucket", "arn:aws:s3:::my-bucket"),
+    ("ecs", "ECS task definition", "arn:aws:ecs:us-east-1:123456789012:task-definition/MyTask"),
+    ("ses", "SES identity", "arn:aws:ses:us-east-1:123456789012:identity/example.com"),
+    ("glue", "Glue job", "arn:aws:glue:us-east-1:123456789012:job/MyJob"),
+    ("states", "Step Functions state machine", "arn:aws:states:us-east-1:123456789012:stateMachine:MyStateMachine"),
+    ("kms", "KMS key", "arn:aws:kms:us-east-1:123456789012:key/abcd1234-a123-4567-b890-1234567890ab"),
+    ("rds", "RDS database instance", "arn:aws:rds:us-east-1:123456789012:db:my-database"),
+]
+
+
+def _detect_service_hint(*texts: str) -> tuple[str, str] | None:
+    """Best-effort (label, example ARN) guess from non-placeholder text.
+
+    Strips TODO_ tokens out of the combined text first -- a bare
+    placeholder can't tell us what AWS service it belongs to, and
+    without this a token could "match" against its own name.
+    """
+    blob = _PLACEHOLDER_PATTERN.sub("", " ".join(t for t in texts if t)).lower()
+    for keyword, label, example in _SERVICE_ARN_HINTS:
+        if keyword in blob:
+            return label, example
+    return None
+
+
+def _as_clause(desc: str) -> str:
+    """'Submit and capture the request.' -> 'submit and capture the request'.
+
+    Folds an existing step description into a "used ... to <do the
+    thing>" sentence instead of repeating it verbatim.
+    """
+    d = (desc or "").strip().rstrip(".")
+    if not d:
+        return d
+    return d[0].lower() + d[1:]
+
+
+def describe_placeholders(
+    workflow_spec: dict | None,
+    tokens: list[str],
+    *,
+    plan: dict | None = None,
+) -> dict[str, str]:
+    """Map each TODO_ token to a short user-facing description.
+
+    Prefer enrichment metadata on workflow_spec (parameters,
+    integrations, components). Fall back to plan step text, then a
+    humanized form of the token name so the fill form is never bare.
+    """
+    details: dict[str, str] = {}
+    if not tokens:
+        return details
+
+    token_set = {t for t in tokens if t}
+
+    # --- parameters: name is often the TODO_ token itself ---
+    if isinstance(workflow_spec, dict):
+        for param in workflow_spec.get("parameters") or []:
+            if not isinstance(param, dict):
+                continue
+            name = str(param.get("name") or "")
+            if name not in token_set:
+                continue
+            desc = (param.get("description") or "").strip()
+            scope = param.get("scope")
+            component_id = param.get("component_id")
+            bits: list[str] = []
+            if desc:
+                bits.append(desc)
+            if component_id:
+                bits.append(f"Used by step `{component_id}`.")
+            elif scope and scope != "global":
+                bits.append(f"Scope: {scope}.")
+            details[name] = " ".join(bits) if bits else _humanize_todo_token(name)
+
+        # --- integrations: connection_details may be the token ---
+        for integ in workflow_spec.get("integrations") or []:
+            if not isinstance(integ, dict):
+                continue
+            conn = str(integ.get("connection_details") or "")
+            matched = [t for t in token_set if t in conn]
+            if not matched:
+                continue
+            label = (integ.get("name") or "").strip()
+            service = (integ.get("service") or "").strip()
+            kind = (integ.get("kind") or "").strip()
+            comps = integ.get("components") or []
+            parts: list[str] = []
+            if label:
+                parts.append(label)
+            elif service:
+                parts.append(f"{service} resource")
+            if service and label and service.lower() not in label.lower():
+                parts.append(f"({service})")
+            if kind:
+                parts.append(f"— {kind.replace('_', ' ')}")
+            if isinstance(comps, list) and comps:
+                parts.append(
+                    "Used by: " + ", ".join(f"`{c}`" for c in comps[:4])
+                    + ("…" if len(comps) > 4 else "")
+                    + "."
+                )
+            text = " ".join(parts).strip() or _humanize_todo_token(matched[0])
+            for t in matched:
+                details.setdefault(t, text)
+
+        # --- components / steps: resource or description may embed the token ---
+        components = (
+            workflow_spec.get("components")
+            or workflow_spec.get("steps")
+            or []
+        )
+        if isinstance(components, list):
+            for comp in components:
+                if not isinstance(comp, dict):
+                    continue
+                cid = str(comp.get("id") or comp.get("name") or "")
+                cdesc = (comp.get("description") or "").strip()
+                resource = str(comp.get("resource") or comp.get("service") or "")
+                service_field = str(comp.get("service") or "")
+                params_blob = json.dumps(comp.get("parameters") or {}, default=str)
+                step_ref = f"step `{cid}`" if cid else "this step"
+
+                # A token can play two different roles on the same step,
+                # and they need different wording or they collapse to the
+                # same generic sentence:
+                #   - it IS the whole resource/service value -> the
+                #     integration itself is unresolved (unknown ARN).
+                #   - it's embedded inside Parameters/service alongside an
+                #     otherwise-identifiable integration (e.g. Resource is
+                #     the Lambda-invoke pattern, Parameters.FunctionName is
+                #     the placeholder) -> we know the service, just not
+                #     which specific resource to call.
+                for t in token_set:
+                    if t in details or not t:
+                        continue
+                    is_whole_resource = t == resource.strip()
+                    is_embedded = not is_whole_resource and (
+                        t in params_blob or t in service_field or t in cdesc
+                    )
+                    if not (is_whole_resource or is_embedded):
+                        continue
+
+                    hint = _detect_service_hint(
+                        "" if is_whole_resource else resource,
+                        service_field,
+                        cdesc,
+                        params_blob,
+                    )
+                    if is_whole_resource:
+                        if hint:
+                            label, example = hint
+                            details[t] = (
+                                f"AWS ARN for the {label} used by {step_ref}"
+                                + (f" — {cdesc}." if cdesc else ".")
+                                + f" e.g. `{example}`."
+                            )
+                        else:
+                            details[t] = (
+                                f"AWS resource ARN required by {step_ref} "
+                                "(integration type wasn't identified — e.g. "
+                                "Lambda, SNS, or DynamoDB ARN)."
+                            )
+                    else:
+                        clause = _as_clause(cdesc)
+                        if hint:
+                            label, example = hint
+                            details[t] = (
+                                f"{label} name or ARN used by {step_ref}"
+                                + (f" to {clause}." if clause else ".")
+                                + f" e.g. `{example}`."
+                            )
+                        elif cdesc:
+                            details[t] = (
+                                f"{cdesc} (step `{cid}`)." if cid else cdesc
+                            )
+                        elif cid:
+                            details[t] = (
+                                f"Resource for step `{cid}` "
+                                f"({_humanize_todo_token(t)})."
+                            )
+
+    # --- plan steps (service / description) ---
+    if isinstance(plan, dict):
+        for step in plan.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            sid = str(step.get("id") or "")
+            sdesc = (step.get("description") or "").strip()
+            service_field = str(step.get("service") or "")
+            step_ref = f"step `{sid}`" if sid else "this step"
+            for t in token_set:
+                if t in details or not t:
+                    continue
+                # At this early stage (before enrichment/ASL) there's no
+                # resource/parameters split yet -- `service` is the only
+                # field that can hold the placeholder. When the token IS
+                # that whole field, extraction couldn't even name the AWS
+                # service; give the same "unresolved integration" phrasing
+                # a later ARN-only placeholder would get.
+                if t != service_field.strip():
+                    continue
+                hint = _detect_service_hint(sdesc)
+                clause = _as_clause(sdesc)
+                if hint:
+                    label, example = hint
+                    details[t] = (
+                        f"{label} name or ARN used by {step_ref}"
+                        + (f" to {clause}." if clause else ".")
+                        + f" e.g. `{example}`."
+                    )
+                elif sdesc:
+                    details[t] = (
+                        f"AWS service + resource identifier (e.g. a Lambda "
+                        f"function name/ARN or SNS topic ARN) used by "
+                        f"{step_ref} to {clause}."
+                    )
+                else:
+                    details[t] = (
+                        f"AWS service + resource identifier needed for "
+                        f"{step_ref} ({_humanize_todo_token(t)})."
+                    )
+
+    # --- fallback: humanize any still-missing tokens ---
+    for t in tokens:
+        if t and t not in details:
+            details[t] = _humanize_todo_token(t)
+
+    # --- guarantee no two tokens ever render identical text ---
+    # Every branch above tries to produce a token-specific description,
+    # but they rely on heuristics (a recognized service keyword, a step
+    # description that differs per role, etc.) that can fail to fire on
+    # real-world data -- e.g. a step whose resource text has no keyword
+    # we know about. Rather than trying to anticipate every case that
+    # could cause two tokens on the same step to collide, enforce
+    # uniqueness structurally as a last pass: if two tokens ended up with
+    # the exact same description, tag each with its own token name so
+    # the fill-placeholders form never shows the same text twice.
+    by_text: dict[str, list[str]] = {}
+    for t, d in details.items():
+        by_text.setdefault(d, []).append(t)
+    for text, toks in by_text.items():
+        if len(toks) < 2:
+            continue
+        for t in toks:
+            details[t] = f"{text} ({_humanize_todo_token(t)})"
+
+    return details
+
+
 def apply_placeholder_overrides(node: Any, overrides: dict[str, str]) -> Any:
     """Deep-replace TODO_ tokens (or any string keys) in a JSON tree.
 
@@ -1704,12 +2006,18 @@ def _state_label(name: str, state: dict) -> str:
 
 
 def render_asl_graph(asl: dict) -> str:
-    """Produce Graphviz DOT approximating the Step Functions console graph."""
-    states: dict = asl.get("States") or {}
+    """Produce Graphviz DOT approximating the Step Functions console graph.
+
+    Recurses into Map Iterator/ItemProcessor and Parallel Branches so nested
+    states (and their Next / Choice / Catch edges) appear in the diagram —
+    not only the iterator entry node.
+    """
+    root_states: dict = asl.get("States") or {}
     start = asl.get("StartAt") or ""
     lines = [
         "digraph ASL {",
         "  rankdir=TB;",
+        '  graph [pad="0.3", nodesep="0.4", ranksep="0.5"];',
         '  node [style="rounded,filled", fontname="Helvetica", fontsize=11];',
         '  edge [fontname="Helvetica", fontsize=9];',
         '  __start [label="Start", shape=circle, fillcolor="#111827", '
@@ -1718,7 +2026,13 @@ def render_asl_graph(asl: dict) -> str:
     if start:
         lines.append(f'  __start -> "{_dot_escape(start)}";')
 
-    for name, state in states.items():
+    drawn_nodes: set[str] = set()
+    drawn_edges: set[tuple[str, str, str]] = set()
+
+    def emit_node(name: str, state: dict) -> None:
+        if name in drawn_nodes:
+            return
+        drawn_nodes.add(name)
         stype = state.get("Type", "Task")
         fill, stroke, shape = _TYPE_STYLE.get(stype, ("#E5E7EB", "#374151", "box"))
         label = _state_label(name, state)
@@ -1727,55 +2041,97 @@ def render_asl_graph(asl: dict) -> str:
             f'color="{stroke}", shape={shape}];'
         )
 
-    drawn: set[tuple[str, str, str]] = set()
-
-    def edge(src: str, dst: str, style: str, color: str, label: str | None = None) -> None:
+    def edge(
+        src: str, dst: str, style: str, color: str, label: str | None = None
+    ) -> None:
         key = (src, dst, style + (label or ""))
-        if key in drawn:
+        if key in drawn_edges:
             return
-        drawn.add(key)
+        drawn_edges.add(key)
         lab = f', label="{_dot_escape(label)}"' if label else ""
         lines.append(
             f'  "{_dot_escape(src)}" -> "{_dot_escape(dst)}" '
             f'[style={style}, color="{color}"{lab}];'
         )
 
-    for name, state in states.items():
-        stype = state.get("Type")
-        if "Next" in state:
-            edge(name, state["Next"], "solid", "#4B5563")
-        if state.get("Default"):
-            edge(name, state["Default"], "dashed", "#B45309", "default")
-        for rule in state.get("Choices") or []:
-            if isinstance(rule, dict) and rule.get("Next"):
-                # Prefer Comment / StringEquals as edge label.
-                lab = None
-                if "StringEquals" in rule:
-                    lab = str(rule["StringEquals"])
-                elif "Comment" in rule:
-                    lab = str(rule["Comment"])[:30]
-                edge(name, rule["Next"], "dashed", "#B45309", lab)
-        for c in state.get("Catch") or []:
-            if isinstance(c, dict) and c.get("Next"):
-                errs = c.get("ErrorEquals") or []
-                lab = "catch"
-                if errs and errs != ["States.ALL"]:
-                    lab = "catch: " + ",".join(str(e) for e in errs[:2])
-                edge(name, c["Next"], "dashed", "#C53030", lab)
+    def walk_states(states: dict, *, cluster_label: str | None = None) -> None:
+        if not isinstance(states, dict) or not states:
+            return
 
-        if stype == "Parallel":
-            for i, br in enumerate(state.get("Branches") or []):
-                if not isinstance(br, dict):
+        cluster_id = None
+        if cluster_label:
+            cluster_id = f"cluster_{abs(hash(cluster_label)) % 10_000_000}"
+            lines.append(f"  subgraph {cluster_id} {{")
+            lines.append("    style=rounded;")
+            lines.append('    color="#CBD5E1";')
+            lines.append(f'    label="{_dot_escape(cluster_label)}";')
+            lines.append("    fontsize=10;")
+
+        for name, state in states.items():
+            if not isinstance(state, dict):
+                continue
+            emit_node(name, state)
+            stype = state.get("Type")
+
+            if "Next" in state and state["Next"]:
+                edge(name, state["Next"], "solid", "#4B5563")
+
+            if state.get("Default"):
+                edge(name, state["Default"], "dashed", "#B45309", "default")
+
+            for rule in state.get("Choices") or []:
+                if isinstance(rule, dict) and rule.get("Next"):
+                    lab = None
+                    if "StringEquals" in rule:
+                        lab = str(rule["StringEquals"])
+                    elif "NumericGreaterThan" in rule:
+                        lab = f"> {rule['NumericGreaterThan']}"
+                    elif "NumericGreaterThanEquals" in rule:
+                        lab = f">= {rule['NumericGreaterThanEquals']}"
+                    elif "Comment" in rule:
+                        lab = str(rule["Comment"])[:30]
+                    edge(name, rule["Next"], "dashed", "#B45309", lab)
+
+            for c in state.get("Catch") or []:
+                if isinstance(c, dict) and c.get("Next"):
+                    errs = c.get("ErrorEquals") or []
+                    lab = "catch"
+                    if errs and errs != ["States.ALL"]:
+                        lab = "catch: " + ",".join(str(e) for e in errs[:2])
+                    edge(name, c["Next"], "dashed", "#C53030", lab)
+
+            if stype == "Parallel":
+                for i, br in enumerate(state.get("Branches") or []):
+                    if not isinstance(br, dict):
+                        continue
+                    br_start = br.get("StartAt")
+                    br_states = br.get("States") or {}
+                    if br_start:
+                        edge(name, br_start, "solid", "#7C3AED", f"branch {i}")
+                    if isinstance(br_states, dict) and br_states:
+                        walk_states(
+                            br_states,
+                            cluster_label=f"{name} branch {i}",
+                        )
+
+            if stype == "Map":
+                it = state.get("Iterator") or state.get("ItemProcessor") or {}
+                if not isinstance(it, dict):
                     continue
-                br_start = br.get("StartAt")
-                if br_start:
-                    edge(name, br_start, "solid", "#7C3AED", f"branch {i}")
-        if stype == "Map":
-            it = state.get("Iterator") or state.get("ItemProcessor") or {}
-            it_start = it.get("StartAt") if isinstance(it, dict) else None
-            if it_start:
-                edge(name, it_start, "solid", "#BE185D", "iterator")
+                it_start = it.get("StartAt")
+                it_states = it.get("States") or {}
+                if it_start:
+                    edge(name, it_start, "solid", "#BE185D", "iterator")
+                if isinstance(it_states, dict) and it_states:
+                    walk_states(
+                        it_states,
+                        cluster_label=f"{name} iterator",
+                    )
 
+        if cluster_id:
+            lines.append("  }")
+
+    walk_states(root_states)
     lines.append("}")
     return "\n".join(lines)
 

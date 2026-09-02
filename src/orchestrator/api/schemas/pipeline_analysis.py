@@ -37,7 +37,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from orchestrator.api.schemas.common import PlanBranch
+from orchestrator.api.schemas.common import ComponentType, PlanBranch
 
 PIPELINE_ANALYSIS_SCHEMA_VERSION = "1.0"
 
@@ -122,23 +122,9 @@ class EnvironmentInference(BaseModel):
 # ---------------------------------------------------------------------------
 # Sub-stage 2: Component identification (paper Section 5.1, Appendix C.2)
 # ---------------------------------------------------------------------------
-
-ComponentType = Literal[
-    "DataLoader",
-    "Transformer",
-    "Reconciliator",
-    "Enricher",
-    "Exporter",
-    "QualityCheck",
-    "Splitter",
-    "Merger",
-    "Orchestrator",
-    "Notifier",
-    "DecisionGate",
-    "ExternalCall",
-    "Terminal",
-    "Other",
-]
+# ComponentType itself now lives in schemas/common.py (imported above) so
+# that PlanStep can carry it as a first-class field without a circular
+# import -- see that module for the full rationale.
 
 
 class ComponentDefinition(BaseModel):
@@ -264,7 +250,17 @@ class ParameterSpec(BaseModel):
         description="Set when scope == 'component': the id of the component this parameter configures.",
     )
     data_type: ParameterDataType
-    default: str | None = Field(default=None, description="Default value if stated or clearly implied.")
+    # Was `str | None`. The model is (correctly) told to make `default` agree
+    # with `data_type` -- a "number" parameter naturally gets a JSON number
+    # default (e.g. ARCHIVE_LOOKBACK_HOURS -> 24), a "boolean" one gets a JSON
+    # bool. A str-only type rejected every one of those, forcing a guaranteed
+    # extra round trip through the repair loop (resending the *entire*
+    # parameter list) just to re-quote numbers as strings -- seen in practice
+    # taking longer than the original call itself. Widening the type to match
+    # what data_type actually implies removes that failure mode entirely.
+    default: str | int | float | bool | None = Field(
+        default=None, description="Default value if stated or clearly implied."
+    )
     required: bool
     constraints: str | None = Field(
         default=None,

@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 
 from orchestrator.api.schemas.common import Plan, PlanBranch, PlanStep
+from orchestrator.api.services.plan.render import _component_kind
 
 _FAIL_NOTIFY_RE = re.compile(
     r"(alert|notify).*(ops|operations|failure|fail)|"
@@ -255,6 +256,7 @@ def _light_cleanup(plan: Plan) -> Plan:
             on_failure=list(s.on_failure or []),
             on_timeout=list(s.on_timeout or []),
             branches=[PlanBranch(condition=b.condition, next=b.next) for b in (s.branches or [])],
+            component_type=s.component_type,
         )
         for s in plan.steps
     ]
@@ -287,16 +289,24 @@ def _light_cleanup(plan: Plan) -> Plan:
             if seen_fail:
                 continue
             seen_fail = True
+            # Preserve a real downstream step if the original step had one --
+            # e.g. "store results, and additionally alert only on failure"
+            # means the alert step still falls through to storing afterward.
+            # Only default to terminal when the step truly had no next; the
+            # later dangling-reference pass (below) nulls this out anyway if
+            # it turns out to point nowhere real.
+            kept_next = s.next if (s.next and s.next not in drop_ids) else None
             rebuilt.append(
                 PlanStep(
                     id=fail_canonical,
                     service="SNS",
                     description=s.description
-                    or "Publish an operations failure alert and stop the workflow.",
-                    next=None,
+                    or "Publish an operations failure alert.",
+                    next=kept_next,
                     on_failure=[],
                     on_timeout=[],
                     branches=[],
+                    component_type=s.component_type or "Notifier",
                 )
             )
             continue
@@ -304,16 +314,18 @@ def _light_cleanup(plan: Plan) -> Plan:
             if seen_success:
                 continue
             seen_success = True
+            kept_next = s.next if (s.next and s.next not in drop_ids) else None
             rebuilt.append(
                 PlanStep(
                     id=success_canonical,
                     service="SNS",
                     description=s.description
                     or "Publish a successful pipeline completion notification.",
-                    next=None,
+                    next=kept_next,
                     on_failure=[],
                     on_timeout=[],
                     branches=[],
+                    component_type=s.component_type or "Notifier",
                 )
             )
             continue
@@ -339,26 +351,18 @@ def _light_cleanup(plan: Plan) -> Plan:
         service = "None" if keep_branches else s.service
         branches = []
         if keep_branches:
-            # Labeling is shape-based too, not keyword-based: exactly
-            # one branch is structurally a Map's single per-item body
-            # (see the identical reasoning in roles.py's MAP_ITERATE
-            # override); two or more branches is either exclusive
-            # Choice arms (if the conditions themselves use outcome
-            # wording like approved/rejected/pass/fail) or Parallel arms
-            # otherwise.
-            is_map = len(s.branches or []) == 1
-            is_choice = (not is_map) and (
-                _CHOICE_RE.search(_blob(s))
-                or any(
-                    re.search(
-                        r"\b(pass|fail|failed|failure|good|not good|eligible|"
-                        r"approved|rejected|success|succeeded)\b",
-                        b.condition or "",
-                        re.I,
-                    )
-                    for b in (s.branches or [])
-                )
-            )
+            # Labeling authority is `_component_kind` in render.py — the
+            # single classifier for Choice vs Parallel vs Map. It prefers
+            # explicit component_type from extraction; when that is absent
+            # (older plans / templates) it uses positive-evidence text
+            # heuristics and defaults branched steps to Choice, never to
+            # Parallel. Do not re-derive that decision here with a narrower
+            # regex (that is what mislabeled threshold / amount / outcome
+            # gates as "parallel arm: …").
+            kind = _component_kind(s)
+            is_map = kind == "map"
+            is_choice = kind == "choice"
+            # kind == "parallel" or None → concurrent-arm labeling below
             for i, b in enumerate(s.branches or []):
                 cond = (b.condition or "").strip()
                 if is_map:
@@ -367,8 +371,12 @@ def _light_cleanup(plan: Plan) -> Plan:
                     # N distinct concurrent jobs, which a Map body isn't.
                     cond = cond or "each item"
                 elif is_choice:
+                    # Preserve whatever exclusive condition extraction
+                    # wrote (threshold, outcome, approve/reject, …).
                     cond = cond or f"outcome {i + 1}"
                 else:
+                    # Confirmed Parallel (or unknown with concurrency
+                    # evidence already handled inside _component_kind).
                     cond = cond or f"parallel arm {i + 1}"
                     if "parallel" not in cond.lower():
                         cond = f"parallel arm: {b.next}"
@@ -383,6 +391,7 @@ def _light_cleanup(plan: Plan) -> Plan:
                 on_failure=list(s.on_failure or []),
                 on_timeout=list(s.on_timeout or []),
                 branches=branches,
+                component_type=s.component_type,
             )
         )
 
@@ -390,7 +399,7 @@ def _light_cleanup(plan: Plan) -> Plan:
     final: list[PlanStep] = []
     for s in rebuilt:
         nxt = remap(s.next)
-        if nxt and nxt not in known:
+        if nxt and (nxt not in known or nxt == s.id):
             nxt = None
         fails = []
         for f in s.on_failure or []:
@@ -416,6 +425,7 @@ def _light_cleanup(plan: Plan) -> Plan:
                 on_failure=fails,
                 on_timeout=timeouts,
                 branches=branches,
+                component_type=s.component_type,
             )
         )
 
@@ -500,6 +510,7 @@ def _rebuild_validate_parallel_quality_load(plan: Plan) -> Plan | None:
             on_failure=[],
             on_timeout=[],
             branches=[],
+            component_type="ExternalCall",
         )
 
     # Preserve LLM ids/names; lock only STRUCTURE (roles + edges).
@@ -543,6 +554,7 @@ def _rebuild_validate_parallel_quality_load(plan: Plan) -> Plan | None:
                 on_failure=[FID],
                 on_timeout=[],
                 branches=[],  # structure: workers never carry decision branches
+                component_type=getattr(w, "component_type", None) or "ExternalCall",
             )
         )
 
@@ -558,6 +570,7 @@ def _rebuild_validate_parallel_quality_load(plan: Plan) -> Plan | None:
             on_failure=[FID],
             on_timeout=[],
             branches=[],
+            component_type=getattr(validate, "component_type", None) or "QualityCheck",
         )
     )
 
@@ -578,6 +591,9 @@ def _rebuild_validate_parallel_quality_load(plan: Plan) -> Plan | None:
                 PlanBranch(condition=f"parallel arm: {wid}", next=wid)
                 for wid in worker_ids
             ],
+            # Explicit Orchestrator so render never falls back to heuristics
+            # and mis-draws this as a Choice diamond.
+            component_type="Orchestrator",
         )
     )
     out.extend(worker_steps)
@@ -593,6 +609,7 @@ def _rebuild_validate_parallel_quality_load(plan: Plan) -> Plan | None:
                 on_failure=[FID],
                 on_timeout=[],
                 branches=[],  # structure: no Choice — failure via on_failure
+                component_type=getattr(quality, "component_type", None) or "QualityCheck",
             )
         )
 
@@ -607,6 +624,7 @@ def _rebuild_validate_parallel_quality_load(plan: Plan) -> Plan | None:
                 on_failure=[FID],
                 on_timeout=[],
                 branches=[],
+                component_type=getattr(load, "component_type", None) or "ExternalCall",
             )
         )
 
@@ -623,6 +641,7 @@ def _rebuild_validate_parallel_quality_load(plan: Plan) -> Plan | None:
             on_failure=[],
             on_timeout=[],
             branches=[],
+            component_type=getattr(success, "component_type", None) if success else "Notifier",
         )
     )
 
@@ -639,6 +658,7 @@ def _rebuild_validate_parallel_quality_load(plan: Plan) -> Plan | None:
             on_failure=[],
             on_timeout=[],
             branches=[],
+            component_type=getattr(failure, "component_type", None) if failure else "Notifier",
         )
     )
 

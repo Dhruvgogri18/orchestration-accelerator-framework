@@ -7,6 +7,41 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 
+ComponentType = Literal[
+    "DataLoader",
+    "Transformer",
+    "Reconciliator",
+    "Enricher",
+    "Exporter",
+    "QualityCheck",
+    "Splitter",
+    "Merger",
+    "Orchestrator",
+    "Notifier",
+    "DecisionGate",
+    "ExternalCall",
+    "Terminal",
+    "Other",
+]
+"""LLM-assigned taxonomy classification for a step (Prompt2DAG-style,
+see schemas/pipeline_analysis.py). Lives here, not in
+schemas/pipeline_analysis.py, so that `PlanStep` below can carry it as
+a first-class field without a circular import (pipeline_analysis.py
+already imports PlanBranch from this module).
+
+This is the SAME enum used by ComponentDefinition / FlowStep in the
+Pipeline Analysis stage -- deliberately not re-derived or renamed here,
+so a step's classification is decided exactly once, by the extraction
+call with the most context, and simply carried downstream by every
+consumer (render, canonicalize, matching) rather than each of them
+re-guessing it from id/description keywords. Control-flow-relevant
+values: "Orchestrator" is a Parallel or Map container (disambiguated
+by branch count: 1 branch = Map's single per-item body, >=2 = Parallel
+arms), "DecisionGate" is a Choice, "Terminal" is Succeed/Fail. All
+other values are ordinary Task-shaped steps.
+"""
+
+
 class PlanBranch(BaseModel):
     """One exclusive outcome of a choice/decision step."""
 
@@ -54,6 +89,22 @@ class PlanStep(BaseModel):
     branches: list[PlanBranch] = Field(
         default_factory=list,
         description="Exclusive conditional arms from a decision step.",
+    )
+    # Explicit, LLM-assigned control-flow kind (see ComponentType above).
+    # Optional for backward compatibility with plans built before this
+    # field existed (older stored plans, curated templates in
+    # plan/matching/templates.py) -- those fall back to the keyword/
+    # branch-count heuristics in render.py / canonicalize.py unchanged.
+    # When present, it is authoritative: consumers should prefer it over
+    # re-deriving the same classification from text.
+    component_type: ComponentType | None = Field(
+        default=None,
+        description=(
+            "Taxonomy classification carried from Pipeline Analysis, if "
+            "available. 'Orchestrator' = Parallel/Map container, "
+            "'DecisionGate' = Choice, 'Terminal' = Succeed/Fail. None for "
+            "plans extracted before this field existed."
+        ),
     )
 
 

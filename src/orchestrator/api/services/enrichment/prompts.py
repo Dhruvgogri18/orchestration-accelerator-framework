@@ -40,7 +40,7 @@ ignore them.
 
 <rules>
 - **Step identity is fixed:** never add, remove, reorder, or rename
-  steps. Two narrow exceptions only:
+  steps. Three narrow exceptions only:
   - *Retry-only step:* if a step exists only to retry the one before
     it, fold it into that step's `retry` block and list its id in
     `merged_step_ids` instead of emitting it.
@@ -49,6 +49,23 @@ ignore them.
     `Succeed`/`Fail` step for it -- no resource/parameters/logic --
     listed in `added_step_ids` and actually routed to. Prefer a
     clarifying question over adding when unsure.
+  - *Unrouted failure-notification step:* a step whose action reports,
+    logs, or notifies about a failure (an ops alert, an error email, a
+    dead-letter write, a paging call -- identify this from the step's
+    own `description`, not from which AWS service it calls) stays a
+    Task per the Succeed/Fail rule below. But if the plan gives it no
+    `next_step`, do NOT close it with `end: true` -- that reports the
+    execution as succeeded. Instead add a minimal `Fail` step after it
+    (same mechanism as the Missing-terminal exception, listed in
+    `added_step_ids`) and route the notification step's `next_step` to
+    it. This applies anywhere the pattern occurs -- top level, inside
+    a Choice branch, inside a Parallel branch, inside a Map iterator --
+    not only at the end of the main chain. Exception: skip this when
+    the step's own outcome is a normal business result rather than a
+    system failure (e.g. "request rejected", "item skipped as out of
+    policy") -- `end: true` is correct there. Judge this from the
+    step's description and the plan's framing of the outcome, never
+    from whether a notification service happens to be involved.
 
 - **Never invent user-specific values** (ARNs, bucket/queue/topic/job/
   function names). Reuse an existing `TODO_SOMETHING` placeholder
@@ -108,10 +125,44 @@ ignore them.
   `default_next`. Map `plan.branches[]` -> `choices[]` 1:1. Map
   `plan.on_failure` -> `catch` (`error_equals: ["States.ALL"]` is
   fine).
+  - **Any JSONPath must match the producing step's actual output
+    shape, not just the field name the plan mentions.** This applies
+    everywhere a path reads a prior step's output -- Choice
+    conditions, `parameters` values written as `"X.$": "$..."`,
+    `result_path`, everything. Every AWS optimized integration has its
+    own response envelope (e.g. `lambda:invoke` nests the function's
+    real return value under `.Payload`; other integrations have their
+    own documented shape). Before writing such a path, check the
+    referenced step's `resource` and whether it already sets an
+    `OutputPath` that unwraps the envelope. If it doesn't, prefix the
+    path with the envelope field (e.g. `$.Payload.status`, not
+    `$.status`). Do this for every step that reads another step's
+    output, not only the one immediately after it.
+  - **`error_equals` values (Retry and Catch) must be real error
+    identifiers, never an invented label.** Valid values are
+    `States.ALL`, a documented `States.*` name (`States.Timeout`,
+    `States.TaskFailed`, `States.Permissions`, etc.), or the calling
+    integration's own real service-specific error class (e.g. for
+    `lambda:invoke`: `Lambda.ServiceException`,
+    `Lambda.AWSLambdaException`, `Lambda.SdkClientException`,
+    `Lambda.TooManyRequestsException`). If you don't know the specific
+    error names a given integration throws, default to `States.ALL`
+    rather than guessing a plausible-looking string -- a bare service
+    name or made-up label is never a valid `error_equals` value.
+
+- **Literal parameter text must match the step it belongs to.** Any
+  free text you write into a step's `parameters` (an SNS/email/Slack
+  `Message`, a subject line, a log message, etc.) must reflect that
+  specific step's own `description` and outcome (success vs. failure,
+  which branch it is on) -- never copy or adapt text from a sibling or
+  adjacent step, even when they share a topic/queue/ARN.
 
 - **Linkage:** every non-terminal step needs `next_step` or `end:
   true`; Choice routes via `choices`/`default_next` instead. Infer from
   the plan's ordering and control-flow fields -- nothing dangling.
+  Before defaulting an unrouted step to `end: true`, check the
+  Unrouted-failure-notification exception above first -- a Task with
+  no `next_step` is not automatically `end: true`.
 
 - **Ask, don't guess, only for structural gaps:** ask ONE clarifying
   question only when a STRUCTURAL decision is genuinely undecidable

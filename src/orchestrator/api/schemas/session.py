@@ -57,6 +57,11 @@ class ApproveResponse(BaseModel):
     # Empty means Stage 4 was allowed to run. Fill via
     # POST /session/{id}/spec/placeholders.
     spec_placeholders: list[str] = []
+    # Short human-readable descriptions for each entry in
+    # spec_placeholders (token → "what to fill"). Derived from
+    # workflow_spec parameters / integrations / components so the UI
+    # can label inputs beyond the bare TODO_ name.
+    placeholder_details: dict[str, str] = Field(default_factory=dict)
     # Stage 4 — populated only when workflow_spec is complete and
     # spec_placeholders is empty.
     asl: dict | None = None

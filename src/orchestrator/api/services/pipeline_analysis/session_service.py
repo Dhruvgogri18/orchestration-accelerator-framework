@@ -171,7 +171,19 @@ def run_extraction_turn(session_id: str, session: Session, message: str) -> Mess
     # for the next call's context.
     end_request(status=result.status)
 
-    # Plan matching → lock known archetypes; otherwise canonicalize as today.
+    # Plan matching / canonicalize still run on every ready turn -- match_plan
+    # emits the plan_match telemetry event below and (for low/none tiers)
+    # writes the curation-queue entry inside match_plan itself via
+    # log_unmatched, and canonicalize_plan's output is compared against the
+    # raw plan purely to log when it *would* have rewritten the topology.
+    # NEITHER is allowed to reassign result.plan any more: what we render
+    # (summary_markdown, diagram_dot), return to the client, and persist as
+    # `latest_plan` for /approve + downstream ASL generation must always be
+    # exactly what flow_structure_analysis produced -- never a template
+    # projection (tier == "high"/"medium") and never a regex-heuristic
+    # topology rebuild (canonicalize_plan Layer B). See plan/canonicalize.py
+    # and plan/matching/matcher.py docstrings for what each would otherwise
+    # have done.
     if result.status == "ready" and result.plan is not None:
         match_result = match_plan(
             result.plan,
@@ -186,15 +198,28 @@ def run_extraction_turn(session_id: str, session: Session, message: str) -> Mess
             score=match_result.score,
             signature_hash=getattr(match_result, "signature_hash", None),
         )
-        if match_result.tier == "high" and match_result.plan is not None:
-            # Structure locked by prototype — skip canonicalize topology
-            result.plan = match_result.plan
-        elif match_result.tier == "medium" and match_result.plan is not None:
-            # Partial trust: project then light canonicalize
-            result.plan = canonicalize_plan(match_result.plan)
+
+        # Diagnostic only, from here down -- `diagnostic_plan` is never
+        # assigned back to result.plan. It exists so curation can see when
+        # the template/heuristic path disagrees with the raw LLM output,
+        # without that disagreement ever reaching the user.
+        if match_result.tier in ("high", "medium") and match_result.plan is not None:
+            diagnostic_plan = (
+                match_result.plan
+                if match_result.tier == "high"
+                else canonicalize_plan(match_result.plan)
+            )
         else:
-            # low / none — legacy path (curation queue already written)
-            result.plan = canonicalize_plan(result.plan)
+            diagnostic_plan = canonicalize_plan(result.plan)
+
+        if diagnostic_plan.model_dump() != result.plan.model_dump():
+            log_event(
+                "plan_canonicalize_would_have_changed",
+                tier=match_result.tier,
+                archetype=getattr(match_result, "archetype", None)
+                or getattr(match_result, "template_name", None),
+                signature_hash=getattr(match_result, "signature_hash", None),
+            )
 
     session_store.append_message(session_id, "assistant", result.model_dump_json())
 

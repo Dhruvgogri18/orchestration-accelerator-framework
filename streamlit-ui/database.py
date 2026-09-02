@@ -188,6 +188,18 @@ def update_message_artifact(message_id, artifact):
         )
 
 
+def update_message_content(message_id, content):
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE messages
+            SET content = ?
+            WHERE id = ?
+            """,
+            (content, message_id),
+        )
+
+
 def get_messages(chat_id):
     with get_connection() as connection:
         rows = connection.execute(

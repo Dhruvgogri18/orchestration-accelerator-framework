@@ -100,26 +100,57 @@ def _strip_code_fences(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 _structured_output_supported = True
+_reasoning_effort_supported = True
+
+# Applied only to the three narrow, single-shot classification/extraction
+# stages below (scope, environment inference, action-clause enumeration) --
+# NOT to component identification, flow structure, parameters, or
+# integrations. Those four are where the correctness-critical rules live
+# (see prompts.py's module docstring on undercounting/misplaced-branch
+# failure modes); lowering reasoning effort there needs a before/after eval
+# comparison, not a blind rollout. Start narrow, validate, then consider
+# widening -- see conversation notes.
+LOW_EFFORT_KWARGS = {"reasoning_effort": "low"}
 
 
-def _chat_completion_structured(messages: list[dict], model_cls: type[BaseModel]) -> str:
-    global _structured_output_supported
-    if _structured_output_supported:
-        try:
-            return chat_completion(
-                messages,
-                temperature=0,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": model_cls.__name__,
-                        "schema": model_cls.model_json_schema(),
+def _chat_completion_structured(
+    messages: list[dict], model_cls: type[BaseModel], **extra_kwargs
+) -> str:
+    global _structured_output_supported, _reasoning_effort_supported
+    kwargs = dict(extra_kwargs)
+    if not _reasoning_effort_supported:
+        kwargs.pop("reasoning_effort", None)
+
+    def _call(**call_kwargs):
+        global _structured_output_supported
+        if _structured_output_supported:
+            try:
+                return chat_completion(
+                    messages,
+                    temperature=0,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": model_cls.__name__,
+                            "schema": model_cls.model_json_schema(),
+                        },
                     },
-                },
-            )
-        except TypeError:
-            _structured_output_supported = False
-    return chat_completion(messages, temperature=0)
+                    **call_kwargs,
+                )
+            except TypeError:
+                _structured_output_supported = False
+        return chat_completion(messages, temperature=0, **call_kwargs)
+
+    try:
+        return _call(**kwargs)
+    except Exception:
+        if "reasoning_effort" in kwargs:
+            # Gateway/model rejected the param -- fall back once, globally,
+            # rather than retrying broken calls on every subsequent turn.
+            _reasoning_effort_supported = False
+            kwargs.pop("reasoning_effort", None)
+            return _call(**kwargs)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -132,11 +163,12 @@ def _call_llm_json_with_repair(
     messages: list[dict],
     model_cls: type[BaseModel],
     max_attempts: int = MAX_STAGE_ATTEMPTS,
+    **extra_kwargs,
 ):
     last_error: str | None = None
 
     for _attempt in range(1, max_attempts + 1):
-        raw = _chat_completion_structured(messages, model_cls)
+        raw = _chat_completion_structured(messages, model_cls, **extra_kwargs)
         cleaned = _strip_code_fences(raw)
 
         try:
@@ -207,7 +239,7 @@ def classify_scope(history: list[dict]) -> ScopeResult:
     if prefiltered is not None:
         return prefiltered
     messages = [{"role": "system", "content": SCOPE_SYSTEM_PROMPT}, *history]
-    return _call_llm_json_with_repair(messages, ScopeResult)
+    return _call_llm_json_with_repair(messages, ScopeResult, **LOW_EFFORT_KWARGS)
 
 # ---------------------------------------------------------------------------
 # Sub-stage 1: Environment inference
@@ -216,7 +248,7 @@ def classify_scope(history: list[dict]) -> ScopeResult:
 
 def infer_environment(history: list[dict]) -> EnvironmentInference:
     messages = [{"role": "system", "content": ENVIRONMENT_INFERENCE_SYSTEM_PROMPT}, *history]
-    return _call_llm_json_with_repair(messages, EnvironmentInference)
+    return _call_llm_json_with_repair(messages, EnvironmentInference, **LOW_EFFORT_KWARGS)
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +266,7 @@ def infer_environment(history: list[dict]) -> EnvironmentInference:
 
 def enumerate_action_clauses(history: list[dict]) -> ActionClauseResult:
     messages = [{"role": "system", "content": ACTION_CLAUSE_SYSTEM_PROMPT}, *history]
-    return _call_llm_json_with_repair(messages, ActionClauseResult)
+    return _call_llm_json_with_repair(messages, ActionClauseResult, **LOW_EFFORT_KWARGS)
 
 
 # ---------------------------------------------------------------------------
@@ -589,9 +621,13 @@ def _run_concurrently(**calls):
 def _flow_to_plan(flow: FlowStructure) -> Plan:
     """Derive the legacy Plan shape (the contract plan.render,
     plan.canonicalize, plan.matching, and enrichment.service all rely
-    on) from the richer FlowStructure. component_type/entry_points/
-    parallel_sections are analysis-only extras those consumers were
-    never written to expect.
+    on) from the richer FlowStructure.
+
+    component_type MUST be carried through: render and canonicalize use
+    it as the authoritative Choice vs Parallel vs Map classifier. Dropping
+    it forces keyword heuristics that mis-label DecisionGates (e.g.
+    OrderAmountGate) as Parallel when branch conditions lack pass/fail
+    wording. entry_points / parallel_sections remain analysis-only.
     """
     steps = [
         PlanStep(
@@ -602,6 +638,7 @@ def _flow_to_plan(flow: FlowStructure) -> Plan:
             on_failure=list(s.on_failure),
             on_timeout=list(s.on_timeout),
             branches=[PlanBranch(condition=b.condition, next=b.next) for b in s.branches],
+            component_type=s.component_type,
         )
         for s in flow.steps
     ]
@@ -616,20 +653,24 @@ def analyze_pipeline(history: list[dict]) -> ExtractionResult:
     sub-stage exhausts its repair-loop attempts -- session_service.py's
     existing 502 mapping applies unchanged.
     """
-    scope = classify_scope(history)
-    if scope.status == "out_of_scope":
-        return ExtractionResult(status="out_of_scope", message=scope.message)
-
-    # Sub-stages 1 (environment) and the action-clause pass only ever read
-    # `history` -- neither depends on the other's output -- so they run
-    # concurrently instead of back-to-back. Saves ~1 LLM round trip of
-    # wall-clock latency on every turn at zero extra token cost (still
-    # exactly the same two calls, just overlapped).
-    with llm_stage("pipeline_analysis_env_and_clauses"):
+    # Sub-stage 0 (scope) and sub-stage 1 (environment) + the action-clause
+    # pass all only ever read `history` -- none depends on either of the
+    # others' output. Scope used to block ahead of the other two (its own
+    # sequential LLM round trip, ~18s in practice, before anything else
+    # could start); now all three run concurrently and we just discard the
+    # environment/clauses results if scope comes back out_of_scope. Saves
+    # a full LLM round trip of wall-clock latency on every in-scope turn
+    # (the overwhelming majority) at the cost of two wasted-but-cheap calls
+    # on the rare out-of-scope turn.
+    with llm_stage("pipeline_analysis_scope_env_and_clauses"):
         parallel = _run_concurrently(
+            scope=lambda: classify_scope(history),
             environment=lambda: infer_environment(history),
             action_clauses=lambda: enumerate_action_clauses(history).clauses,
         )
+    scope = parallel["scope"]
+    if scope.status == "out_of_scope":
+        return ExtractionResult(status="out_of_scope", message=scope.message)
     environment = parallel["environment"]
     action_clauses = parallel["action_clauses"]
 

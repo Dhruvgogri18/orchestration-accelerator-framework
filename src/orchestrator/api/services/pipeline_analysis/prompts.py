@@ -77,7 +77,6 @@ ENVIRONMENT_INFERENCE_SYSTEM_PROMPT = f"""\
 Environment Inference stage (1.1) of an AWS Step Functions workflow assistant. \
 Scope has ALREADY been confirmed in-domain -- do not re-judge that. Target \
 platform is always AWS Step Functions -- do not vary that.
-{DOMAIN_RULE}
 </role>
 
 <task>
@@ -278,17 +277,70 @@ Assemble the fixed component list into an execution graph.
 - **Referential integrity:** every referenced component id must exist in
   the given list; descriptions must agree with the links added.
 
-- **Parallel:** an Orchestrator's branches list each worker component;
-  its "next" is the post-join step; worker components omit "next".
-  Record the worker id group as one entry in "parallel_sections".
+- **Orchestrator branch cardinality (applies to every Orchestrator
+  construct, current and future):** the number of entries in an
+  Orchestrator's "branches" is determined by what it structurally
+  represents, never by how many downstream steps happen to exist:
+  - If the Orchestrator fans out to N separate, independent, named jobs
+    that each run once and don't feed into each other -- branches has
+    exactly N entries, one per job, each pointing at that job's own
+    first (and only directly-referenced) step.
+  - If the Orchestrator represents applying ONE pipeline to items of a
+    single collection (however many sequential steps that pipeline
+    has) -- branches has exactly ONE entry, pointing at the pipeline's
+    first step. Every step after that is wired via ordinary "next"
+    edges between the pipeline's own steps, like any sequential chain
+    -- never surfaced as additional branches entries on the
+    Orchestrator itself.
+  - The general check: branches.length must equal the number of
+    independent starting points the Orchestrator fans out to, NOT the
+    number of steps that eventually run. Multiple sequential steps
+    inside one starting point are never separate branches. Before
+    finalizing any Orchestrator's branches, count its independent
+    starting points first, then verify branches.length matches that
+    count exactly -- if it doesn't, that's a bug, not a stylistic
+    choice.
+  - If you find yourself modeling a new Orchestrator pattern this rule
+    doesn't cleanly cover, apply this same test rather than copying the
+    branch-per-item habit from whichever construct you last wired.
+
+- **Parallel:** an Orchestrator's branches list each worker component
+  (one entry per independent job, per the cardinality rule above); its
+  "next" is the post-join step; worker components omit "next". Record
+  the worker id group as one entry in "parallel_sections".
 
 - **Map:** an Orchestrator representing per-item iteration gets EXACTLY
-  ONE entry in "branches" -- {{"condition": "each item", "next": "<first
-  step of the per-item pipeline>"}}. Wire the per-item pipeline's own
-  steps normally between each other. The Orchestrator's "next" is the
-  post-iteration join step and must be set even though branches is also
-  set -- it must never point into the per-item pipeline. Record the
-  per-item pipeline's step ids as one entry in "parallel_sections".
+  ONE entry in "branches" (per the cardinality rule above) --
+  {{"condition": "each item", "next": "<first step of the per-item
+  pipeline>"}}. Wire the per-item pipeline's own steps normally between
+  each other via "next" -- do not do what Parallel does and give each
+  per-item step its own branches entry. The Orchestrator's "next" is
+  the post-iteration join step and must be set even though branches is
+  also set -- it must never point into the per-item pipeline. Record
+  the per-item pipeline's step ids as one entry in "parallel_sections".
+
+- **A Map's per-item pipeline can itself contain a nested Parallel.** These
+  are two independent signals and each gets its OWN Orchestrator -- never
+  collapse them into one:
+  - "process up to N items/files at a time" / "N at once" is a
+    MAP-level concurrency cap on iterating a list. It is never its own
+    step; it lives on the Map Orchestrator alone (downstream: its
+    `max_concurrency`). Do not add a second component for it.
+  - "for each item, do X and Y at the same time" is a Parallel, but it
+    is scoped to ONE item and belongs INSIDE the per-item pipeline, as
+    one of the ordinary sequential steps recorded in `parallel_sections`
+    for the Map. It is not a competing top-level Orchestrator.
+  - Worked example -- "list files from S3, scan each file for secrets
+    and PII concurrently, process up to 15 files at a time, alert and
+    continue on a failed file, then write a summary": this is ONE Map
+    Orchestrator (`branches` has exactly 1 entry, `parallel_sections`
+    holds the per-item pipeline's ids), whose per-item pipeline is
+    exactly one step: a Parallel Orchestrator (`branches` has exactly 2
+    entries: ScanForSecrets, ScanForPII). Two Orchestrator components
+    total, one nested inside the other's per-item pipeline -- never two
+    Orchestrators sitting side by side at the top level for this
+    request, and never a Task component standing in for the iteration
+    itself.
 
 - **Join/aggregation steps are never a branch:**
   - A step that only runs after every branch or every item has finished
@@ -304,6 +356,23 @@ Assemble the fixed component list into an execution graph.
   least 2 entries in "branches" (never just "next") -- one per exclusive
   outcome. Components that exist to handle those outcomes are branch
   targets on that gate, not free-floating steps.
+
+- **"Always A; additionally B only if condition" is NOT a 2-arm Choice.**
+  A request phrased as "do A, and do B only if <condition>" (e.g. "store
+  the results, and send a notification only if at least one item
+  failed") describes ONE action that always runs (A) plus a SECOND,
+  independently conditional action (B) -- not two mutually exclusive
+  outcomes of a single decision. Do not model this as a DecisionGate
+  whose branches are "A" vs "B", which would wrongly make A skip
+  whenever B runs. Instead: the DecisionGate's branches are "condition
+  true" -> B and "condition false" -> (whatever runs when B is skipped,
+  often nothing/straight to A), and B's own "next" must lead into A so A
+  still runs afterward. The test: if the request's "always" action would
+  stop happening on the path where the conditional action fires, the
+  wiring is wrong -- re-check before finalizing. Only model a true
+  exclusive Choice (distinct terminal outcomes, e.g. "alert on failure,
+  otherwise mark success") when both arms are genuinely alternatives
+  with no shared downstream step the request implies both should reach.
 
 - **No orphans:** every component except declared entry_points must be
   the target of at least one next/branches[].next/on_failure/on_timeout

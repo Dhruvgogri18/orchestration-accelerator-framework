@@ -41,6 +41,51 @@ ROLE_DEFAULTS: dict[str, tuple[str, str]] = {
     "TERMINAL": ("None", "End the workflow."),
 }
 
+# role -> ComponentType (see schemas/common.py). This is the SAME
+# taxonomy the six-stage extraction pipeline assigns and validates
+# (pipeline_analysis/service.py's _check_components_preserved rejects
+# any drift between stages). Template rendering must carry it through
+# too, or every template-matched plan (this module's whole purpose)
+# would silently lose it and fall back to render.py/canonicalize.py's
+# keyword guessing regardless of how well extraction did its job.
+#
+# DECISION/FAN_OUT/MAP_ITERATE are safe to hardcode here because
+# roles.py assigns them structurally (branch shape), never by wording
+# -- see tag_step's "structural overrides" -- so there is exactly one
+# ComponentType each role can ever mean, independent of any particular
+# example's phrasing.
+ROLE_COMPONENT_TYPE: dict[str, str] = {
+    "INGEST": "DataLoader",
+    "VALIDATE": "QualityCheck",
+    "TRANSFORM": "Transformer",
+    "ENRICH": "Enricher",
+    "QUALITY_CHECK": "QualityCheck",
+    "DECISION": "DecisionGate",
+    "FAN_OUT": "Orchestrator",
+    "WORKER": "Other",
+    "AGGREGATE": "Merger",
+    "PERSIST": "Exporter",
+    "MAP_ITERATE": "Orchestrator",
+    "RETRY_WAIT": "Other",
+    "COMPENSATE": "Other",
+    "EXTERNAL_CALL": "ExternalCall",
+    "ACTION": "Other",
+    "NOTIFY_SUCCESS": "Notifier",
+    "NOTIFY_FAILURE": "Notifier",
+    "TERMINAL": "Terminal",
+}
+
+# Fail at import time, not at request time, if a role is ever added to
+# one dict and not the other -- a missing entry here means every
+# template render for a plan containing that role would KeyError deep
+# inside a request instead of surfacing as an obvious startup problem.
+_missing = set(ROLE_DEFAULTS) - set(ROLE_COMPONENT_TYPE)
+if _missing:
+    raise RuntimeError(
+        f"ROLE_COMPONENT_TYPE is missing entries for roles: {sorted(_missing)}. "
+        "Every role in ROLE_DEFAULTS must have a matching ComponentType."
+    )
+
 
 @dataclass(frozen=True)
 class Template:
@@ -166,6 +211,20 @@ def render(
                     for cond, t in out_branch.get(canon_id, [])
                     if t in final_id
                 ],
+                # Prefer the original extraction's already-validated
+                # component_type (it survived _check_components_preserved
+                # in pipeline_analysis/service.py); only fall back to the
+                # role's canonical type for a step the template invented
+                # (no matching original) or an old plan that predates the
+                # field. Either way this must never end up None here --
+                # every role in ROLE_DEFAULTS has a corresponding entry
+                # in ROLE_COMPONENT_TYPE, so a missing role is a bug to
+                # fix at the mapping, not something to paper over with a
+                # silent None.
+                component_type=(
+                    (orig.component_type if orig else None)
+                    or ROLE_COMPONENT_TYPE[role]
+                ),
             )
         )
 
@@ -184,11 +243,11 @@ register(
         name="linear-etl",
         summary="Ingest, transform, persist.",
         steps=[
-            PlanStep(id="Ingest", service="Lambda", description="Read the input.", next="Transform", on_failure=["Alert"]),
-            PlanStep(id="Transform", service="Glue", description="Process the data.", next="Persist", on_failure=["Alert"]),
-            PlanStep(id="Persist", service="Lambda", description="Load results.", next="Success", on_failure=["Alert"]),
-            PlanStep(id="Success", service="SNS", description="Publish success."),
-            PlanStep(id="Alert", service="SNS", description="Publish failure alert."),
+            PlanStep(id="Ingest", service="Lambda", description="Read the input.", next="Transform", on_failure=["Alert"], component_type="DataLoader"),
+            PlanStep(id="Transform", service="Glue", description="Process the data.", next="Persist", on_failure=["Alert"], component_type="Transformer"),
+            PlanStep(id="Persist", service="Lambda", description="Load results.", next="Success", on_failure=["Alert"], component_type="Exporter"),
+            PlanStep(id="Success", service="SNS", description="Publish success.", component_type="Notifier"),
+            PlanStep(id="Alert", service="SNS", description="Publish failure alert.", component_type="Notifier"),
         ],
     ),
 )
@@ -199,7 +258,7 @@ register(
         name="fan-out-fan-in",
         summary="Validate, run two jobs in parallel, quality-check, persist.",
         steps=[
-            PlanStep(id="Validate", service="Lambda", description="Validate input.", next="Parallel", on_failure=["Alert"]),
+            PlanStep(id="Validate", service="Lambda", description="Validate input.", next="Parallel", on_failure=["Alert"], component_type="QualityCheck"),
             PlanStep(
                 id="Parallel", service="None", description="Run two jobs in parallel.",
                 next="Quality", on_failure=["Alert"],
@@ -207,13 +266,14 @@ register(
                     PlanBranch(condition="parallel arm: JobOne", next="JobOne"),
                     PlanBranch(condition="parallel arm: JobTwo", next="JobTwo"),
                 ],
+                component_type="Orchestrator",
             ),
-            PlanStep(id="JobOne", service="Glue", description="Run processing job one.", on_failure=["Alert"]),
-            PlanStep(id="JobTwo", service="Glue", description="Run processing job two.", on_failure=["Alert"]),
-            PlanStep(id="Quality", service="Lambda", description="Run data quality check.", next="Persist", on_failure=["Alert"]),
-            PlanStep(id="Persist", service="Lambda", description="Load approved results.", next="Success", on_failure=["Alert"]),
-            PlanStep(id="Success", service="SNS", description="Publish success."),
-            PlanStep(id="Alert", service="SNS", description="Publish failure alert."),
+            PlanStep(id="JobOne", service="Glue", description="Run processing job one.", on_failure=["Alert"], component_type="Other"),
+            PlanStep(id="JobTwo", service="Glue", description="Run processing job two.", on_failure=["Alert"], component_type="Other"),
+            PlanStep(id="Quality", service="Lambda", description="Run data quality check.", next="Persist", on_failure=["Alert"], component_type="QualityCheck"),
+            PlanStep(id="Persist", service="Lambda", description="Load approved results.", next="Success", on_failure=["Alert"], component_type="Exporter"),
+            PlanStep(id="Success", service="SNS", description="Publish success.", component_type="Notifier"),
+            PlanStep(id="Alert", service="SNS", description="Publish failure alert.", component_type="Notifier"),
         ],
     ),
 )
@@ -232,21 +292,24 @@ register(
             PlanStep(
                 id="ReadItems", service="S3", description="Discover and read all items from the input location.",
                 next="ProcessItemsConcurrently",
+                component_type="DataLoader",
             ),
             PlanStep(
                 id="ProcessItemsConcurrently", service="None",
                 description="Iterate over each discovered item and run every one independently and concurrently.",
                 next="Summarize",
                 branches=[PlanBranch(condition="each item", next="ValidateItem")],
+                component_type="Orchestrator",
             ),
             PlanStep(
                 id="ValidateItem", service="Lambda", description="Validate one item.",
                 next="TransformItem", on_failure=["NotifyInvalidItem"],
+                component_type="QualityCheck",
             ),
-            PlanStep(id="TransformItem", service="Lambda", description="Transform one validated item.", next="PersistItem"),
-            PlanStep(id="PersistItem", service="Lambda", description="Load one item's transformed data into the target store."),
-            PlanStep(id="NotifyInvalidItem", service="SNS", description="Publish a failure alert for an invalid item."),
-            PlanStep(id="Summarize", service="Lambda", description="Combine the outcomes of all items into a final summary."),
+            PlanStep(id="TransformItem", service="Lambda", description="Transform one validated item.", next="PersistItem", component_type="Transformer"),
+            PlanStep(id="PersistItem", service="Lambda", description="Load one item's transformed data into the target store.", component_type="Exporter"),
+            PlanStep(id="NotifyInvalidItem", service="SNS", description="Publish a failure alert for an invalid item.", component_type="Notifier"),
+            PlanStep(id="Summarize", service="Lambda", description="Combine the outcomes of all items into a final summary.", component_type="Merger"),
         ],
     ),
 )
@@ -257,17 +320,18 @@ register(
         name="choice-branch-approval",
         summary="Submit, decide, take one of two exclusive paths.",
         steps=[
-            PlanStep(id="Submit", service="Lambda", description="Receive the request.", next="Decide"),
+            PlanStep(id="Submit", service="Lambda", description="Receive the request.", next="Decide", component_type="Other"),
             PlanStep(
                 id="Decide", service="None", description="Evaluate the request.",
                 branches=[
                     PlanBranch(condition="approved", next="Proceed"),
                     PlanBranch(condition="rejected", next="Alert"),
                 ],
+                component_type="DecisionGate",
             ),
-            PlanStep(id="Proceed", service="Lambda", description="Carry out the approved action.", next="Success"),
-            PlanStep(id="Success", service="SNS", description="Publish success."),
-            PlanStep(id="Alert", service="SNS", description="Publish failure alert."),
+            PlanStep(id="Proceed", service="Lambda", description="Carry out the approved action.", next="Success", component_type="Other"),
+            PlanStep(id="Success", service="SNS", description="Publish success.", component_type="Notifier"),
+            PlanStep(id="Alert", service="SNS", description="Publish failure alert.", component_type="Notifier"),
         ],
     ),
 )
