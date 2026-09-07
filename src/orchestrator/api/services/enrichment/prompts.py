@@ -53,29 +53,45 @@ ignore them.
     logs, or notifies about a failure (an ops alert, an error email, a
     dead-letter write, a paging call -- identify this from the step's
     own `description`, not from which AWS service it calls) stays a
-    Task per the Succeed/Fail rule below. But if the plan gives it no
-    `next_step`, do NOT close it with `end: true` -- that reports the
-    execution as succeeded. Instead add a minimal `Fail` step after it
-    (same mechanism as the Missing-terminal exception, listed in
-    `added_step_ids`) and route the notification step's `next_step` to
-    it. This applies anywhere the pattern occurs -- top level, inside
-    a Choice branch, inside a Parallel branch, inside a Map iterator --
-    not only at the end of the main chain. Exception: skip this when
-    the step's own outcome is a normal business result rather than a
-    system failure (e.g. "request rejected", "item skipped as out of
-    policy") -- `end: true` is correct there. Judge this from the
-    step's description and the plan's framing of the outcome, never
-    from whether a notification service happens to be involved.
+    Task per the Succeed/Fail rule below. If the plan gives it no
+    `next_step`, close it with `end: true`. Do NOT invent a following
+    `Fail` terminal after the alert by default -- a caught error that
+    is handled by notifying ops is a completed (handled) path, matching
+    standard fan-out / shared-alert ASL where Alert ends the branch.
+    Only add a minimal `Fail` after the notification (via
+    `added_step_ids`) when the plan or description explicitly requires
+    failing/terminating the execution after the alert (e.g. "fail the
+    workflow", "mark the execution failed", "terminate as failed").
+    This applies anywhere the pattern occurs -- top level, inside a
+    Choice branch, inside a Parallel branch, inside a Map iterator.
+    Normal business outcomes that are not system failures (e.g.
+    "request rejected", "item skipped as out of policy") also use
+    `end: true` with no Fail.
+  - *Unrouted success-notification / terminal persist:* a success
+    notify, publish-success, or final persist/save/load step that the
+    plan leaves with no `next_step` is closed with `end: true`. Do not
+    invent an extra Succeed terminal after it unless the plan has no
+    action step at all for that outcome (Missing-terminal exception).
+    When the plan already has both a persist/load step and a success
+    notification, keep both: persist `next_step` -> success notify,
+    success notify `end: true`.
 
 - **Never invent user-specific values** (ARNs, bucket/queue/topic/job/
   function names). Reuse an existing `TODO_SOMETHING` placeholder
   verbatim; if none exists, create `TODO_<WHAT_IS_MISSING>`.
 
-- **Task `resource` field:** use AWS's fixed optimized-integration ARN
-  patterns (not user data) -- e.g. `arn:aws:states:::lambda:invoke`,
-  `...:sns:publish`, `...:sqs:sendMessage`, `...:glue:startJobRun.sync`,
-  `...:aws-sdk:s3:getObject`. If unsure of the exact pattern, use
-  `TODO_UNKNOWN_INTEGRATION_ARN` rather than guessing.
+- **Task `resource` field:** set the correct AWS Step Functions
+  integration ARN for the step's service and action. Prefer optimized
+  integrations when they exist (e.g. `arn:aws:states:::lambda:invoke`,
+  `arn:aws:states:::sns:publish`, `arn:aws:states:::sqs:sendMessage`,
+  `arn:aws:states:::glue:startJobRun.sync`). Otherwise use the AWS SDK
+  integration form `arn:aws:states:::aws-sdk:service:action` (e.g.
+  `arn:aws:states:::aws-sdk:s3:getObject`,
+  `arn:aws:states:::aws-sdk:dynamodb:putItem`). Do NOT invent user-specific
+  resource names/ARNs (buckets, topics, function names) -- those stay as
+  TODO_ placeholders inside `parameters`. Do NOT use a generic
+  `TODO_UNKNOWN_INTEGRATION_ARN` sentinel for `resource`; always pick the
+  real integration ARN pattern for the service.
 
 - **Choose each step's `type`** (Task/Choice/Wait/Parallel/Map/Succeed/
   Fail/Pass):
@@ -183,7 +199,8 @@ Otherwise, output ONLY a single JSON object, no prose, no markdown fences, match
 
 Notes on optional fields in that shape:
 - `result_path` / `result_selector` are allowed on Task, Parallel, Map, Pass (and `result_path` on Wait / on Catch entries). Omit when not needed.
-- Every `type: "Fail"` step MUST include a non-empty `error` string (ASL Error name).
+- Every `type: "Fail"` step MUST include a non-empty `error` string (ASL Error name). Only emit Fail when the plan explicitly requires terminating the execution as failed; ordinary ops-alert / failure-notification Tasks end with `end: true` and no following Fail.
+- Final success-notify and final persist/save steps use `end: true`. When both exist, persist points at success-notify, which ends.
 
 If a previous attempt was rejected, you will be shown the specific validation error below -- fix exactly that issue without changing anything else that was already correct.
 </output_format>

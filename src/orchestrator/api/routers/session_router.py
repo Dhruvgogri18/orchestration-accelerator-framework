@@ -3,6 +3,11 @@
 Routes are intentionally thin -- real logic lives in services/ and
 repositories/. A route's job is: validate the HTTP request, call one
 service function, map domain errors to HTTP, return the response.
+
+Backend selection is controlled by USE_LANGGRAPH in settings / .env:
+  false → pipeline_analysis.session_service (classic path)
+  true  → orchestration.service (LangGraph StateGraph path)
+Both expose the same function and exception names.
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 
+from orchestrator.api.config.settings import get_api_settings
 from orchestrator.api.schemas.session import (
     ApproveRequest,
     ApproveResponse,
@@ -30,7 +36,12 @@ from orchestrator.api.schemas.session import (
 from orchestrator.api.services.deploy.service import DeploymentError, PreDeployCheckError
 from orchestrator.api.services.pipeline_analysis.service import ExtractionError
 from orchestrator.api.services.plan.render import PlanRenderError, find_placeholders
-from orchestrator.api.services.pipeline_analysis import session_service
+
+_settings = get_api_settings()
+if _settings.use_langgraph:
+    from orchestrator.api.services.orchestration import service as session_service
+else:
+    from orchestrator.api.services.pipeline_analysis import session_service
 
 router = APIRouter(prefix="/session", tags=["session"])
 

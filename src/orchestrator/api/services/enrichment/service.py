@@ -90,15 +90,9 @@ from orchestrator.api.services.llm_trace import log_event, llm_stage
 MAX_ENRICHMENT_ATTEMPTS = 4
 MAX_CLARIFICATION_ROUNDS = 3
 
-# If the exact same resource string trips _find_unknown_arns this many
-# times across attempts in one enrichment run, stop asking the model to
-# re-guess it and patch it to the placeholder ourselves. The model is
-# already told to fall back to TODO_UNKNOWN_INTEGRATION_ARN when unsure
-# (see ENRICHMENT_SYSTEM_PROMPT) -- this is a backstop for when it doesn't
-# take that instruction, so one bad guess doesn't burn the whole attempt
-# budget re-guessing the same wrong (or, as with ".sync:2", sometimes
-# actually-correct-but-whitelist-missing) value.
-ARN_FORCE_PLACEHOLDER_AFTER = 2
+# ARN whitelist / TODO_UNKNOWN_INTEGRATION_ARN force-patch removed:
+# resource ARNs are left to the model (optimized integration or aws-sdk
+# form). User-specific names still use TODO_ placeholders in parameters.
 
 # A declared "added" step may only be one of these ASL types -- a
 # minimal terminal, never a real action or new decision point. This is
@@ -643,7 +637,6 @@ def _run_all_checks(plan: Plan, spec: dict) -> str | None:
         _check_merge_validity,
         _check_addition_validity,
         _check_no_unjustified_nesting,
-        _check_arn_whitelist,
     ):
         error = check(plan, spec) if check in checks_needing_plan else check(spec)
         if error:
@@ -661,7 +654,6 @@ def _run_enrichment_loop(
     candidate spec (validate via _run_all_checks, repair on failure).
     """
     last_error = None
-    unknown_arn_seen_counts: dict[str, int] = {}
 
     for _attempt in range(1, MAX_ENRICHMENT_ATTEMPTS + 1):
         raw = chat_completion(messages, temperature=0)
@@ -699,31 +691,6 @@ def _run_enrichment_loop(
                 messages=messages,
                 clarification_rounds=clarification_rounds + 1,
             )
-
-        # Before running the full check suite: if this response repeats an
-        # ARN-whitelist violation on the exact same resource string we've
-        # already rejected ARN_FORCE_PLACEHOLDER_AFTER times, the model is
-        # stuck re-guessing rather than falling back to the placeholder as
-        # instructed. Patch it ourselves rather than spending another
-        # attempt asking again.
-        #
-        # IMPORTANT: the placeholder must be unique PER STEP, not the bare
-        # "TODO_UNKNOWN_INTEGRATION_ARN" constant. If two different steps
-        # both fail to resolve an ARN in the same enrichment run (common --
-        # one bad guess pattern often repeats across several steps), a
-        # shared literal token means apply_overrides_to_json's plain string
-        # substitution later fills EVERY one of those steps' Resource with
-        # whatever single value the user supplied for that one token --
-        # silently pointing multiple different Task states at the same
-        # (wrong) ARN instead of asking for a distinct value per step.
-        for violation in _find_unknown_arns(parsed):
-            resource = violation["resource"]
-            seen = unknown_arn_seen_counts.get(resource, 0) + 1
-            unknown_arn_seen_counts[resource] = seen
-            if seen >= ARN_FORCE_PLACEHOLDER_AFTER:
-                step = _find_step_by_id(parsed, violation["step_id"])
-                if step is not None:
-                    step["resource"] = _unknown_arn_token(violation["step_id"])
 
         error = _run_all_checks(plan, parsed)
         if error is None:

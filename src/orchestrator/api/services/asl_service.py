@@ -691,18 +691,14 @@ def _retry_to_asl(retriers: list[dict] | None) -> list[dict] | None:
 def _catch_to_asl(catchers: list[dict] | None) -> list[dict] | None:
     if not catchers:
         return None
-    out: list[dict] = []
-    for c in catchers:
-        if not c.get("next_step"):
-            continue
-        entry: dict[str, Any] = {
+    return [
+        {
             "ErrorEquals": list(c.get("error_equals") or ["States.ALL"]),
             "Next": c["next_step"],
         }
-        if c.get("result_path") is not None:
-            entry["ResultPath"] = c["result_path"]
-        out.append(entry)
-    return out or None
+        for c in catchers
+        if c.get("next_step")
+    ]
 
 
 def _apply_common_transition(state: dict, step: dict) -> None:
@@ -745,10 +741,6 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             state["Parameters"] = step["parameters"]
         if step.get("timeout_seconds") is not None:
             state["TimeoutSeconds"] = int(step["timeout_seconds"])
-        if step.get("result_selector") is not None:
-            state["ResultSelector"] = step["result_selector"]
-        if step.get("result_path") is not None:
-            state["ResultPath"] = step["result_path"]
         retry = _retry_to_asl(step.get("retry"))
         if retry:
             state["Retry"] = retry
@@ -764,8 +756,6 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             state["Timestamp"] = step["timestamp"]
         else:
             raise AslGenerationError(f"Wait step '{sid}' needs seconds or timestamp")
-        if step.get("result_path") is not None:
-            state["ResultPath"] = step["result_path"]
         _apply_common_transition(state, step)
 
     elif stype == "Choice":
@@ -786,10 +776,6 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
         if not branches:
             raise AslGenerationError(f"Parallel step '{sid}' has no branches")
         state["Branches"] = [_build_branch_asl(b, notes) for b in branches]
-        if step.get("result_selector") is not None:
-            state["ResultSelector"] = step["result_selector"]
-        if step.get("result_path") is not None:
-            state["ResultPath"] = step["result_path"]
         retry = _retry_to_asl(step.get("retry"))
         if retry:
             state["Retry"] = retry
@@ -815,10 +801,6 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             state["ItemBatcher"] = {
                 "MaxItemsPerBatch": items_batcher["max_items_per_batch"]
             }
-        if step.get("result_selector") is not None:
-            state["ResultSelector"] = step["result_selector"]
-        if step.get("result_path") is not None:
-            state["ResultPath"] = step["result_path"]
         retry = _retry_to_asl(step.get("retry"))
         if retry:
             state["Retry"] = retry
@@ -837,10 +819,6 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             state["Cause"] = step["cause"]
 
     elif stype == "Pass":
-        if step.get("result_selector") is not None:
-            state["ResultSelector"] = step["result_selector"]
-        if step.get("result_path") is not None:
-            state["ResultPath"] = step["result_path"]
         _apply_common_transition(state, step)
 
     return state
@@ -2048,6 +2026,18 @@ def render_asl_graph(asl: dict) -> str:
     if start:
         lines.append(f'  __start -> "{_dot_escape(start)}";')
 
+    end_used = False
+
+    def ensure_end_node() -> None:
+        nonlocal end_used
+        if end_used:
+            return
+        end_used = True
+        lines.append(
+            '  __end [label="End", shape=circle, fillcolor="#111827", '
+            'fontcolor="white", width=0.4, height=0.4];'
+        )
+
     drawn_nodes: set[str] = set()
     drawn_edges: set[tuple[str, str, str]] = set()
 
@@ -2097,6 +2087,16 @@ def render_asl_graph(asl: dict) -> str:
 
             if "Next" in state and state["Next"]:
                 edge(name, state["Next"], "solid", "#4B5563")
+
+            # Terminal states always link to the shared End marker —
+            # including inside Map iterators and Parallel branches.
+            # Restricting this to top-level only hid every per-item End
+            # (Persist, Notify, …) and made graphs look like they had no
+            # terminal whenever the only Ends lived under a Map.
+            # Succeed/Fail are terminals by type (no End field required).
+            if state.get("End") is True or stype in ("Succeed", "Fail"):
+                ensure_end_node()
+                edge(name, "__end", "solid", "#4B5563")
 
             if state.get("Default"):
                 edge(name, state["Default"], "dashed", "#B45309", "default")

@@ -230,6 +230,52 @@ class FlowStructure(BaseModel):
 # ---------------------------------------------------------------------------
 # Sub-stage 4: Parameter extraction (paper Section 5.1, Appendix C.4)
 # ---------------------------------------------------------------------------
+# Optional merged sub-stage 2+3: components + flow in one LLM call
+# (latency optimization — see MERGE_COMPONENT_AND_FLOW)
+# ---------------------------------------------------------------------------
+
+
+class CombinedComponentsAndFlow(BaseModel):
+    """Single-call alternative to ComponentIdentificationResult then
+    FlowStructure. Same ready/needs_clarification gate as component
+    identification; when ready, both components and flow are required.
+    """
+
+    status: Literal["ready", "needs_clarification"]
+    components: list[ComponentDefinition] | None = Field(default=None, validate_default=True)
+    clarifying_question: str | None = Field(default=None, validate_default=True)
+    # Populated only when status == "ready"
+    pipeline_name: str | None = None
+    pipeline_summary: str | None = None
+    entry_points: list[str] | None = None
+    parallel_sections: list[list[str]] | None = None
+    steps: list[FlowStep] | None = None
+
+    @field_validator("components")
+    @classmethod
+    def components_required_when_ready(cls, v, info):
+        if info.data.get("status") == "ready" and not v:
+            raise ValueError("components is required when status is 'ready'")
+        return v
+
+    @field_validator("clarifying_question")
+    @classmethod
+    def question_required_when_clarifying(cls, v, info):
+        if info.data.get("status") == "needs_clarification" and not v:
+            raise ValueError(
+                "clarifying_question is required when status is 'needs_clarification'"
+            )
+        return v
+
+    @field_validator("steps")
+    @classmethod
+    def steps_required_when_ready(cls, v, info):
+        if info.data.get("status") == "ready" and not v:
+            raise ValueError("steps is required when status is 'ready'")
+        return v
+
+
+# ---------------------------------------------------------------------------
 
 ParameterScope = Literal["global", "component", "environment"]
 ParameterDataType = Literal["string", "number", "boolean", "list", "object"]

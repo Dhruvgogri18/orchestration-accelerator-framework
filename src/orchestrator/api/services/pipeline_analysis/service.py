@@ -54,6 +54,7 @@ from pydantic import BaseModel, ValidationError
 from orchestrator.api.schemas.common import ExtractionResult, Plan, PlanBranch, PlanStep, ScopeResult
 from orchestrator.api.schemas.pipeline_analysis import (
     ActionClauseResult,
+    CombinedComponentsAndFlow,
     ComponentDefinition,
     ComponentIdentificationResult,
     EnvironmentInference,
@@ -66,6 +67,7 @@ from orchestrator.indexing.gateway_client import chat_completion
 from orchestrator.api.services.llm_trace import llm_stage
 from orchestrator.api.services.pipeline_analysis.prompts import (
     ACTION_CLAUSE_SYSTEM_PROMPT,
+    COMBINED_COMPONENT_AND_FLOW_SYSTEM_PROMPT,
     COMPONENT_IDENTIFICATION_SYSTEM_PROMPT,
     ENVIRONMENT_INFERENCE_SYSTEM_PROMPT,
     FLOW_STRUCTURE_SYSTEM_PROMPT,
@@ -113,6 +115,79 @@ _reasoning_effort_supported = True
 LOW_EFFORT_KWARGS = {"reasoning_effort": "low"}
 
 
+def _pipeline_settings():
+    """Lazy import so unit tests can load this module without settings/.env."""
+    try:
+        from orchestrator.api.config.settings import get_api_settings
+        return get_api_settings()
+    except Exception:  # pragma: no cover
+        return None
+
+
+def _fast_model_kwargs() -> dict:
+    """Model override for narrow classification stages (scope/env/clauses)."""
+    settings = _pipeline_settings()
+    if settings is None:
+        return {}
+    model = getattr(settings, "gateway_fast_chat_model", None) or None
+    if model and str(model).strip():
+        return {"model": str(model).strip()}
+    return {}
+
+
+def _default_model_kwargs() -> dict:
+    settings = _pipeline_settings()
+    if settings is None:
+        return {}
+    model = getattr(settings, "gateway_chat_model", None) or None
+    if model and str(model).strip():
+        return {"model": str(model).strip()}
+    return {}
+
+
+def _prompt_cache_enabled() -> bool:
+    settings = _pipeline_settings()
+    if settings is None:
+        return True
+    return bool(getattr(settings, "use_prompt_cache", True))
+
+
+def _merge_component_and_flow_enabled() -> bool:
+    settings = _pipeline_settings()
+    if settings is None:
+        return True
+    return bool(getattr(settings, "merge_component_and_flow", True))
+
+
+def _system_message(content: str) -> dict:
+    """Build a system message, optionally marked for provider prompt caching.
+
+    When USE_PROMPT_CACHE is on, emit Anthropic-style content blocks with
+    cache_control. OpenAI-compatible gateways that do not understand the
+    shape still receive the same text; providers that support prefix
+    caching benefit when the system prompt is a stable first prefix.
+    """
+    if not _prompt_cache_enabled():
+        return {"role": "system", "content": content}
+    return {
+        "role": "system",
+        "content": [
+            {
+                "type": "text",
+                "text": content,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+    }
+
+
+def _last_user_text(history: list[dict]) -> str:
+    for msg in reversed(history or []):
+        if msg.get("role") == "user" and (msg.get("content") or "").strip():
+            return msg["content"]
+    return ""
+
+
 def _chat_completion_structured(
     messages: list[dict], model_cls: type[BaseModel], **extra_kwargs
 ) -> str:
@@ -123,6 +198,9 @@ def _chat_completion_structured(
 
     def _call(**call_kwargs):
         global _structured_output_supported
+        # Prefer explicit model from caller; else default GATEWAY_CHAT_MODEL.
+        if "model" not in call_kwargs:
+            call_kwargs = {**_default_model_kwargs(), **call_kwargs}
         if _structured_output_supported:
             try:
                 return chat_completion(
@@ -238,8 +316,10 @@ def classify_scope(history: list[dict]) -> ScopeResult:
     prefiltered = _prefilter_scope(history)
     if prefiltered is not None:
         return prefiltered
-    messages = [{"role": "system", "content": SCOPE_SYSTEM_PROMPT}, *history]
-    return _call_llm_json_with_repair(messages, ScopeResult, **LOW_EFFORT_KWARGS)
+    messages = [_system_message(SCOPE_SYSTEM_PROMPT), *history]
+    return _call_llm_json_with_repair(
+        messages, ScopeResult, **LOW_EFFORT_KWARGS, **_fast_model_kwargs()
+    )
 
 # ---------------------------------------------------------------------------
 # Sub-stage 1: Environment inference
@@ -247,8 +327,10 @@ def classify_scope(history: list[dict]) -> ScopeResult:
 
 
 def infer_environment(history: list[dict]) -> EnvironmentInference:
-    messages = [{"role": "system", "content": ENVIRONMENT_INFERENCE_SYSTEM_PROMPT}, *history]
-    return _call_llm_json_with_repair(messages, EnvironmentInference, **LOW_EFFORT_KWARGS)
+    messages = [_system_message(ENVIRONMENT_INFERENCE_SYSTEM_PROMPT), *history]
+    return _call_llm_json_with_repair(
+        messages, EnvironmentInference, **LOW_EFFORT_KWARGS, **_fast_model_kwargs()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -265,8 +347,10 @@ def infer_environment(history: list[dict]) -> EnvironmentInference:
 
 
 def enumerate_action_clauses(history: list[dict]) -> ActionClauseResult:
-    messages = [{"role": "system", "content": ACTION_CLAUSE_SYSTEM_PROMPT}, *history]
-    return _call_llm_json_with_repair(messages, ActionClauseResult, **LOW_EFFORT_KWARGS)
+    messages = [_system_message(ACTION_CLAUSE_SYSTEM_PROMPT), *history]
+    return _call_llm_json_with_repair(
+        messages, ActionClauseResult, **LOW_EFFORT_KWARGS, **_fast_model_kwargs()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +416,7 @@ def identify_components(
         else []
     )
     messages = [
-        {"role": "system", "content": COMPONENT_IDENTIFICATION_SYSTEM_PROMPT},
+        _system_message(COMPONENT_IDENTIFICATION_SYSTEM_PROMPT),
         *history,
         *clause_context,
     ]
@@ -486,7 +570,7 @@ def analyze_flow_structure(
 ) -> FlowStructure:
     components_json = json.dumps([c.model_dump() for c in components])
     messages = [
-        {"role": "system", "content": FLOW_STRUCTURE_SYSTEM_PROMPT},
+        _system_message(FLOW_STRUCTURE_SYSTEM_PROMPT),
         *history,
         {"role": "user", "content": f"Components to wire:\n{components_json}"},
     ]
@@ -618,6 +702,123 @@ def _run_concurrently(**calls):
 # ---------------------------------------------------------------------------
 
 
+
+_ASL_STEP_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,79}$")
+
+
+def _sanitize_step_id(raw: str) -> str:
+    """Make a step id legal for workflow_spec / ASL state names.
+
+    AWS Step Functions state names (and workflow_spec.schema.json step
+    ids) must match ^[A-Za-z0-9_]{1,80}$. Hyphens from kebab-case LLM
+    ids break enrichment (schema rejects them; renaming them fails the
+    fidelity check against the plan). Convert hyphens/spaces to
+    underscores and strip other illegal characters.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "Step"
+    # Replace common separators with underscore
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch == "_":
+            out.append(ch)
+        elif ch in "- \t.":
+            out.append("_")
+        # drop everything else
+    cleaned = "".join(out)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    if not cleaned:
+        cleaned = "Step"
+    # Must start with a letter for readability / some validators
+    if not cleaned[0].isalpha():
+        cleaned = "S_" + cleaned
+    return cleaned[:80]
+
+
+def _rewrite_id_refs(value: str | None, mapping: dict[str, str]) -> str | None:
+    if value is None:
+        return None
+    return mapping.get(value, value)
+
+
+def _sanitize_components_and_flow(
+    components: list[ComponentDefinition],
+    flow: FlowStructure,
+) -> tuple[list[ComponentDefinition], FlowStructure]:
+    """Rewrite component/flow ids to ASL-safe form and update all refs."""
+    # Build mapping from original ids (components first, then any flow-only)
+    mapping: dict[str, str] = {}
+    used: set[str] = set()
+
+    def allocate(original: str) -> str:
+        if original in mapping:
+            return mapping[original]
+        base = _sanitize_step_id(original)
+        candidate = base
+        n = 2
+        while candidate in used:
+            suffix = f"_{n}"
+            candidate = (base[: 80 - len(suffix)] + suffix) if len(base) + len(suffix) > 80 else base + suffix
+            n += 1
+        mapping[original] = candidate
+        used.add(candidate)
+        return candidate
+
+    for c in components:
+        allocate(c.id)
+    for s in flow.steps:
+        allocate(s.id)
+    for ep in flow.entry_points or []:
+        allocate(ep)
+    for section in flow.parallel_sections or []:
+        for sid in section:
+            allocate(sid)
+
+    new_components = [
+        ComponentDefinition(
+            id=mapping[c.id],
+            service=c.service,
+            description=c.description,
+            component_type=c.component_type,
+        )
+        for c in components
+    ]
+
+    new_steps = []
+    for s in flow.steps:
+        new_steps.append(
+            type(s)(
+                id=mapping[s.id],
+                service=s.service,
+                description=s.description,
+                component_type=s.component_type,
+                next=_rewrite_id_refs(s.next, mapping),
+                on_failure=[mapping.get(x, x) for x in (s.on_failure or [])],
+                on_timeout=[mapping.get(x, x) for x in (s.on_timeout or [])],
+                branches=[
+                    type(b)(
+                        condition=b.condition,
+                        next=mapping.get(b.next, b.next),
+                    )
+                    for b in (s.branches or [])
+                ],
+            )
+        )
+
+    new_flow = FlowStructure(
+        pipeline_name=flow.pipeline_name,
+        pipeline_summary=flow.pipeline_summary,
+        entry_points=[mapping.get(x, x) for x in (flow.entry_points or [])],
+        parallel_sections=[
+            [mapping.get(x, x) for x in section]
+            for section in (flow.parallel_sections or [])
+        ],
+        steps=new_steps,
+    )
+    return new_components, new_flow
+
+
 def _flow_to_plan(flow: FlowStructure) -> Plan:
     """Derive the legacy Plan shape (the contract plan.render,
     plan.canonicalize, plan.matching, and enrichment.service all rely
@@ -643,6 +844,128 @@ def _flow_to_plan(flow: FlowStructure) -> Plan:
         for s in flow.steps
     ]
     return Plan(name=flow.pipeline_name, summary=flow.pipeline_summary, steps=steps)
+
+
+
+def identify_components_and_flow(
+    history: list[dict],
+    action_clauses: list[str] | None = None,
+    max_attempts: int = MAX_STAGE_ATTEMPTS,
+) -> tuple[ComponentIdentificationResult, FlowStructure | None]:
+    """Merged sub-stages 2+3: one LLM call for components and flow.
+
+    Returns (ComponentIdentificationResult, FlowStructure|None).
+    FlowStructure is None when status is needs_clarification.
+    """
+    clause_context = (
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Action clauses identified from this request (an "
+                    "earlier, independent enumeration pass -- your "
+                    "components list must account for every one of "
+                    "them; see the COMPLETENESS RULE):\n"
+                    + json.dumps(action_clauses)
+                ),
+            }
+        ]
+        if action_clauses
+        else []
+    )
+    messages = [
+        _system_message(COMBINED_COMPONENT_AND_FLOW_SYSTEM_PROMPT),
+        *history,
+        *clause_context,
+    ]
+    last_error: str | None = None
+
+    for _attempt in range(1, max_attempts + 1):
+        raw = _chat_completion_structured(messages, CombinedComponentsAndFlow)
+        cleaned = _strip_code_fences(raw)
+
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            last_error = f"Response was not valid JSON: {exc}"
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"Error: {last_error}. Please fix and resend the full JSON.",
+                }
+            )
+            continue
+
+        try:
+            result = CombinedComponentsAndFlow.model_validate(parsed)
+        except ValidationError as exc:
+            last_error = f"JSON did not match expected shape: {exc}"
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"Error: {last_error}. Please fix and resend the full JSON.",
+                }
+            )
+            continue
+
+        if result.status == "needs_clarification":
+            return (
+                ComponentIdentificationResult(
+                    status="needs_clarification",
+                    clarifying_question=result.clarifying_question,
+                ),
+                None,
+            )
+
+        completeness_error = _check_component_completeness(
+            action_clauses or [], result.components or []
+        )
+        if completeness_error is not None:
+            last_error = completeness_error
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": f"Error: {last_error}"})
+            continue
+
+        # Map into the two legacy shapes downstream still expects.
+        comp_result = ComponentIdentificationResult(
+            status="ready",
+            components=result.components,
+        )
+        flow = FlowStructure(
+            pipeline_name=result.pipeline_name or "workflow",
+            pipeline_summary=result.pipeline_summary or "",
+            entry_points=result.entry_points or [],
+            parallel_sections=result.parallel_sections or [],
+            steps=result.steps or [],
+        )
+        # Reuse existing flow validators when present.
+        preserved = _check_components_preserved(result.components or [], flow)
+        if preserved is not None:
+            last_error = preserved
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": f"Error: {last_error}"})
+            continue
+        decision_err = _check_decision_gates_wired(flow)
+        if decision_err is not None:
+            last_error = decision_err
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": f"Error: {last_error}"})
+            continue
+        connected_err = _check_flow_connected(flow)
+        if connected_err is not None:
+            last_error = connected_err
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": f"Error: {last_error}"})
+            continue
+
+        return comp_result, flow
+
+    raise ExtractionError(
+        f"Combined component+flow stage failed after {max_attempts} attempts. "
+        f"Last error: {last_error}"
+    )
 
 
 def analyze_pipeline(history: list[dict]) -> ExtractionResult:
@@ -674,17 +997,34 @@ def analyze_pipeline(history: list[dict]) -> ExtractionResult:
     environment = parallel["environment"]
     action_clauses = parallel["action_clauses"]
 
-    with llm_stage("component_identification"):
-        components_result = identify_components(history, action_clauses=action_clauses)
-    if components_result.status == "needs_clarification":
-        return ExtractionResult(
-            status="needs_clarification",
-            clarifying_question=components_result.clarifying_question,
-        )
-    components = components_result.components or []
+    if _merge_component_and_flow_enabled():
+        with llm_stage("component_and_flow"):
+            components_result, flow = identify_components_and_flow(
+                history, action_clauses=action_clauses
+            )
+        if components_result.status == "needs_clarification":
+            return ExtractionResult(
+                status="needs_clarification",
+                clarifying_question=components_result.clarifying_question,
+            )
+        components = components_result.components or []
+        assert flow is not None
+    else:
+        with llm_stage("component_identification"):
+            components_result = identify_components(history, action_clauses=action_clauses)
+        if components_result.status == "needs_clarification":
+            return ExtractionResult(
+                status="needs_clarification",
+                clarifying_question=components_result.clarifying_question,
+            )
+        components = components_result.components or []
 
-    with llm_stage("flow_structure_analysis"):
-        flow = analyze_flow_structure(history, components)
+        with llm_stage("flow_structure_analysis"):
+            flow = analyze_flow_structure(history, components)
+
+    # ASL / workflow_spec step ids cannot contain hyphens. Normalize here
+    # so enrichment never hits the schema-vs-fidelity conflict.
+    components, flow = _sanitize_components_and_flow(components, flow)
 
     # Sub-stages 4 (parameters) and 5 (integrations) both only read
     # (components, flow) from stage 3 -- neither reads the other's

@@ -59,6 +59,39 @@ class APISettings(BaseSettings):
         validation_alias="AWS_DEPLOY_NAME_PREFIX",
     )
 
+    # --- Orchestration backend ---
+    # USE_LANGGRAPH=true  → session routes use api.services.orchestration
+    #                       (StateGraph for analysis / approve / enrichment)
+    # USE_LANGGRAPH=false → classic pipeline_analysis.session_service path
+    # Default false so production stays on the proven path until explicitly enabled.
+    use_langgraph: bool = Field(
+        default=False,
+        validation_alias="USE_LANGGRAPH",
+    )
+
+    # Primary chat model (also set via GATEWAY_CHAT_MODEL in gateway_client).
+    gateway_chat_model: str | None = Field(
+        default=None,
+        validation_alias="GATEWAY_CHAT_MODEL",
+    )
+    # Faster/cheaper model for narrow classification stages (scope,
+    # environment, action_clauses). Falls back to gateway_chat_model / gateway default.
+    gateway_fast_chat_model: str | None = Field(
+        default=None,
+        validation_alias="GATEWAY_FAST_CHAT_MODEL",
+    )
+    # Mark long system prompts for provider prompt-caching when supported.
+    use_prompt_cache: bool = Field(
+        default=True,
+        validation_alias="USE_PROMPT_CACHE",
+    )
+    # Merge component_identification + flow_structure into one LLM call.
+    # Saves one sequential round-trip; disable if quality regresses.
+    merge_component_and_flow: bool = Field(
+        default=True,
+        validation_alias="MERGE_COMPONENT_AND_FLOW",
+    )
+
 
 @lru_cache
 def get_api_settings() -> APISettings:

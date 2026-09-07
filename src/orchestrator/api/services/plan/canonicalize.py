@@ -652,7 +652,7 @@ def _rebuild_validate_parallel_quality_load(plan: Plan) -> Plan | None:
             description=(
                 failure.description
                 if failure
-                else "Publish an operations failure alert and stop the workflow."
+                else "Publish an operations failure alert."
             ),
             next=None,
             on_failure=[],
