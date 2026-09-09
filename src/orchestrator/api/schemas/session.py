@@ -62,6 +62,12 @@ class ApproveResponse(BaseModel):
     # workflow_spec parameters / integrations / components so the UI
     # can label inputs beyond the bare TODO_ name.
     placeholder_details: dict[str, str] = Field(default_factory=dict)
+    # Tokens from `overrides` that were REJECTED for having the wrong
+    # shape (e.g. a bare bucket name where a full ARN is required, or
+    # vice versa) and so were NOT applied -- they stay listed in
+    # spec_placeholders as still-unresolved. token → user-facing reason.
+    # See asl_service.validate_placeholder_value.
+    placeholder_errors: dict[str, str] = Field(default_factory=dict)
     # Stage 4 — populated only when workflow_spec is complete and
     # spec_placeholders is empty.
     asl: dict | None = None

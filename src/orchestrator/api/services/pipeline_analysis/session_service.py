@@ -29,9 +29,12 @@ from orchestrator.api.schemas.session import (
 from orchestrator.api.services.asl_service import (
     AslGenerationError,
     build_asl_from_spec,
+    classify_placeholder_kind,
+    describe_placeholders,
     find_asl_placeholders,
     render_asl_graph,
     validate_asl,
+    validate_placeholder_value,
 )
 from orchestrator.api.services.deploy.service import (
     deploy_state_machine,
@@ -397,6 +400,14 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
     finally:
         end_request(status="approved")
 
+    # Human-readable "what to fill in" text for each spec_placeholders
+    # token, derived from the workflow_spec's own parameters/
+    # integrations/components metadata (falls back to plan text, then
+    # a humanized token name -- see describe_placeholders docstring).
+    placeholder_details = describe_placeholders(
+        workflow_spec, spec_placeholders, plan=resolved_plan.model_dump()
+    )
+
     locked = {
         "resolved_plan": resolved_plan.model_dump(),
         "remaining_placeholders": remaining,
@@ -404,6 +415,7 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
         "enrichment_error": enrichment_error,
         "enrichment_question": enrichment_question,
         "spec_placeholders": spec_placeholders,
+        "placeholder_details": placeholder_details,
         "asl": asl,
         "asl_graph_dot": asl_graph_dot,
         "asl_validations": asl_validations,
@@ -424,6 +436,7 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
         enrichment_error=enrichment_error,
         enrichment_question=enrichment_question,
         spec_placeholders=spec_placeholders,
+        placeholder_details=placeholder_details,
         asl=asl,
         asl_graph_dot=asl_graph_dot,
         asl_validations=asl_validations,
@@ -469,10 +482,15 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
     finally:
         end_request(status="approved")
 
+    placeholder_details = describe_placeholders(
+        workflow_spec, spec_placeholders, plan=plan.model_dump()
+    )
+
     locked["workflow_spec"] = workflow_spec
     locked["enrichment_error"] = enrichment_error
     locked["enrichment_question"] = enrichment_question
     locked["spec_placeholders"] = spec_placeholders
+    locked["placeholder_details"] = placeholder_details
     locked["asl"] = asl
     locked["asl_graph_dot"] = asl_graph_dot
     locked["asl_validations"] = asl_validations
@@ -494,6 +512,7 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
         enrichment_error=enrichment_error,
         enrichment_question=enrichment_question,
         spec_placeholders=spec_placeholders,
+        placeholder_details=placeholder_details,
         asl=asl,
         asl_graph_dot=asl_graph_dot,
         asl_validations=asl_validations,
@@ -530,7 +549,27 @@ def fill_spec_placeholders(session_id: str, overrides: dict[str, str]) -> Approv
             "Use POST /session/{id}/asl/generate to force a regeneration."
         )
 
-    updated_spec = apply_overrides_to_json(workflow_spec, overrides)
+    resolved_plan = Plan.model_validate(locked["resolved_plan"])
+    plan_dict = resolved_plan.model_dump()
+
+    # Reject overrides of the wrong shape (a bare name where an ARN is
+    # required, an ARN/URI where a bare name is required, etc.) instead
+    # of writing them into the spec -- a malformed value would either
+    # fail deploy pre-checks opaquely later or, worse, silently produce
+    # a working-looking but wrong ARN/name. Anything rejected here is
+    # simply left out of what we apply, so find_asl_placeholders() will
+    # still report its token as unresolved afterwards.
+    placeholder_errors: dict[str, str] = {}
+    valid_overrides: dict[str, str] = {}
+    for token, value in overrides.items():
+        kind = classify_placeholder_kind(workflow_spec, token, plan=plan_dict)
+        error = validate_placeholder_value(kind, value)
+        if error:
+            placeholder_errors[token] = error
+        else:
+            valid_overrides[token] = value
+
+    updated_spec = apply_overrides_to_json(workflow_spec, valid_overrides)
 
     asl: dict | None = None
     asl_graph_dot: str | None = None
@@ -544,15 +583,20 @@ def fill_spec_placeholders(session_id: str, overrides: dict[str, str]) -> Approv
     finally:
         end_request(status="approved")
 
+    placeholder_details = describe_placeholders(
+        updated_spec, spec_placeholders, plan=plan_dict
+    )
+
     locked["workflow_spec"] = updated_spec
     locked["spec_placeholders"] = spec_placeholders
+    locked["placeholder_details"] = placeholder_details
+    locked["placeholder_errors"] = placeholder_errors
     locked["asl"] = asl
     locked["asl_graph_dot"] = asl_graph_dot
     locked["asl_validations"] = asl_validations
     locked["asl_error"] = asl_error
     session_store.set_locked_spec(session_id, locked)
 
-    resolved_plan = Plan.model_validate(locked["resolved_plan"])
     return ApproveResponse(
         status="approved",
         resolved_plan=resolved_plan,
@@ -561,6 +605,8 @@ def fill_spec_placeholders(session_id: str, overrides: dict[str, str]) -> Approv
         enrichment_error=locked.get("enrichment_error"),
         enrichment_question=locked.get("enrichment_question"),
         spec_placeholders=spec_placeholders,
+        placeholder_details=placeholder_details,
+        placeholder_errors=placeholder_errors,
         asl=asl,
         asl_graph_dot=asl_graph_dot,
         asl_validations=asl_validations,

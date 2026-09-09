@@ -128,6 +128,12 @@ def _request(method: str, path: str, payload: dict | None = None) -> dict:
     return data if isinstance(data, dict) else {"data": data}
 
 
+def _str_dict(raw) -> dict[str, str]:
+    """Normalize an API-returned token->text mapping to str:str, tolerating
+    a missing/malformed field instead of raising."""
+    return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+
 def _empty_artifact(session_id: str = "", stage: str = "failed", text: str = "") -> dict:
     return {
         "session_id": session_id,
@@ -154,6 +160,7 @@ def _empty_artifact(session_id: str = "", stage: str = "failed", text: str = "")
         "remaining_placeholders": [],
         "spec_placeholders": [],
         "placeholder_details": {},
+        "placeholder_errors": {},
         "api_raw": None,
     }
 
@@ -209,12 +216,8 @@ def _normalize_message_response(session_id: str, data: dict) -> dict:
             art["placeholders"] = remaining
             art["remaining_placeholders"] = remaining
             art["spec_placeholders"] = list(data.get("spec_placeholders") or [])
-            details_raw = data.get("placeholder_details") or {}
-            art["placeholder_details"] = (
-                {str(k): str(v) for k, v in details_raw.items()}
-                if isinstance(details_raw, dict)
-                else {}
-            )
+            art["placeholder_details"] = _str_dict(data.get("placeholder_details"))
+            art["placeholder_errors"] = _str_dict(data.get("placeholder_errors"))
             art["asl"] = asl
             art["asl_json"] = asl
             art["graph_dot"] = data.get("asl_graph_dot") or data.get("diagram_dot")
@@ -264,12 +267,14 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
     spec_ph = list(data.get("spec_placeholders") or [])
     art["spec_placeholders"] = spec_ph
     # token → short description for the fill form labels
-    details_raw = data.get("placeholder_details") or {}
-    art["placeholder_details"] = (
-        {str(k): str(v) for k, v in details_raw.items()}
-        if isinstance(details_raw, dict)
-        else {}
-    )
+    art["placeholder_details"] = _str_dict(data.get("placeholder_details"))
+    # token → why the last-submitted value for it was rejected (wrong
+    # shape — e.g. an ARN pasted where a bare name was required, or
+    # vice versa). Populated only right after a fill-placeholders call
+    # that rejected one or more values; see asl_service.validate_placeholder_value
+    # on the API side. Must be carried through here or the UI has no way
+    # to know a value was silently rejected rather than just still empty.
+    art["placeholder_errors"] = _str_dict(data.get("placeholder_errors"))
     art["enrichment_error"] = data.get("enrichment_error")
     art["enrichment_question"] = data.get("enrichment_question")
     parts = [
@@ -288,12 +293,14 @@ def _normalize_approve_response(session_id: str, data: dict) -> dict:
             "before ASL can be generated:"
         )
         ph_details = art["placeholder_details"]
+        ph_errors = art["placeholder_errors"]
         for p in spec_ph:
             desc = (ph_details.get(p) or "").strip()
-            if desc:
-                parts.append(f"- `{p}` — {desc}")
-            else:
-                parts.append(f"- `{p}`")
+            err = (ph_errors.get(p) or "").strip()
+            line = f"- `{p}` — {desc}" if desc else f"- `{p}`"
+            if err:
+                line += f" ⚠️ **Rejected:** {err}"
+            parts.append(line)
     if data.get("enrichment_question"):
         parts.append("")
         parts.append(

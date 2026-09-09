@@ -2754,6 +2754,19 @@ def render_spec_approved(message_id, artifact, chat_id):
             ph_details = artifact.get("placeholder_details") or {}
             if not isinstance(ph_details, dict):
                 ph_details = {}
+            # token → reason the last-submitted value was rejected (wrong
+            # shape: a bare name where an ARN is required, an ARN/URI
+            # where a bare name is required, etc.). Set on the response
+            # after a failed "Apply" — see fill_spec_placeholders.
+            ph_errors = artifact.get("placeholder_errors") or {}
+            if not isinstance(ph_errors, dict):
+                ph_errors = {}
+            if ph_errors:
+                st.error(
+                    f"{len(ph_errors)} value(s) were the wrong format and "
+                    "were not applied — fix them below.",
+                    icon="⚠️",
+                )
 
             def _fallback_desc(tok: str) -> str:
                 raw = tok[5:] if tok.upper().startswith("TODO_") else tok
@@ -2807,6 +2820,8 @@ def render_spec_approved(message_id, artifact, chat_id):
                     disabled=not controls_enabled,
                     label_visibility="collapsed",
                 )
+                if token in ph_errors:
+                    st.error(ph_errors[token], icon="⚠️")
                 st.markdown("")  # spacing between fields
             filled = {
                 k: v.strip() for k, v in ph_overrides.items() if v and v.strip()

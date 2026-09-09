@@ -121,35 +121,201 @@ def _humanize_todo_token(token: str) -> str:
 
 
 # Known AWS integrations we can recognize from resource/description text,
-# used to give ARN-style placeholders a concrete label + example instead
-# of a generic "AWS resource ARN". Checked in order, so this list stays
-# short and specific rather than trying to be exhaustive.
-_SERVICE_ARN_HINTS: list[tuple[str, str, str]] = [
-    ("lambda", "Lambda function", "arn:aws:lambda:us-east-1:123456789012:function:MyFunction"),
-    ("dynamodb", "DynamoDB table", "arn:aws:dynamodb:us-east-1:123456789012:table/MyTable"),
-    ("sns", "SNS topic", "arn:aws:sns:us-east-1:123456789012:MyTopic"),
-    ("sqs", "SQS queue", "arn:aws:sqs:us-east-1:123456789012:MyQueue"),
-    ("s3", "S3 bucket", "arn:aws:s3:::my-bucket"),
-    ("ecs", "ECS task definition", "arn:aws:ecs:us-east-1:123456789012:task-definition/MyTask"),
-    ("ses", "SES identity", "arn:aws:ses:us-east-1:123456789012:identity/example.com"),
-    ("glue", "Glue job", "arn:aws:glue:us-east-1:123456789012:job/MyJob"),
-    ("states", "Step Functions state machine", "arn:aws:states:us-east-1:123456789012:stateMachine:MyStateMachine"),
-    ("kms", "KMS key", "arn:aws:kms:us-east-1:123456789012:key/abcd1234-a123-4567-b890-1234567890ab"),
-    ("rds", "RDS database instance", "arn:aws:rds:us-east-1:123456789012:db:my-database"),
+# used to give placeholders a concrete label + example instead of a
+# generic "AWS resource ARN". Checked in order, so this list stays short
+# and specific rather than trying to be exhaustive. Each entry carries
+# BOTH an ARN-shaped example and a bare-name-shaped example, since the
+# same integration (e.g. S3) can need either depending on which field
+# the placeholder actually fills -- a Task Resource is always an ARN,
+# but an S3 GetObject "Bucket" parameter wants the bare bucket name, and
+# handing out the wrong shape as an "e.g." is exactly what leads users
+# to paste an ARN (or an s3:// URI) where a plain name belongs, or vice
+# versa. See classify_placeholder_kind() / validate_placeholder_value().
+_SERVICE_ARN_HINTS: list[tuple[str, str, str, str]] = [
+    ("lambda", "Lambda function", "arn:aws:lambda:us-east-1:123456789012:function:MyFunction", "MyFunction"),
+    ("dynamodb", "DynamoDB table", "arn:aws:dynamodb:us-east-1:123456789012:table/MyTable", "MyTable"),
+    ("sns", "SNS topic", "arn:aws:sns:us-east-1:123456789012:MyTopic", "MyTopic"),
+    ("sqs", "SQS queue", "arn:aws:sqs:us-east-1:123456789012:MyQueue", "MyQueue"),
+    ("s3", "S3 bucket", "arn:aws:s3:::my-bucket", "my-bucket"),
+    ("ecs", "ECS task definition", "arn:aws:ecs:us-east-1:123456789012:task-definition/MyTask", "MyTask"),
+    ("ses", "SES identity", "arn:aws:ses:us-east-1:123456789012:identity/example.com", "example.com"),
+    ("glue", "Glue job", "arn:aws:glue:us-east-1:123456789012:job/MyJob", "MyJob"),
+    ("states", "Step Functions state machine", "arn:aws:states:us-east-1:123456789012:stateMachine:MyStateMachine", "MyStateMachine"),
+    ("kms", "KMS key", "arn:aws:kms:us-east-1:123456789012:key/abcd1234-a123-4567-b890-1234567890ab", "abcd1234-a123-4567-b890-1234567890ab"),
+    ("rds", "RDS database instance", "arn:aws:rds:us-east-1:123456789012:db:my-database", "my-database"),
 ]
 
 
-def _detect_service_hint(*texts: str) -> tuple[str, str] | None:
-    """Best-effort (label, example ARN) guess from non-placeholder text.
+def _detect_service_hint(*texts: str) -> tuple[str, str, str] | None:
+    """Best-effort (label, example ARN, example bare name) guess from
+    non-placeholder text.
 
     Strips TODO_ tokens out of the combined text first -- a bare
     placeholder can't tell us what AWS service it belongs to, and
     without this a token could "match" against its own name.
     """
     blob = _PLACEHOLDER_PATTERN.sub("", " ".join(t for t in texts if t)).lower()
-    for keyword, label, example in _SERVICE_ARN_HINTS:
+    for keyword, label, arn_example, name_example in _SERVICE_ARN_HINTS:
         if keyword in blob:
-            return label, example
+            return label, arn_example, name_example
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Placeholder value "shape" -- is this token supposed to be filled with a
+# full ARN, a bare resource name, a URL/endpoint, or is there no strong
+# signal either way? Used both to word descriptions correctly
+# (describe_placeholders) and to reject a value of the wrong shape
+# (validate_placeholder_value) -- e.g. an S3 bucket-name field filled
+# with an s3:// URI or a full ARN, or an ARN field filled with a bare
+# name.
+# ---------------------------------------------------------------------------
+
+PlaceholderKind = str  # "arn" | "name" | "url" | "generic"
+
+# General AWS ARN shape: arn:partition:service:region:account-id:resource.
+# Region and account-id are legitimately empty for some services (e.g.
+# S3 bucket ARNs: "arn:aws:s3:::my-bucket"), so those two segments are
+# optional -- but all six colon-separated fields, and the "arn:" prefix
+# plus a real partition/service, must be present.
+_ARN_STRUCTURE_RE = re.compile(
+    r"^arn:(aws|aws-cn|aws-us-gov):[a-zA-Z0-9\-]+:[a-z0-9\-]*:(\d{12})?:.+$"
+)
+_S3_URI_RE = re.compile(r"^s3://", re.IGNORECASE)
+# Parameter/field-name suffixes that tell us what shape of value AWS
+# expects at that spot, independent of which specific service it is.
+_ARN_FIELD_SUFFIX_RE = re.compile(r"arn$", re.IGNORECASE)
+_URL_FIELD_SUFFIX_RE = re.compile(r"(url|uri|endpoint)$", re.IGNORECASE)
+# Deliberately narrow to fields that name a top-level AWS resource
+# (bucket/table/queue/topic/function/job/cluster/role, or anything
+# ending "...Name"). Fields like "Key"/"Prefix"/"Path"/"Value" are
+# intentionally excluded -- an S3 object key, a DynamoDB item value, a
+# JSON path, etc. legitimately contain "/" or ":" and must NOT be
+# forced through the bare-name ("no slash, no colon") check below, or
+# a perfectly correct value gets rejected.
+_NAME_FIELD_SUFFIX_RE = re.compile(
+    r"(bucket|table|queue|topic|function|job|cluster|role|name)$", re.IGNORECASE
+)
+
+
+def _find_key_for_token(node: Any, token: str, key: str | None = None) -> str | None:
+    """Depth-first search through a JSON-ish structure for the nearest
+    dict key whose value contains `token`. Used to recover the actual
+    Parameters field name (e.g. "Bucket" vs "BucketArn") a placeholder
+    was plugged into, since that field name -- not the AWS service
+    alone -- is what determines whether AWS wants an ARN or a bare name
+    there.
+    """
+    if isinstance(node, str):
+        return key if token in node else None
+    if isinstance(node, dict):
+        for k, v in node.items():
+            found = _find_key_for_token(v, token, k)
+            if found:
+                return found
+        return None
+    if isinstance(node, list):
+        for v in node:
+            found = _find_key_for_token(v, token, key)
+            if found:
+                return found
+    return None
+
+
+def classify_placeholder_kind(
+    workflow_spec: dict | None,
+    token: str,
+    *,
+    plan: dict | None = None,
+) -> PlaceholderKind:
+    """Best-effort guess at what SHAPE of value `token` should be
+    filled with: "arn" (full ARN), "name" (bare resource name/id, no
+    "arn:" prefix, no "s3://" scheme, no "/"), "url" (an endpoint/URI),
+    or "generic" (no strong signal -- accept anything non-empty).
+
+    Preference order: the token's own naming convention (TODO_..._ARN
+    is unambiguous) beats structural context, since it's what the
+    extraction stage itself decided this value represents.
+    """
+    upper = (token or "").upper()
+    if upper.endswith("_ARN"):
+        return "arn"
+    if upper.endswith(("_URL", "_URI", "_ENDPOINT")):
+        return "url"
+    # NOTE: deliberately does NOT include "_KEY" -- an object/file "key"
+    # (e.g. TODO_CSV_OBJECT_KEY) is commonly a slash-separated path
+    # ("incoming/data.csv"), not a bare resource name, so it's left to
+    # fall through to structural context (and ultimately "generic")
+    # rather than being force-fit into the no-slash "name" rule.
+    if upper.endswith(("_NAME", "_BUCKET", "_TABLE", "_QUEUE", "_TOPIC")):
+        return "name"
+
+    if isinstance(workflow_spec, dict):
+        components = workflow_spec.get("components") or workflow_spec.get("steps") or []
+        if isinstance(components, list):
+            for comp in components:
+                if not isinstance(comp, dict):
+                    continue
+                resource = str(comp.get("resource") or comp.get("service") or "")
+                if token == resource.strip():
+                    return "arn"  # a Task's own Resource is always an ARN
+                params = comp.get("parameters")
+                if isinstance(params, (dict, list)):
+                    field_key = _find_key_for_token(params, token)
+                    if field_key:
+                        if _ARN_FIELD_SUFFIX_RE.search(field_key):
+                            return "arn"
+                        if _URL_FIELD_SUFFIX_RE.search(field_key):
+                            return "url"
+                        if _NAME_FIELD_SUFFIX_RE.search(field_key):
+                            return "name"
+                        return "generic"
+
+        for param in workflow_spec.get("parameters") or []:
+            if isinstance(param, dict) and str(param.get("name") or "") == token:
+                constraints = str(param.get("constraints") or "").lower()
+                if "arn" in constraints:
+                    return "arn"
+
+    return "generic"
+
+
+def validate_placeholder_value(kind: PlaceholderKind, value: str) -> str | None:
+    """Check a user-supplied override against the shape `kind` implies.
+    Returns None when the value is acceptable, else a short user-facing
+    error string. Blank values are left to the caller (a still-empty
+    field is "unresolved", not "invalid").
+    """
+    v = (value or "").strip()
+    if not v:
+        return None
+    if _PLACEHOLDER_PATTERN.search(v):
+        return "Still contains a TODO_ placeholder — enter the actual value."
+
+    if kind == "arn":
+        if not _ARN_STRUCTURE_RE.match(v):
+            return (
+                "Must be a full AWS ARN, formatted "
+                "arn:aws:<service>:<region>:<account-id>:<resource> "
+                "(e.g. arn:aws:sns:us-east-1:123456789012:MyTopic) — "
+                "not a bare name or a URI."
+            )
+        return None
+
+    if kind == "url":
+        if v.lower().startswith("arn:"):
+            return "Must be a URL/endpoint, not an ARN."
+        return None
+
+    if kind == "name":
+        if v.lower().startswith("arn:"):
+            return "Must be just the resource name, not the full ARN."
+        if _S3_URI_RE.match(v):
+            return "Must be just the bucket name, not an s3:// URI."
+        if "/" in v or ":" in v:
+            return "Must be a bare resource name (no '/' or ':')."
+        return None
+
     return None
 
 
@@ -277,13 +443,14 @@ def describe_placeholders(
                         cdesc,
                         params_blob,
                     )
+                    kind = classify_placeholder_kind(workflow_spec, t, plan=plan)
                     if is_whole_resource:
                         if hint:
-                            label, example = hint
+                            label, arn_example, _name_example = hint
                             details[t] = (
                                 f"AWS ARN for the {label} used by {step_ref}"
                                 + (f" — {cdesc}." if cdesc else ".")
-                                + f" e.g. `{example}`."
+                                + f" Must be the full ARN, e.g. `{arn_example}`."
                             )
                         else:
                             details[t] = (
@@ -293,16 +460,35 @@ def describe_placeholders(
                             )
                     else:
                         clause = _as_clause(cdesc)
-                        if hint:
-                            label, example = hint
-                            details[t] = (
-                                f"{label} name or ARN used by {step_ref}"
-                                + (f" to {clause}." if clause else ".")
-                                + f" e.g. `{example}`."
-                            )
+                        # Only borrow the service hint's own wording
+                        # ("S3 bucket ARN/name") when this token's kind
+                        # says it IS that resource identifier. A token
+                        # sitting in an ambiguous field (e.g. an S3 "Key"
+                        # parameter -- an object path, not the bucket)
+                        # would otherwise get mislabeled "S3 bucket
+                        # name" just because the step also touches S3.
+                        if hint and kind in ("arn", "name"):
+                            label, arn_example, name_example = hint
+                            if kind == "arn":
+                                details[t] = (
+                                    f"{label} ARN used by {step_ref}"
+                                    + (f" to {clause}." if clause else ".")
+                                    + f" Must be the full ARN, e.g. `{arn_example}`."
+                                )
+                            else:
+                                details[t] = (
+                                    f"{label} name used by {step_ref}"
+                                    + (f" to {clause}." if clause else ".")
+                                    + f" Just the name, not the ARN — e.g. `{name_example}`."
+                                )
                         elif cdesc:
                             details[t] = (
                                 f"{cdesc} (step `{cid}`)." if cid else cdesc
+                            )
+                        elif hint:
+                            label, _arn_example, _name_example = hint
+                            details[t] = (
+                                f"Value related to the {label} used by {step_ref}."
                             )
                         elif cid:
                             details[t] = (
@@ -332,13 +518,27 @@ def describe_placeholders(
                     continue
                 hint = _detect_service_hint(sdesc)
                 clause = _as_clause(sdesc)
+                kind = classify_placeholder_kind(workflow_spec, t, plan=plan)
                 if hint:
-                    label, example = hint
-                    details[t] = (
-                        f"{label} name or ARN used by {step_ref}"
-                        + (f" to {clause}." if clause else ".")
-                        + f" e.g. `{example}`."
-                    )
+                    label, arn_example, name_example = hint
+                    if kind == "arn":
+                        details[t] = (
+                            f"{label} ARN used by {step_ref}"
+                            + (f" to {clause}." if clause else ".")
+                            + f" Must be the full ARN, e.g. `{arn_example}`."
+                        )
+                    elif kind == "name":
+                        details[t] = (
+                            f"{label} name used by {step_ref}"
+                            + (f" to {clause}." if clause else ".")
+                            + f" Just the name, not the ARN — e.g. `{name_example}`."
+                        )
+                    else:
+                        details[t] = (
+                            f"{label} name or ARN used by {step_ref}"
+                            + (f" to {clause}." if clause else ".")
+                            + f" e.g. `{arn_example}`."
+                        )
                 elif sdesc:
                     details[t] = (
                         f"AWS service + resource identifier (e.g. a Lambda "
