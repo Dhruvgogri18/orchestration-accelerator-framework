@@ -2540,9 +2540,10 @@ def _find_todo_placeholders_in_value(node, seen=None) -> list[str]:
 
     Plan-level remaining_placeholders only cover extraction/plan text.
     Enrichment + ASL generation often introduce additional tokens
-    (e.g. TODO_UNKNOWN_INTEGRATION_ARN, TableName TODOs) that only
-    exist inside the ASL document — deploy pre-checks scan the ASL,
-    so the fill form must too.
+    (e.g. TODO_UNKNOWN_INTEGRATION_ARN, TableName TODOs, DynamoDB Item
+    attribute *keys* like TODO_ATTRIBUTE_NAME) that only exist inside
+    the ASL / workflow_spec document — deploy pre-checks scan the full
+    tree (values and keys), so the fill form must too.
     """
     import re
 
@@ -2554,7 +2555,11 @@ def _find_todo_placeholders_in_value(node, seen=None) -> list[str]:
             if match not in seen:
                 seen.append(match)
     elif isinstance(node, dict):
-        for v in node.values():
+        for k, v in node.items():
+            if isinstance(k, str):
+                for match in pattern.findall(k):
+                    if match not in seen:
+                        seen.append(match)
             _find_todo_placeholders_in_value(v, seen)
     elif isinstance(node, (list, tuple)):
         for v in node:

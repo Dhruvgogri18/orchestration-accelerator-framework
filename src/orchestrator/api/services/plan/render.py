@@ -82,21 +82,31 @@ def apply_overrides_to_json(node: Any, overrides: dict[str, str]) -> Any:
     3.5's enrichment output) rather than only the thin Plan (Stage 2):
     enrichment's ARN whitelist deliberately lets TODO_ tokens through,
     and it can place them in any field it writes -- a Parameters value,
-    a resource string, anywhere -- not just the service/description
+    a resource string, **or a dict key** (e.g. DynamoDB Item attribute
+    name ``TODO_ATTRIBUTE_NAME``) -- not just the service/description
     pair apply_overrides() knows about. This walks the whole structure
     (dicts, lists, and strings, recursively) and substitutes every
-    token in every string it finds, so it works the same regardless of
-    where enrichment put the placeholder.
+    token in every string value **and every dict key**, so it works the
+    same regardless of where enrichment put the placeholder.
 
     Returns a new structure; the input is not mutated.
     """
     if isinstance(node, str):
         result = node
         for token, value in overrides.items():
-            result = result.replace(token, value)
+            if token and value is not None:
+                result = result.replace(token, value)
         return result
     if isinstance(node, dict):
-        return {k: apply_overrides_to_json(v, overrides) for k, v in node.items()}
+        out: dict = {}
+        for k, v in node.items():
+            new_k = k
+            if isinstance(k, str):
+                for token, value in overrides.items():
+                    if token and value is not None and token in k:
+                        new_k = k.replace(token, value)
+            out[new_k] = apply_overrides_to_json(v, overrides)
+        return out
     if isinstance(node, list):
         return [apply_overrides_to_json(v, overrides) for v in node]
     return node

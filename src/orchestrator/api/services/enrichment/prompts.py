@@ -136,12 +136,16 @@ ignore them.
 
 - **Choice conditions, parseable only** -- no free prose:
   `$.path == value` | `!=` | `>` `>=` `<` `<=` N | `is true` | `is
-  false` | `is present`. Use real JSONPath (e.g. `$.status`); a plain
+  false` | `is present`. Prefer path form (e.g. `$.status`); a plain
   label like "approved" becomes `$.status == approved`. Always set
   `default_next`. Map `plan.branches[]` -> `choices[]` 1:1. Map
   `plan.on_failure` -> `catch` (`error_equals: ["States.ALL"]` is
-  fine).
-  - **Any JSONPath must match the producing step's actual output
+  fine). Final ASL is pure **JSONata** (`QueryLanguage: JSONata`):
+  the generator rewrites these path conditions into
+  `{% $states.input... %}` Condition expressions and `parameters`
+  into Arguments — you may still write the familiar `$.path` form
+  in this workflow_spec stage.
+  - **Any path must match the producing step's actual output
     shape, not just the field name the plan mentions.** This applies
     everywhere a path reads a prior step's output -- Choice
     conditions, `parameters` values written as `"X.$": "$..."`,
@@ -149,11 +153,11 @@ ignore them.
     own response envelope (e.g. `lambda:invoke` nests the function's
     real return value under `.Payload`; other integrations have their
     own documented shape). Before writing such a path, check the
-    referenced step's `resource` and whether it already sets an
-    `OutputPath` that unwraps the envelope. If it doesn't, prefix the
-    path with the envelope field (e.g. `$.Payload.status`, not
-    `$.status`). Do this for every step that reads another step's
-    output, not only the one immediately after it.
+    referenced step's `resource` and whether it already unwraps the
+    envelope. If it doesn't, prefix the path with the envelope field
+    (e.g. `$.Payload.status`, not `$.status`). Do this for every step
+    that reads another step's output, not only the one immediately
+    after it.
   - **`error_equals` values (Retry and Catch) must be real error
     identifiers, never an invented label.** Valid values are
     `States.ALL`, a documented `States.*` name (`States.Timeout`,
@@ -172,6 +176,41 @@ ignore them.
   specific step's own `description` and outcome (success vs. failure,
   which branch it is on) -- never copy or adapt text from a sibling or
   adjacent step, even when they share a topic/queue/ARN.
+
+- **Inter-step data wiring (required, not optional):** when step B
+  consumes data produced by earlier step A (or by execution input the
+  user described), B's `parameters` MUST reference that data with path
+  forms (`"Bucket.$": "$.s3.bucket"`, Glue `Arguments.--source-key.$`,
+  etc.). Do not emit a downstream Task with only a static resource name
+  (e.g. Glue with only `JobName`, no source Arguments) when the plan
+  clearly reads an object/file/result earlier. Set `result_path` on
+  producer steps when later steps need their result (e.g.
+  `result_path: "$.glueJob"`). Prefer execution-input paths for values
+  the user supplies at start (`$.s3.bucket`); prefer prior-step result
+  paths for values only known after a Task runs.
+
+- **Failure-notification Message must carry the error:** every step
+  that is an `on_failure` / Catch target and publishes/alerts (SNS,
+  email, chat) MUST put the caught error into `parameters.Message` (or
+  body) via a path such as `"Message.$": "$.errorInfo"` (Catch entries
+  use `result_path: "$.errorInfo"`). A static "something failed" string
+  alone is not enough -- operators need the error payload. Success
+  notifiers stay outcome-specific static text and must not copy failure
+  wording.
+
+- **Load / persist patterns — match the data shape:**
+  - *Single record* the user described (one item, one row, one id) →
+    `dynamodb:putItem` / similar with real attribute names as
+    `TODO_ATTR_*` placeholders only when the schema was not given.
+  - *Bulk load of a file, CSV, or transform output* into a database →
+    do NOT invent a one-row `putItem` with fake attributes. Prefer one
+    of: (a) the upstream Glue/ETL job writes to the DB — pass table /
+    connection as Glue `Arguments` and keep the "load" step only if the
+    plan has a distinct load action that should invoke a loader Lambda
+    (`TODO_LOAD_FUNCTION_ARN`) or supported bulk API; (b) ask ONE
+    clarifying question naming the load mechanism if none is implied.
+  - Never invent DynamoDB key attribute names that the user did not
+    state; use `TODO_<ATTR>_NAME` placeholders (values) or ask.
 
 - **Linkage:** every non-terminal step needs `next_step` or `end:
   true`; Choice routes via `choices`/`default_next` instead. Infer from

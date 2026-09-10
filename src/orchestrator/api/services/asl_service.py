@@ -54,13 +54,19 @@ def find_asl_placeholders(node: Any, _seen: list[str] | None = None) -> list[str
     """Recursively scan the FULL ASL document -- including nested
     Parallel Branches and Map ItemProcessor/Iterator bodies, since
     those are just nested dicts/lists within the same JSON tree -- for
-    any TODO_ token in any string value at any depth.
+    any TODO_ token in any string value **or dict key** at any depth.
+
+    Dict keys matter: enrichment often invents DynamoDB attribute names
+    like ``TODO_PARTITION_KEY`` as an Item key. Those never appear as
+    string values, so a values-only scan would leave them invisible to
+    the fill-placeholders UI and to deploy readiness checks.
 
     Deliberately broader than the aws_constraints group's TODO_ check
     below, which only ever looks at a Task's `Resource`: enrichment
     can just as easily leave a TODO_ token in a Parameters value, a
-    Comment, or an InputPath, and a workflow with any of those is
-    exactly as undeployable as one with a placeholder Resource.
+    Comment, an InputPath, or an Item attribute key, and a workflow
+    with any of those is exactly as undeployable as one with a
+    placeholder Resource.
     """
     out = _seen if _seen is not None else []
     if isinstance(node, str):
@@ -68,7 +74,12 @@ def find_asl_placeholders(node: Any, _seen: list[str] | None = None) -> list[str
             if m not in out:
                 out.append(m)
     elif isinstance(node, dict):
-        for v in node.values():
+        for k, v in node.items():
+            # Keys themselves may be TODO_ tokens (e.g. DynamoDB Item attrs).
+            if isinstance(k, str):
+                for m in _PLACEHOLDER_PATTERN.findall(k):
+                    if m not in out:
+                        out.append(m)
             find_asl_placeholders(v, out)
     elif isinstance(node, list):
         for v in node:
@@ -120,44 +131,188 @@ def _humanize_todo_token(token: str) -> str:
     return " ".join(out)
 
 
-# Known AWS integrations we can recognize from resource/description text,
-# used to give placeholders a concrete label + example instead of a
-# generic "AWS resource ARN". Checked in order, so this list stays short
-# and specific rather than trying to be exhaustive. Each entry carries
-# BOTH an ARN-shaped example and a bare-name-shaped example, since the
-# same integration (e.g. S3) can need either depending on which field
-# the placeholder actually fills -- a Task Resource is always an ARN,
-# but an S3 GetObject "Bucket" parameter wants the bare bucket name, and
-# handing out the wrong shape as an "e.g." is exactly what leads users
-# to paste an ARN (or an s3:// URI) where a plain name belongs, or vice
-# versa. See classify_placeholder_kind() / validate_placeholder_value().
-_SERVICE_ARN_HINTS: list[tuple[str, str, str, str]] = [
-    ("lambda", "Lambda function", "arn:aws:lambda:us-east-1:123456789012:function:MyFunction", "MyFunction"),
-    ("dynamodb", "DynamoDB table", "arn:aws:dynamodb:us-east-1:123456789012:table/MyTable", "MyTable"),
-    ("sns", "SNS topic", "arn:aws:sns:us-east-1:123456789012:MyTopic", "MyTopic"),
-    ("sqs", "SQS queue", "arn:aws:sqs:us-east-1:123456789012:MyQueue", "MyQueue"),
-    ("s3", "S3 bucket", "arn:aws:s3:::my-bucket", "my-bucket"),
-    ("ecs", "ECS task definition", "arn:aws:ecs:us-east-1:123456789012:task-definition/MyTask", "MyTask"),
-    ("ses", "SES identity", "arn:aws:ses:us-east-1:123456789012:identity/example.com", "example.com"),
-    ("glue", "Glue job", "arn:aws:glue:us-east-1:123456789012:job/MyJob", "MyJob"),
-    ("states", "Step Functions state machine", "arn:aws:states:us-east-1:123456789012:stateMachine:MyStateMachine", "MyStateMachine"),
-    ("kms", "KMS key", "arn:aws:kms:us-east-1:123456789012:key/abcd1234-a123-4567-b890-1234567890ab", "abcd1234-a123-4567-b890-1234567890ab"),
-    ("rds", "RDS database instance", "arn:aws:rds:us-east-1:123456789012:db:my-database", "my-database"),
-]
+# Optional friendly labels + examples for well-known AWS services.
+# Detection itself is generic (see _service_key_from_resource /
+# _detect_service_hint): any service string works; this map only improves
+# wording when we recognize a service. Unknown services fall back to a
+# title-cased service name with a generic ARN example.
+_SERVICE_LABELS: dict[str, tuple[str, str, str]] = {
+    # key -> (human label, example ARN, example bare name)
+    "lambda": (
+        "Lambda function",
+        "arn:aws:lambda:us-east-1:123456789012:function:MyFunction",
+        "MyFunction",
+    ),
+    "dynamodb": (
+        "DynamoDB table",
+        "arn:aws:dynamodb:us-east-1:123456789012:table/MyTable",
+        "MyTable",
+    ),
+    "sns": (
+        "SNS topic",
+        "arn:aws:sns:us-east-1:123456789012:MyTopic",
+        "MyTopic",
+    ),
+    "sqs": (
+        "SQS queue",
+        "arn:aws:sqs:us-east-1:123456789012:MyQueue",
+        "MyQueue",
+    ),
+    "s3": (
+        "S3 bucket",
+        "arn:aws:s3:::my-bucket",
+        "my-bucket",
+    ),
+    "ecs": (
+        "ECS task definition",
+        "arn:aws:ecs:us-east-1:123456789012:task-definition/MyTask",
+        "MyTask",
+    ),
+    "ses": (
+        "SES identity",
+        "arn:aws:ses:us-east-1:123456789012:identity/example.com",
+        "example.com",
+    ),
+    "glue": (
+        "Glue job",
+        "arn:aws:glue:us-east-1:123456789012:job/MyJob",
+        "MyJob",
+    ),
+    "states": (
+        "Step Functions state machine",
+        "arn:aws:states:us-east-1:123456789012:stateMachine:MyStateMachine",
+        "MyStateMachine",
+    ),
+    "kms": (
+        "KMS key",
+        "arn:aws:kms:us-east-1:123456789012:key/abcd1234-a123-4567-b890-1234567890ab",
+        "abcd1234-a123-4567-b890-1234567890ab",
+    ),
+    "rds": (
+        "RDS database instance",
+        "arn:aws:rds:us-east-1:123456789012:db:my-database",
+        "my-database",
+    ),
+    "athena": (
+        "Athena workgroup",
+        "arn:aws:athena:us-east-1:123456789012:workgroup/primary",
+        "primary",
+    ),
+    "batch": (
+        "Batch job queue",
+        "arn:aws:batch:us-east-1:123456789012:job-queue/MyQueue",
+        "MyQueue",
+    ),
+    "events": (
+        "EventBridge bus",
+        "arn:aws:events:us-east-1:123456789012:event-bus/default",
+        "default",
+    ),
+    "eventbridge": (
+        "EventBridge bus",
+        "arn:aws:events:us-east-1:123456789012:event-bus/default",
+        "default",
+    ),
+    "stepfunctions": (
+        "Step Functions state machine",
+        "arn:aws:states:us-east-1:123456789012:stateMachine:MyStateMachine",
+        "MyStateMachine",
+    ),
+}
+
+# Step Functions optimized / SDK integration resource patterns:
+#   arn:aws:states:::lambda:invoke
+#   arn:aws:states:::glue:startJobRun.sync
+#   arn:aws:states:::aws-sdk:s3:getObject
+#   arn:aws:states:::sns:publish
+_SFN_RESOURCE_SERVICE_RE = re.compile(
+    r"arn:aws:states:::(?:aws-sdk:)?([a-z0-9\-]+):",
+    re.IGNORECASE,
+)
+# Ordinary resource ARNs: arn:aws:glue:region:acct:job/MyJob
+_PLAIN_ARN_SERVICE_RE = re.compile(
+    r"^arn:(?:aws|aws-cn|aws-us-gov):([a-z0-9\-]+):",
+    re.IGNORECASE,
+)
 
 
-def _detect_service_hint(*texts: str) -> tuple[str, str, str] | None:
-    """Best-effort (label, example ARN, example bare name) guess from
-    non-placeholder text.
+def _service_key_from_resource(resource: str) -> str | None:
+    """Extract the AWS service key from a Step Functions Resource string.
 
-    Strips TODO_ tokens out of the combined text first -- a bare
-    placeholder can't tell us what AWS service it belongs to, and
-    without this a token could "match" against its own name.
+    Works for any service -- not limited to a fixed allow-list -- so a
+    newly supported integration still gets a correct service key for
+    labeling/validation.
     """
-    blob = _PLACEHOLDER_PATTERN.sub("", " ".join(t for t in texts if t)).lower()
-    for keyword, label, arn_example, name_example in _SERVICE_ARN_HINTS:
-        if keyword in blob:
-            return label, arn_example, name_example
+    text = (resource or "").strip()
+    if not text:
+        return None
+    m = _SFN_RESOURCE_SERVICE_RE.search(text)
+    if m:
+        key = m.group(1).lower()
+        # aws-sdk path already captured the real service; "states" alone
+        # means the resource is itself a state machine ARN pattern.
+        return key
+    m = _PLAIN_ARN_SERVICE_RE.match(text)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def _label_for_service_key(key: str) -> tuple[str, str, str]:
+    """(label, example_arn, example_name) for a service key."""
+    key = (key or "").lower().strip()
+    if key in _SERVICE_LABELS:
+        return _SERVICE_LABELS[key]
+    # Generic fallback: title-case the service key so unknown services
+    # still get a readable label instead of "AWS resource".
+    pretty = key.replace("-", " ").title() if key else "AWS resource"
+    example_arn = f"arn:aws:{key or 'service'}:us-east-1:123456789012:resource/MyResource"
+    example_name = "MyResource"
+    return pretty, example_arn, example_name
+
+
+def _detect_service_hint(
+    *texts: str,
+    prefer_resource: str | None = None,
+) -> tuple[str, str, str] | None:
+    """Best-effort (label, example ARN, example bare name) for a step.
+
+    Preference order (generic, not service-list-dependent):
+      1. Explicit Step Functions Resource ARN / integration string
+         (``prefer_resource`` or any text that looks like one).
+      2. Longest whole-word service-key match against remaining text
+         (description / service field), so ``glue`` is not beaten by a
+         coincidental ``s3`` substring inside a Glue job argument key
+         like ``--SOURCE_S3_LOCATION``.
+
+    Strips TODO_ tokens before keyword matching so a placeholder name
+    cannot match against itself.
+    """
+    # 1. Resource-first (always wins when present)
+    candidates = [prefer_resource] if prefer_resource else []
+    candidates.extend(texts)
+    for c in candidates:
+        if not c:
+            continue
+        key = _service_key_from_resource(str(c))
+        if key and key not in ("aws-sdk",):
+            return _label_for_service_key(key)
+
+    # 2. Keyword match on non-resource text only — never scan parameter
+    #    key noise (SOURCE_S3_LOCATION, etc.). Callers should pass
+    #    resource/service/description, not params JSON.
+    blob = _PLACEHOLDER_PATTERN.sub("", " ".join(str(t) for t in texts if t)).lower()
+    if not blob.strip():
+        return None
+
+    # Prefer longer keys first so "dynamodb" beats a hypothetical "db"
+    # and multi-word keys are stable.
+    known_keys = sorted(_SERVICE_LABELS.keys(), key=len, reverse=True)
+    for key in known_keys:
+        # Word-boundary-ish: avoid matching "s3" inside "SOURCE_S3_LOCATION"
+        # by requiring the key as a standalone token or after a separator.
+        if re.search(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", blob):
+            return _label_for_service_key(key)
     return None
 
 
@@ -222,6 +377,46 @@ def _find_key_for_token(node: Any, token: str, key: str | None = None) -> str | 
     return None
 
 
+def _token_is_dict_key(node: Any, token: str) -> bool:
+    """True when `token` appears as a dict key (e.g. a DynamoDB attribute
+    name inside Item) rather than as a field *value*. Keys are identifiers
+    the user must supply, but they must NOT inherit the step's primary
+    resource label (table/bucket/topic).
+    """
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if str(k) == token or token in str(k):
+                return True
+            if _token_is_dict_key(v, token):
+                return True
+    elif isinstance(node, list):
+        for v in node:
+            if _token_is_dict_key(v, token):
+                return True
+    return False
+
+
+def _kind_from_field_key(field_key: str) -> PlaceholderKind | None:
+    """Infer value shape from an ASL/Parameters field name.
+
+    Field context is more reliable than a soft token suffix: e.g.
+    ``TopicArn`` is always an ARN even when the token is named
+    ``TODO_OPS_SNS_TOPIC``. Returns None when the field name gives no
+    strong signal (Key, Value, Message, Body, …).
+    """
+    if not field_key:
+        return None
+    # Strip path noise: "Arguments.--SOURCE_S3_LOCATION" → last segment
+    leaf = field_key.split(".")[-1].strip()
+    if _ARN_FIELD_SUFFIX_RE.search(leaf):
+        return "arn"
+    if _URL_FIELD_SUFFIX_RE.search(leaf):
+        return "url"
+    if _NAME_FIELD_SUFFIX_RE.search(leaf):
+        return "name"
+    return None
+
+
 def classify_placeholder_kind(
     workflow_spec: dict | None,
     token: str,
@@ -233,23 +428,27 @@ def classify_placeholder_kind(
     "arn:" prefix, no "s3://" scheme, no "/"), "url" (an endpoint/URI),
     or "generic" (no strong signal -- accept anything non-empty).
 
-    Preference order: the token's own naming convention (TODO_..._ARN
-    is unambiguous) beats structural context, since it's what the
-    extraction stage itself decided this value represents.
+    Preference order (accurate for any service):
+      1. Hard token suffix: ``_ARN`` / ``_URL`` / ``_URI`` / ``_ENDPOINT``
+         (unambiguous intent from the extraction stage).
+      2. Structural field context from workflow_spec parameters
+         (``TopicArn``, ``JobName``, ``Bucket``, …) -- this overrides
+         soft token suffixes like ``_TOPIC`` / ``_NAME`` so a token
+         sitting under ``TopicArn`` is treated as an ARN even if named
+         ``TODO_OPS_SNS_TOPIC``.
+      3. Soft token suffix: ``_NAME`` / ``_BUCKET`` / ``_TABLE`` /
+         ``_QUEUE`` / ``_TOPIC`` / ``_JOB``.
+      4. Parameter constraints text mentioning "arn".
+      5. ``generic``.
     """
     upper = (token or "").upper()
     if upper.endswith("_ARN"):
         return "arn"
     if upper.endswith(("_URL", "_URI", "_ENDPOINT")):
         return "url"
-    # NOTE: deliberately does NOT include "_KEY" -- an object/file "key"
-    # (e.g. TODO_CSV_OBJECT_KEY) is commonly a slash-separated path
-    # ("incoming/data.csv"), not a bare resource name, so it's left to
-    # fall through to structural context (and ultimately "generic")
-    # rather than being force-fit into the no-slash "name" rule.
-    if upper.endswith(("_NAME", "_BUCKET", "_TABLE", "_QUEUE", "_TOPIC")):
-        return "name"
 
+    # Structural context BEFORE soft token suffixes -- field name is the
+    # source of truth for what AWS actually expects at that slot.
     if isinstance(workflow_spec, dict):
         components = workflow_spec.get("components") or workflow_spec.get("steps") or []
         if isinstance(components, list):
@@ -263,12 +462,9 @@ def classify_placeholder_kind(
                 if isinstance(params, (dict, list)):
                     field_key = _find_key_for_token(params, token)
                     if field_key:
-                        if _ARN_FIELD_SUFFIX_RE.search(field_key):
-                            return "arn"
-                        if _URL_FIELD_SUFFIX_RE.search(field_key):
-                            return "url"
-                        if _NAME_FIELD_SUFFIX_RE.search(field_key):
-                            return "name"
+                        from_field = _kind_from_field_key(field_key)
+                        if from_field is not None:
+                            return from_field
                         return "generic"
 
         for param in workflow_spec.get("parameters") or []:
@@ -276,6 +472,15 @@ def classify_placeholder_kind(
                 constraints = str(param.get("constraints") or "").lower()
                 if "arn" in constraints:
                     return "arn"
+                name_l = str(param.get("name") or "").lower()
+                if name_l.endswith("_arn") or "arn" in str(param.get("description") or "").lower():
+                    return "arn"
+
+    # Soft suffixes -- only when no field context decided the shape.
+    # NOTE: deliberately does NOT include "_KEY" -- an object/file key
+    # is often a path ("incoming/data.csv"), not a bare resource name.
+    if upper.endswith(("_NAME", "_BUCKET", "_TABLE", "_QUEUE", "_TOPIC", "_JOB")):
+        return "name"
 
     return "generic"
 
@@ -323,11 +528,16 @@ def _as_clause(desc: str) -> str:
     """'Submit and capture the request.' -> 'submit and capture the request'.
 
     Folds an existing step description into a "used ... to <do the
-    thing>" sentence instead of repeating it verbatim.
+    thing>" sentence instead of repeating it verbatim. TODO_ tokens in
+    the description are humanized so the fill form never echoes the
+    raw placeholder name inside help text.
     """
     d = (desc or "").strip().rstrip(".")
     if not d:
         return d
+    d = _PLACEHOLDER_PATTERN.sub(
+        lambda m: _humanize_todo_token(m.group(0)), d
+    )
     return d[0].lower() + d[1:]
 
 
@@ -437,13 +647,29 @@ def describe_placeholders(
                     if not (is_whole_resource or is_embedded):
                         continue
 
+                    # Service detection: Resource ARN first, then service /
+                    # description only — never params JSON (keys like
+                    # --SOURCE_S3_LOCATION must not re-label a Glue step
+                    # as S3).
                     hint = _detect_service_hint(
-                        "" if is_whole_resource else resource,
                         service_field,
                         cdesc,
-                        params_blob,
+                        prefer_resource=("" if is_whole_resource else resource) or None,
                     )
                     kind = classify_placeholder_kind(workflow_spec, t, plan=plan)
+                    params_obj = comp.get("parameters")
+                    field_key = (
+                        _find_key_for_token(params_obj, t)
+                        if isinstance(params_obj, (dict, list))
+                        else None
+                    )
+                    # Token used as a dict key (DynamoDB attribute name,
+                    # map key, etc.) is not the step's primary resource.
+                    as_key_only = (
+                        isinstance(params_obj, (dict, list))
+                        and _token_is_dict_key(params_obj, t)
+                        and field_key is None
+                    )
                     if is_whole_resource:
                         if hint:
                             label, arn_example, _name_example = hint
@@ -460,30 +686,69 @@ def describe_placeholders(
                             )
                     else:
                         clause = _as_clause(cdesc)
-                        # Only borrow the service hint's own wording
-                        # ("S3 bucket ARN/name") when this token's kind
-                        # says it IS that resource identifier. A token
-                        # sitting in an ambiguous field (e.g. an S3 "Key"
-                        # parameter -- an object path, not the bucket)
-                        # would otherwise get mislabeled "S3 bucket
-                        # name" just because the step also touches S3.
-                        if hint and kind in ("arn", "name"):
+                        leaf = (field_key or "").split(".")[-1] if field_key else ""
+                        if as_key_only:
+                            # e.g. TODO_ATTRIBUTE_NAME as a DynamoDB Item key
+                            human = _humanize_todo_token(t)
+                            details[t] = (
+                                f"{human} used as a field/attribute key by {step_ref}"
+                                + (f" to {clause}." if clause else ".")
+                            )
+                        # Field-aware label: JobName + Glue → "Glue job name";
+                        # TopicArn + SNS → "SNS topic ARN". Generic for any
+                        # service via resource-derived hint + field leaf.
+                        elif hint and kind in ("arn", "name"):
                             label, arn_example, name_example = hint
                             if kind == "arn":
+                                field_bit = f" ({leaf})" if leaf and not leaf.lower().endswith("arn") else ""
                                 details[t] = (
-                                    f"{label} ARN used by {step_ref}"
+                                    f"{label} ARN{field_bit} used by {step_ref}"
                                     + (f" to {clause}." if clause else ".")
                                     + f" Must be the full ARN, e.g. `{arn_example}`."
                                 )
                             else:
-                                details[t] = (
-                                    f"{label} name used by {step_ref}"
-                                    + (f" to {clause}." if clause else ".")
-                                    + f" Just the name, not the ARN — e.g. `{name_example}`."
-                                )
-                        elif cdesc:
+                                # Prefer field leaf when it already names the
+                                # resource role (JobName, TableName, Bucket).
+                                if leaf and re.search(
+                                    r"(bucket|table|queue|topic|function|job|cluster|role|name)$",
+                                    leaf,
+                                    re.IGNORECASE,
+                                ):
+                                    role = leaf
+                                    # JobName → "job name"; TableName → "table name"
+                                    role_h = re.sub(
+                                        r"([a-z])([A-Z])", r"\1 \2", role
+                                    ).replace("_", " ").lower()
+                                    details[t] = (
+                                        f"{label.split()[0]} {role_h} used by {step_ref}"
+                                        + (f" to {clause}." if clause else ".")
+                                        + f" Just the name, not the ARN — e.g. `{name_example}`."
+                                    )
+                                else:
+                                    details[t] = (
+                                        f"{label} name used by {step_ref}"
+                                        + (f" to {clause}." if clause else ".")
+                                        + f" Just the name, not the ARN — e.g. `{name_example}`."
+                                    )
+                        elif field_key and kind == "arn":
                             details[t] = (
-                                f"{cdesc} (step `{cid}`)." if cid else cdesc
+                                f"`{leaf}` (ARN) for {step_ref}"
+                                + (f" — {clause}." if clause else ".")
+                                + " Must be a full AWS ARN."
+                            )
+                        elif field_key and kind == "name":
+                            details[t] = (
+                                f"`{leaf}` for {step_ref}"
+                                + (f" — {clause}." if clause else ".")
+                                + " Just the resource name, not an ARN."
+                            )
+                        elif cdesc:
+                            clean = _PLACEHOLDER_PATTERN.sub(
+                                lambda m: _humanize_todo_token(m.group(0)),
+                                cdesc,
+                            ).strip().rstrip(".")
+                            details[t] = (
+                                f"{clean} (step `{cid}`)." if cid else clean
                             )
                         elif hint:
                             label, _arn_example, _name_example = hint
@@ -579,13 +844,13 @@ def describe_placeholders(
 
 
 def apply_placeholder_overrides(node: Any, overrides: dict[str, str]) -> Any:
-    """Deep-replace TODO_ tokens (or any string keys) in a JSON tree.
+    """Deep-replace TODO_ tokens in a JSON tree (string values AND dict keys).
 
     Used after Stage 4 so user-supplied values from /approve overrides
     land in the locked ASL / workflow_spec — not only in the thin Plan
     service/description fields. Enrichment routinely re-emits TODOs in
-    Parameters and Resource; without this step, Apply placeholders in
-    the UI never changes the deployable definition.
+    Parameters, Resource, and as DynamoDB Item attribute *keys*; without
+    key rewriting, Apply placeholders would leave those keys unresolved.
     """
     if not overrides:
         return node
@@ -596,7 +861,15 @@ def apply_placeholder_overrides(node: Any, overrides: dict[str, str]) -> Any:
                 out = out.replace(token, value)
         return out
     if isinstance(node, dict):
-        return {k: apply_placeholder_overrides(v, overrides) for k, v in node.items()}
+        new_dict: dict[Any, Any] = {}
+        for k, v in node.items():
+            new_k = k
+            if isinstance(k, str):
+                for token, value in overrides.items():
+                    if token and value is not None and token in k:
+                        new_k = k.replace(token, value)
+            new_dict[new_k] = apply_placeholder_overrides(v, overrides)
+        return new_dict
     if isinstance(node, list):
         return [apply_placeholder_overrides(v, overrides) for v in node]
     return node
@@ -713,11 +986,15 @@ def _collect_spec_ids(spec: dict) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Choice condition → ASL Choice rule
+# JSONata helpers (pure JSONata ASL — no JSONPath fields)
 # ---------------------------------------------------------------------------
+# Generated state machines always set top-level QueryLanguage: "JSONata".
+# JSONPath-only fields (Parameters, ItemsPath, Variable+comparator, InputPath,
+# ResultPath, OutputPath, ResultSelector) are never emitted. Spec strings that
+# still arrive in JSONPath form (from enrichment) are converted here.
 
-# JSONPath variable: $.foo, $.Payload.status, $.items[0].id, etc.
-_VAR = r"(\$\.[A-Za-z0-9_.\[\]'\"-]+)"
+# Path-like token: $.foo, $.Payload.status, $.items[0].id, $$, $$.Execution.Id
+_VAR = r"(\$(?:\$)?(?:\.[A-Za-z0-9_.\[\]'\"-]+)?)"
 
 # Strict / preferred forms (enrichment is instructed to emit these).
 _COND_BOOL = re.compile(
@@ -759,113 +1036,278 @@ _COND_SOFT_PATH_STATUS = re.compile(
 )
 
 
+# AWS Step Functions JSONata rules (docs: transforming-data.html):
+# - Top-level or per-state QueryLanguage: "JSONata"
+# - No Parameters / InputPath / ResultPath / OutputPath / ResultSelector /
+#   ItemsPath / Variable+comparator / key.$ suffixes
+# - Use Arguments, Output, Items, Condition, Assign instead
+# - Dynamic strings: "{% <expr> %}" — must start with "{%" and end with "%}"
+# - Reserved: $states.input | $states.result | $states.errorOutput | $states.context
+# - Workflow variables: $varName via Assign; reference as {% $varName %}
+# - Static constants stay plain JSON literals (no {% %})
+
+_TODO_TOKEN = re.compile(r"^TODO_[A-Z0-9_]+$")
+# "$varName" already a variable reference (not JSONPath $. or $$.)
+_VAR_REF = re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*$")
+
+# Workflow-variable names introduced by Catch Assign (and similar) during
+# the current generate_asl() call. Paths like $.errorInfo must become
+# $errorInfo (Assign variable), NOT $states.input.errorInfo — the latter
+# is empty because Assign does not write into state input.
+_ASSIGN_VARS: set[str] = set()
+
+
+def _jsonpath_to_jsonata_expr(path: str) -> str:
+    """Map a JSONPath / path-like reference to a JSONata expression.
+
+    AWS reserved variable shapes:
+      $.foo.bar     → $states.input.foo.bar
+      $             → $states.input
+      $$.Exec.Id    → $states.context.Exec.Id
+      $customerName → $customerName  (workflow variable; unchanged)
+
+    When ``foo`` is in ``_ASSIGN_VARS`` (Catch Assign target), ``$.foo``
+    and ``$.foo.bar`` become ``$foo`` / ``$foo.bar`` so downstream states
+    read the assigned workflow variable instead of missing input fields.
+    """
+    text = (path or "").strip()
+    if not text:
+        return "$states.input"
+    if text.startswith("{%") and text.endswith("%}"):
+        return text[2:-2].strip()
+    if text.startswith("$states"):
+        return text
+    if text == "$":
+        return "$states.input"
+    if text == "$$":
+        return "$states.context"
+    if text.startswith("$."):
+        rest = text[2:]
+        head = rest.split(".", 1)[0]
+        if head in _ASSIGN_VARS:
+            return "$" + rest
+        return "$states.input." + rest
+    if text.startswith("$$."):
+        return "$states.context." + text[3:]
+    # Workflow variable already: $bucketName
+    if _VAR_REF.match(text):
+        return text
+    # Bare identifier → state input field (or Assign var when known)
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", text):
+        if text in _ASSIGN_VARS:
+            return f"${text}"
+        return f"$states.input.{text}"
+    return text
+
+
+def _as_jsonata_string(expr: str) -> str:
+    """Wrap a JSONata expression in ASL ``{% ... %}`` delimiters (AWS form)."""
+    text = (expr or "").strip()
+    if text.startswith("{%") and text.endswith("%}"):
+        return text
+    return "{% " + text + " %}"
+
+
+def _todo_to_input_expr(token: str) -> str:
+    """Unresolved TODO_TOKEN → bind from execution input (JSONata).
+
+    Example: TODO_S3_BUCKET → {% $states.input.TODO_S3_BUCKET %}
+    Callers can pass these fields on execution start; filled concrete values
+    stay plain literals and are not rewritten.
+    """
+    return _as_jsonata_string(f"$states.input.{token}")
+
+
+def _convert_value_to_jsonata(value: Any) -> Any:
+    """Recursively apply AWS JSONata value rules to Arguments / Output trees.
+
+    Nested dicts are converted with the same key rules as top-level
+    Parameters → Arguments (strip ``.$`` suffixes, path-ify string
+    values). Without that, enrichment shapes like::
+
+        {"Arguments": {"--source-bucket.$": "$.s3.bucket"}}
+        {"Item": {"pk": {"S.$": "$.JobRunId"}}}
+
+    would keep JSONPath ``.$`` keys under QueryLanguage=JSONata and
+    fail purity validation / AWS deploy.
+    """
+    if isinstance(value, list):
+        return [_convert_value_to_jsonata(v) for v in value]
+    if isinstance(value, dict):
+        # Same key rewrite as _convert_parameters_to_arguments — nested
+        # objects must not leak JSONPath '.$' suffixes.
+        return _convert_parameters_to_arguments(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if _TODO_TOKEN.match(s):
+            return _as_jsonata_string(f"$states.input.{s}")
+        if s.startswith("$.") or s.startswith("$$") or s == "$" or s == "$$":
+            return _as_jsonata_string(_jsonpath_to_jsonata_expr(s))
+        if s.startswith("{%") and s.endswith("%}"):
+            return s
+        if _VAR_REF.match(s):
+            return _as_jsonata_string(s)
+        return value
+    return value
+
+
+def _convert_parameters_to_arguments(params: dict) -> dict:
+    """JSONPath Parameters object → JSONata Arguments object (AWS rules).
+
+    - Keys ending in '.$' become bare keys with {% path-expr %} values.
+    - Nested objects/arrays are walked recursively (same key rewrite
+      at every depth, so ``Arguments.--source-bucket.$`` and
+      ``Item.pk.S.$`` are both cleaned).
+    - TODO_ tokens and $. paths become {% $states.input... %} expressions.
+    - Plain constants stay as plain JSON literals.
+    - Values that are already ``{% ... %}`` JSONata strings are kept.
+    """
+    if not isinstance(params, dict):
+        return params
+    out: dict[str, Any] = {}
+    for key, val in params.items():
+        key_s = str(key)
+        if key_s.endswith(".$"):
+            new_key = key_s[:-2]
+            if isinstance(val, str):
+                s = val.strip()
+                # Already a JSONata expression (e.g. after a prior pass
+                # or enrichment wrote {% %} directly under a '.$' key).
+                if s.startswith("{%") and s.endswith("%}"):
+                    out[new_key] = s
+                else:
+                    out[new_key] = _as_jsonata_string(_jsonpath_to_jsonata_expr(s))
+            else:
+                out[new_key] = _convert_value_to_jsonata(val)
+        else:
+            out[key_s] = _convert_value_to_jsonata(val)
+    return out
+
+
+def _items_to_jsonata(items_path: str) -> str:
+    """Map ItemsPath → JSONata ``Items`` expression."""
+    return _as_jsonata_string(_jsonpath_to_jsonata_expr(items_path))
+
+
 def _choice_rule_from_condition(condition: str, next_step: str) -> dict:
-    """Convert a condition string into an ASL Choice rule.
+    """Convert a condition string into a pure-JSONata ASL Choice rule.
 
     Prefer strict parseable forms (enrichment is instructed to emit
-    ``$.path == value``, ``$.path > N``, ``$.path is present``, etc.).
-    Fall back to conservative StringEquals on ``$.status`` so the
-    definition stays valid and the original label is preserved in Comment.
+    ``$.path == value``, ``$.path > N``, ``$.path is present``, etc.)
+    and converts them to JSONata ``{% $states.input.status = 'approved' %}``.
     """
     text = (condition or "").strip()
-    if not text:
-        return {
-            "Variable": "$.status",
-            "StringEquals": "true",
+
+    def rule(expr: str, comment: str | None = None) -> dict:
+        out: dict[str, Any] = {
+            "Condition": _as_jsonata_string(expr),
             "Next": next_step,
-            "Comment": "empty condition from workflow_spec",
         }
+        if comment:
+            out["Comment"] = comment
+        return out
+
+    if not text:
+        return rule(
+            "$states.input.status = true",
+            "empty condition from workflow_spec",
+        )
+
+    # Already a JSONata Condition string
+    if text.startswith("{%") and text.endswith("%}"):
+        return {"Condition": text, "Next": next_step}
+
+    # Likely already JSONata body without wrappers
+    if "$states" in text or text.startswith("$exists") or text.startswith("$not"):
+        return rule(text)
 
     m = _COND_BOOL.match(text)
     if m:
-        return {
-            "Variable": m.group(1),
-            "BooleanEquals": m.group(2).lower() == "true",
-            "Next": next_step,
-        }
+        expr_path = _jsonpath_to_jsonata_expr(m.group(1))
+        bool_val = m.group(2).lower()
+        return rule(f"{expr_path} = {bool_val}")
 
     m = _COND_NUM.match(text)
     if m:
-        path, op, num_s = m.group(1), m.group(2), m.group(3)
-        num = float(num_s)
-        key = {
-            ">": "NumericGreaterThan",
-            ">=": "NumericGreaterThanEquals",
-            "<": "NumericLessThan",
-            "<=": "NumericLessThanEquals",
-        }[op]
-        value: int | float = int(num) if num == int(num) else num
-        return {"Variable": path, key: value, "Next": next_step}
+        expr_path = _jsonpath_to_jsonata_expr(m.group(1))
+        op, num_s = m.group(2), m.group(3)
+        return rule(f"{expr_path} {op} {num_s}")
 
     m = _COND_NEQ.match(text)
     if m:
-        return {
-            "Variable": m.group(1),
-            "StringEquals": m.group(2).strip(),
-            "Next": next_step,
-            "Comment": f"NOTE: original condition was inequality (!=); "
-            f"review and replace with a positive match if needed: {text}",
-        }
+        expr_path = _jsonpath_to_jsonata_expr(m.group(1))
+        raw_val = m.group(2).strip()
+        if re.match(r"^-?\d+(?:\.\d+)?$", raw_val):
+            return rule(
+                f"{expr_path} != {raw_val}",
+                f"NOTE: original condition was inequality (!=); review: {text}",
+            )
+        if raw_val.lower() in ("true", "false"):
+            return rule(
+                f"{expr_path} != {raw_val.lower()}",
+                f"NOTE: original condition was inequality (!=); review: {text}",
+            )
+        val = raw_val.replace("'", "\\'")
+        return rule(
+            f"{expr_path} != '{val}'",
+            f"NOTE: original condition was inequality (!=); review: {text}",
+        )
 
     m = _COND_EQ.match(text)
     if m:
-        return {
-            "Variable": m.group(1),
-            "StringEquals": m.group(2).strip(),
-            "Next": next_step,
-        }
+        expr_path = _jsonpath_to_jsonata_expr(m.group(1))
+        raw_val = m.group(2).strip()
+        # Unquoted numeric/boolean literals must stay unquoted -- JSONata's
+        # type system treats '5' != 5.
+        if re.match(r"^-?\d+(?:\.\d+)?$", raw_val):
+            return rule(f"{expr_path} = {raw_val}")
+        if raw_val.lower() in ("true", "false"):
+            return rule(f"{expr_path} = {raw_val.lower()}")
+        val = raw_val.replace("'", "\\'")
+        return rule(f"{expr_path} = '{val}'")
 
     m = _COND_PRESENT.match(text)
     if m:
-        return {
-            "Variable": m.group(1),
-            "IsPresent": True,
-            "Next": next_step,
-        }
+        expr_path = _jsonpath_to_jsonata_expr(m.group(1))
+        return rule(f"$exists({expr_path})")
 
     m = _COND_NOT_PRESENT.match(text)
     if m:
-        return {
-            "Variable": m.group(1),
-            "IsPresent": False,
-            "Next": next_step,
-        }
+        expr_path = _jsonpath_to_jsonata_expr(m.group(1))
+        return rule(f"$not($exists({expr_path}))")
 
     m = _COND_CONTAINS.match(text)
     if m:
-        return {
-            "Variable": m.group(1),
-            "StringMatches": f"*{m.group(2).strip()}*",
-            "Next": next_step,
-        }
+        expr_path = _jsonpath_to_jsonata_expr(m.group(1))
+        val = m.group(2).strip().replace("'", "\\'")
+        return rule(f"$contains({expr_path}, '{val}')")
 
-    # Soft: bare status-like label → $.status == label
     m = _COND_SOFT_STATUS.match(text)
     if m:
-        return {
-            "Variable": "$.status",
-            "StringEquals": m.group(1).strip().lower(),
-            "Next": next_step,
-            "Comment": f"soft-parsed condition label: {text}",
-        }
+        label = m.group(1).strip().lower().replace("'", "\\'")
+        return rule(
+            f"$states.input.status = '{label}'",
+            f"soft-parsed condition label: {text}",
+        )
 
-    # Soft: bare JSONPath → treat as boolean / presence of that path
     m = _COND_SOFT_PATH_STATUS.match(text)
-    if m and text.startswith("$."):
-        return {
-            "Variable": m.group(1),
-            "IsPresent": True,
-            "Next": next_step,
-            "Comment": f"soft-parsed path-only condition: {text}",
-        }
+    if m and (text.startswith("$.") or text.startswith("$$")):
+        expr_path = _jsonpath_to_jsonata_expr(m.group(1))
+        return rule(
+            f"$exists({expr_path})",
+            f"soft-parsed path-only condition: {text}",
+        )
 
-    # Last resort: keep the human label visible on $.status
-    return {
-        "Variable": "$.status",
-        "StringEquals": text,
-        "Next": next_step,
-        "Comment": f"unparsed condition from workflow_spec — review: {text}",
-    }
+    # No known pattern matched. Silently guessing (e.g. treating the whole
+    # string as a status label) risks generating a Choice rule that looks
+    # valid but never matches what the author meant -- that's worse than
+    # failing loudly, since it deploys without complaint and just silently
+    # never takes this branch. Surface it as a generation error instead.
+    raise AslGenerationError(
+        f"Could not translate condition into a JSONata Choice rule: {text!r}. "
+        "Rephrase as e.g. \"$.field == value\", \"$.field > 5\", "
+        "\"$.field is present\", or a raw JSONata body."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -891,14 +1333,29 @@ def _retry_to_asl(retriers: list[dict] | None) -> list[dict] | None:
 def _catch_to_asl(catchers: list[dict] | None) -> list[dict] | None:
     if not catchers:
         return None
-    return [
-        {
+    out = []
+    for c in catchers:
+        if not c.get("next_step"):
+            continue
+        item: dict[str, Any] = {
             "ErrorEquals": list(c.get("error_equals") or ["States.ALL"]),
             "Next": c["next_step"],
         }
-        for c in catchers
-        if c.get("next_step")
-    ]
+        # JSONata mode has no ResultPath -- the equivalent is Assign, which
+        # binds the error onto a workflow variable so the target state (and
+        # anything after it) can still read it via {% $<key> %}.
+        # Always Assign (default errorInfo) so failure notifiers can rely
+        # on $errorInfo even when enrichment omitted result_path.
+        rp = c.get("result_path")
+        if isinstance(rp, str) and rp.strip():
+            key = rp.strip()
+            key = key[2:] if key.startswith("$.") else key.lstrip("$")
+            key = re.sub(r"[^A-Za-z0-9_]", "_", key) or "errorInfo"
+        else:
+            key = "errorInfo"
+        item["Assign"] = {key: "{% $states.errorOutput %}"}
+        out.append(item)
+    return out
 
 
 def _apply_common_transition(state: dict, step: dict) -> None:
@@ -921,6 +1378,55 @@ def _build_branch_asl(branch: dict, notes: list[str]) -> dict:
     return {"StartAt": start, "States": states}
 
 
+def _apply_output_reshape(
+    state: dict, step: dict, sid: str, notes: list[str]
+) -> None:
+    """Apply workflow_spec's output/result_selector/result_path to Output.
+
+    The schema allows result_path/result_selector on Task, Parallel, Map,
+    Pass, and Wait -- this used to only run for Task steps, silently
+    dropping the field on the other four types.
+    """
+    if step.get("output") is not None:
+        state["Output"] = _convert_value_to_jsonata(step["output"])
+    elif step.get("result_selector") is not None:
+        state["Output"] = _convert_parameters_to_arguments(step["result_selector"])
+    elif isinstance(step.get("result_path"), str) and step["result_path"].strip():
+        # JSONPath ResultPath "$.foo" MERGES the task result under "foo"
+        # while preserving the rest of the input. A bare Output object
+        # {foo: result} would REPLACE the state output and drop prior
+        # fields (s3.bucket, etc.), breaking downstream Arguments that
+        # still read $states.input.s3.bucket. Use JSONata $merge so
+        # behaviour matches ResultPath.
+        rp = step["result_path"].strip()
+        key = rp[2:] if rp.startswith("$.") else rp.lstrip("$")
+        # Only simple top-level keys (no dots) are safe as object keys in
+        # the merge expression; nested paths fall back to Assign.
+        if key and re.match(r"^[A-Za-z0-9_]+$", key):
+            state["Output"] = (
+                "{% $merge([$states.input, {'" + key + "': $states.result}]) %}"
+            )
+            notes.append(
+                f"Step '{sid}': mapped legacy result_path '{rp}' to "
+                f"JSONata Output $merge with key '{key}' (preserves input)."
+            )
+        elif key and re.match(r"^[A-Za-z0-9_.]+$", key):
+            # Nested path — keep result accessible via Assign variable
+            # derived from the last segment.
+            leaf = key.split(".")[-1] or "result"
+            leaf = re.sub(r"[^A-Za-z0-9_]", "_", leaf)
+            assign = state.get("Assign") if isinstance(state.get("Assign"), dict) else {}
+            assign = dict(assign)
+            assign[leaf] = "{% $states.result %}"
+            state["Assign"] = assign
+            # Still pass input through so later states keep context.
+            state["Output"] = "{% $states.input %}"
+            notes.append(
+                f"Step '{sid}': mapped nested result_path '{rp}' to "
+                f"Assign.{leaf} + Output=$states.input."
+            )
+
+
 def _step_to_state(step: dict, notes: list[str]) -> dict:
     """Translate one workflow_spec step into an ASL state object."""
     sid = step["id"]
@@ -938,7 +1444,9 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             raise AslGenerationError(f"Task step '{sid}' missing resource")
         state["Resource"] = resource
         if step.get("parameters"):
-            state["Parameters"] = step["parameters"]
+            # Pure JSONata: Arguments replaces Parameters (no .$ path keys).
+            state["Arguments"] = _convert_parameters_to_arguments(step["parameters"])
+        _apply_output_reshape(state, step, sid, notes)
         if step.get("timeout_seconds") is not None:
             state["TimeoutSeconds"] = int(step["timeout_seconds"])
         retry = _retry_to_asl(step.get("retry"))
@@ -954,8 +1462,14 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             state["Seconds"] = int(step["seconds"])
         elif step.get("timestamp"):
             state["Timestamp"] = step["timestamp"]
+        elif step.get("seconds_path"):
+            # JSONPath SecondsPath → JSONata Seconds expression
+            state["Seconds"] = _as_jsonata_string(
+                _jsonpath_to_jsonata_expr(step["seconds_path"])
+            )
         else:
             raise AslGenerationError(f"Wait step '{sid}' needs seconds or timestamp")
+        _apply_output_reshape(state, step, sid, notes)
         _apply_common_transition(state, step)
 
     elif stype == "Choice":
@@ -982,17 +1496,26 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
         catch = _catch_to_asl(step.get("catch"))
         if catch:
             state["Catch"] = catch
+        _apply_output_reshape(state, step, sid, notes)
         _apply_common_transition(state, step)
 
     elif stype == "Map":
         iterator = step.get("iterator")
-        items_path = step.get("items_path")
+        items_path = step.get("items_path") or step.get("items")
         if not iterator or not items_path:
             raise AslGenerationError(
                 f"Map step '{sid}' requires iterator and items_path"
             )
-        state["ItemsPath"] = items_path
-        state["Iterator"] = _build_branch_asl(iterator, notes)
+        # Pure JSONata: Items replaces ItemsPath
+        state["Items"] = (
+            items_path
+            if isinstance(items_path, str)
+            and items_path.strip().startswith("{%")
+            else _items_to_jsonata(str(items_path))
+        )
+        # ItemProcessor is the JSONata-era name; Iterator still accepted by
+        # AWS for compatibility — emit ItemProcessor for pure JSONata ASL.
+        state["ItemProcessor"] = _build_branch_asl(iterator, notes)
         max_concurrency = step.get("max_concurrency")
         if max_concurrency is not None:
             state["MaxConcurrency"] = max_concurrency
@@ -1007,6 +1530,7 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
         catch = _catch_to_asl(step.get("catch"))
         if catch:
             state["Catch"] = catch
+        _apply_output_reshape(state, step, sid, notes)
         _apply_common_transition(state, step)
 
     elif stype == "Succeed":
@@ -1019,22 +1543,173 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
             state["Cause"] = step["cause"]
 
     elif stype == "Pass":
+        if step.get("parameters"):
+            # Pass with Assign-like reshape via Output in JSONata
+            state["Output"] = _convert_parameters_to_arguments(step["parameters"])
+        elif step.get("result") is not None:
+            state["Output"] = step["result"]
+        else:
+            _apply_output_reshape(state, step, sid, notes)
         _apply_common_transition(state, step)
 
     return state
 
 
+def _collect_assign_var_names(spec: dict) -> set[str]:
+    """Names Catch (and similar) will bind via Assign from result_path.
+
+    Walks the whole steps tree so nested Map/Parallel catchers count too.
+    Every Catch gets an Assign (default ``errorInfo``) even when the
+    spec omitted result_path -- keep this set in sync with _catch_to_asl.
+    """
+    names: set[str] = set()
+    for step in _iter_spec_steps(spec.get("steps")):
+        for c in step.get("catch") or []:
+            if not isinstance(c, dict):
+                continue
+            if not c.get("next_step"):
+                continue
+            rp = c.get("result_path")
+            if isinstance(rp, str) and rp.strip():
+                key = rp.strip()
+                key = key[2:] if key.startswith("$.") else key.lstrip("$")
+                key = re.sub(r"[^A-Za-z0-9_]", "_", key) or "errorInfo"
+            else:
+                key = "errorInfo"
+            names.add(key)
+    return names
+
+
+def _collect_catch_target_ids(spec: dict) -> set[str]:
+    """Step ids that are Catch / on_failure destinations."""
+    targets: set[str] = set()
+    for step in _iter_spec_steps(spec.get("steps")):
+        for c in step.get("catch") or []:
+            if isinstance(c, dict) and c.get("next_step"):
+                targets.add(str(c["next_step"]))
+        for fid in step.get("on_failure") or []:
+            if fid:
+                targets.add(str(fid))
+    return targets
+
+
+def _message_references_error(msg: Any, assign_vars: set[str]) -> bool:
+    if not isinstance(msg, str):
+        return False
+    if "errorOutput" in msg:
+        return True
+    for v in assign_vars:
+        if v and v in msg:
+            return True
+    return False
+
+
+def _ensure_failure_messages_include_error(
+    asl: dict,
+    spec: dict,
+    notes: list[str],
+) -> None:
+    """Guarantee Catch-target alert steps include the assigned error in Message.
+
+    Enrichment sometimes emits a static SNS/email body on a failure
+    notifier. In JSONata, Catch binds the error via Assign (e.g.
+    $errorInfo); static text alone hides the failure cause from ops.
+    This is a mechanical, service-agnostic pass: any state that is a
+    Catch target and exposes a string ``Message`` (or ``HtmlMessage`` /
+    ``Text``) gets the error variable appended when missing.
+    """
+    targets = _collect_catch_target_ids(spec)
+    if not targets:
+        return
+    assign_vars = set(_ASSIGN_VARS) or {"errorInfo"}
+    err_var = "errorInfo" if "errorInfo" in assign_vars else next(iter(assign_vars))
+    err_ref = f"${err_var}"
+
+    body_keys = ("Message", "HtmlMessage", "Text", "Body")
+
+    states = asl.get("States") or {}
+    for name, state in states.items():
+        if name not in targets or not isinstance(state, dict):
+            continue
+        args = state.get("Arguments")
+        if not isinstance(args, dict):
+            continue
+        # Only touch notifier-like states that already have a body field
+        # or are SNS/SES/Chat publish integrations.
+        resource = str(state.get("Resource") or "")
+        is_notifier = any(
+            s in resource
+            for s in (
+                "sns:publish",
+                "ses:sendEmail",
+                "ses:sendRawEmail",
+                "chime.",
+                "sqs:sendMessage",
+            )
+        )
+        has_body = any(k in args for k in body_keys)
+        if not (is_notifier or has_body):
+            continue
+
+        for key in body_keys:
+            if key not in args and not (is_notifier and key == "Message"):
+                continue
+            msg = args.get(key)
+            if key not in args and is_notifier and key == "Message":
+                args["Message"] = _as_jsonata_string(f"$string({err_ref})")
+                notes.append(
+                    f"State '{name}': set Message to $string({err_ref}) "
+                    f"(Catch target had no Message)."
+                )
+                break
+            if _message_references_error(msg, assign_vars):
+                break
+            if isinstance(msg, str) and msg.strip():
+                s = msg.strip()
+                if s.startswith("{%") and s.endswith("%}"):
+                    inner = s[2:-2].strip()
+                    args[key] = _as_jsonata_string(
+                        f"($string({inner}) & ' | error: ' & $string({err_ref}))"
+                    )
+                else:
+                    safe = s.replace("\\", "\\\\").replace("'", "\\'")
+                    args[key] = _as_jsonata_string(
+                        f"'{safe} | error: ' & $string({err_ref})"
+                    )
+                notes.append(
+                    f"State '{name}': appended {err_ref} to {key} "
+                    f"(Catch-target failure notifier)."
+                )
+                break
+            else:
+                args[key] = _as_jsonata_string(f"$string({err_ref})")
+                notes.append(
+                    f"State '{name}': set {key} to $string({err_ref}) "
+                    f"(Catch target)."
+                )
+                break
+
+
 def generate_asl(spec: dict) -> tuple[dict, list[str]]:
-    """Translate a validated workflow_spec into an ASL definition.
+    """Translate a validated workflow_spec into a pure-JSONata ASL definition.
+
+    Always sets top-level ``QueryLanguage: "JSONata"``. No JSONPath fields
+    (Parameters, ItemsPath, Variable, InputPath, ResultPath, OutputPath,
+    ResultSelector) are emitted.
 
     Returns (asl_dict, generation_notes). Raises AslGenerationError on
     structural problems that make translation impossible.
     """
+    global _ASSIGN_VARS
     if not isinstance(spec, dict):
         raise AslGenerationError("workflow_spec must be a dict")
     steps = spec.get("steps")
     if not steps:
         raise AslGenerationError("workflow_spec.steps is empty")
+
+    # Populate before _step_to_state so path conversion rewrites
+    # $.errorInfo → $errorInfo for Catch Assign targets.
+    _ASSIGN_VARS = _collect_assign_var_names(spec)
 
     notes: list[str] = []
     name = spec.get("name") or "GeneratedWorkflow"
@@ -1052,12 +1727,20 @@ def generate_asl(spec: dict) -> tuple[dict, list[str]]:
 
     asl: dict[str, Any] = {
         "Comment": f"{name}: {summary}".strip(": "),
+        "QueryLanguage": "JSONata",
         "StartAt": start_at,
         "States": states,
     }
     if spec.get("version"):
         asl["Version"] = str(spec["version"])
 
+    # Mechanical correctness: Catch-target notifiers always include the
+    # assigned error payload in their Message/body (enrichment may have
+    # left a static string).
+    _ensure_failure_messages_include_error(asl, spec, notes)
+
+    notes.append("Generated with QueryLanguage=JSONata (no JSONPath fields).")
+    _ASSIGN_VARS = set()
     return asl, notes
 
 
@@ -1287,13 +1970,17 @@ def _validate_structure(asl: dict, report: ValidationReport) -> None:
                 else:
                     for sn, st in (it.get("States") or {}).items():
                         check_state(sn, st, f"{path}.Iterator.States.{sn}")
-            if "ItemsPath" not in state and "ItemSelector" not in state:
-                # ItemsPath is the classic field; soft-warn via issue if missing
+            if (
+                "Items" not in state
+                and "ItemsPath" not in state
+                and "ItemSelector" not in state
+            ):
+                # JSONata uses Items; legacy JSONPath used ItemsPath.
                 report.issues.append(
                     ValidationIssue(
                         "structural",
-                        "map_no_items_path",
-                        f"Map state '{name}' should have ItemsPath",
+                        "map_no_items",
+                        f"Map state '{name}' should have Items (JSONata) or ItemsPath",
                         path,
                     )
                 )
@@ -1730,8 +2417,81 @@ def _validate_spec_consistency(
 # Validation group 4 — AWS pragmatic constraints
 # ---------------------------------------------------------------------------
 
-def _validate_aws_constraints(asl: dict, report: ValidationReport) -> None:
+# Fields that only make sense in legacy JSONPath-mode ASL. If any of these
+# appear anywhere in a QueryLanguage=JSONata document, the generator (or a
+# hand-edit) has leaked JSONPath into an otherwise-pure-JSONata definition,
+# and AWS will reject the deploy. This is the invariant generate_asl()
+# claims to guarantee end-to-end -- worth checking, not just assuming.
+_JSONPATH_ONLY_FIELDS = {
+    "InputPath",
+    "OutputPath",
+    "ResultPath",
+    "ResultSelector",
+    "Parameters",
+    "ItemsPath",
+}
+
+
+def _check_jsonata_purity(asl: dict, report: ValidationReport) -> bool:
     ok = True
+    if asl.get("QueryLanguage") != "JSONata":
+        report.issues.append(
+            ValidationIssue(
+                "aws_constraints",
+                "not_jsonata",
+                "Top-level QueryLanguage must be 'JSONata' for this generator's output",
+            )
+        )
+        return False
+
+    def walk(node: Any, path: str) -> None:
+        nonlocal ok
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if key in _JSONPATH_ONLY_FIELDS:
+                    report.issues.append(
+                        ValidationIssue(
+                            "aws_constraints",
+                            "jsonpath_field_leaked",
+                            f"'{key}' is a JSONPath-only field but document is "
+                            f"QueryLanguage=JSONata",
+                            f"{path}.{key}",
+                        )
+                    )
+                    ok = False
+                if isinstance(key, str) and key.endswith(".$"):
+                    report.issues.append(
+                        ValidationIssue(
+                            "aws_constraints",
+                            "jsonpath_key_leaked",
+                            f"Key '{key}' uses JSONPath '.$' suffix in a JSONata document",
+                            f"{path}.{key}",
+                        )
+                    )
+                    ok = False
+                if key == "Condition" and isinstance(val, str):
+                    v = val.strip()
+                    if not (v.startswith("{%") and v.endswith("%}")):
+                        report.issues.append(
+                            ValidationIssue(
+                                "aws_constraints",
+                                "condition_not_wrapped",
+                                f"Choice Condition must be wrapped in {{% ... %}}: {v!r}",
+                                f"{path}.Condition",
+                            )
+                        )
+                        ok = False
+                walk(val, f"{path}.{key}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                walk(v, f"{path}[{i}]")
+
+    walk(asl, "$")
+    return ok
+
+
+def _validate_aws_constraints(asl: dict, report: ValidationReport) -> None:
+    ok = _check_jsonata_purity(asl, report)
     states: dict = asl.get("States") or {}
 
     if len(states) > MAX_STATES_SOFT:
@@ -2304,7 +3064,15 @@ def render_asl_graph(asl: dict) -> str:
             for rule in state.get("Choices") or []:
                 if isinstance(rule, dict) and rule.get("Next"):
                     lab = None
-                    if "StringEquals" in rule:
+                    cond = rule.get("Condition")
+                    if isinstance(cond, str) and cond.strip():
+                        # "{% $states.input.status = 'approved' %}" → status = approved
+                        t = cond.strip()
+                        if t.startswith("{%") and t.endswith("%}"):
+                            t = t[2:-2].strip()
+                        t = t.replace("$states.input.", "").replace("$states.context.", "")
+                        lab = t[:28] + ("..." if len(t) > 28 else "")
+                    elif "StringEquals" in rule:
                         lab = str(rule["StringEquals"])
                     elif "NumericGreaterThan" in rule:
                         lab = f"> {rule['NumericGreaterThan']}"

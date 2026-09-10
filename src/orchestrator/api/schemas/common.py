@@ -2,9 +2,60 @@
 
 from __future__ import annotations
 
-from typing import Literal
+import types
+import typing
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+def _field_accepts_none(annotation: Any) -> bool:
+    """True if `annotation` is a union that includes NoneType (i.e. the
+    field was declared `X | None` / `Optional[X]`), for either the
+    `typing.Union` or PEP 604 `types.UnionType` spelling.
+    """
+    origin = typing.get_origin(annotation)
+    if origin is typing.Union or origin is types.UnionType:
+        return type(None) in typing.get_args(annotation)
+    return annotation is type(None)
+
+
+class LLMJsonModel(BaseModel):
+    """Base class for every schema shape a model populates directly via
+    a `response_format=json_schema` call (as opposed to schemas/session.py,
+    which are ordinary FastAPI request/response bodies humans and code
+    construct, not LLM output).
+
+    Models sometimes emit "" for an Optional[str] field instead of
+    omitting it or emitting `null`, even when only `null` is documented
+    to mean "not applicable" -- e.g. FlowStep.next / PlanStep.next: an
+    empty string is NOT the same as no next step downstream, since
+    asl_service._apply_common_transition() and canonicalize.py's remap()
+    both use truthy checks (`if step.next:`), so next="" silently
+    produces neither "Next" nor "End" on the generated ASL state, which
+    AWS Step Functions rejects. This has already surfaced independently
+    on two different fields in two different pipeline stages, which
+    means it's a property of "LLM filling in a nullable string field,"
+    not of any one field -- so it's normalized once, here, for every
+    Optional[str] field on every LLM-populated shape (current and
+    future), rather than as a per-field validator each schema author
+    has to remember to add.
+
+    Fields typed as plain `str` (not `str | None`) are left untouched:
+    if the model sends "" there, that's a real validation problem for
+    that field's own rules to catch, not something to silently mask.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _blank_optional_strings_to_none(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        cleaned = dict(data)
+        for name, field in cls.model_fields.items():
+            if cleaned.get(name) == "" and _field_accepts_none(field.annotation):
+                cleaned[name] = None
+        return cleaned
 
 
 ComponentType = Literal[
@@ -42,7 +93,7 @@ other values are ordinary Task-shaped steps.
 """
 
 
-class PlanBranch(BaseModel):
+class PlanBranch(LLMJsonModel):
     """One exclusive outcome of a choice/decision step."""
 
     condition: str = Field(
@@ -55,7 +106,7 @@ class PlanBranch(BaseModel):
     )
 
 
-class PlanStep(BaseModel):
+class PlanStep(LLMJsonModel):
     """One step in the lightweight plan (Stage 2), NOT the full
     workflow_spec.json step shape (that's Story 2.3's job, downstream
     of this).
@@ -108,7 +159,7 @@ class PlanStep(BaseModel):
     )
 
 
-class Plan(BaseModel):
+class Plan(LLMJsonModel):
     name: str = Field(..., description="Proposed workflow name.")
     summary: str = Field(
         ..., description="One or two sentence description of the whole workflow."
@@ -116,7 +167,7 @@ class Plan(BaseModel):
     steps: list[PlanStep] = Field(..., min_length=1)
 
 
-class ExtractionResult(BaseModel):
+class ExtractionResult(LLMJsonModel):
     """The exact shape the LLM must return, every single turn.
 
     Enforced two ways: the system prompt instructs the model to
@@ -180,7 +231,7 @@ class ExtractionResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class ScopeResult(BaseModel):
+class ScopeResult(LLMJsonModel):
     """Stage A: is the latest message in-domain at all? Nothing else."""
 
     status: Literal["in_scope", "out_of_scope"]
@@ -194,7 +245,7 @@ class ScopeResult(BaseModel):
         return v
 
 
-class DraftStep(BaseModel):
+class DraftStep(LLMJsonModel):
     """Stage B output: id/service/description only -- no wiring yet."""
 
     id: str = Field(..., description="Short unique identifier, e.g. 'ValidateFile'.")
@@ -202,7 +253,7 @@ class DraftStep(BaseModel):
     description: str
 
 
-class StepDecompositionResult(BaseModel):
+class StepDecompositionResult(LLMJsonModel):
     """Stage B: break the request into steps, or ask ONE structural question."""
 
     status: Literal["ready", "needs_clarification"]
@@ -230,3 +281,4 @@ class StepDecompositionResult(BaseModel):
 # from Stage B plus add next/on_failure/on_timeout/branches. No new model
 # needed; extraction_service._check_ids_preserved() enforces the "same
 # ids, same order, nothing invented/dropped" contract Plan alone can't.
+ 

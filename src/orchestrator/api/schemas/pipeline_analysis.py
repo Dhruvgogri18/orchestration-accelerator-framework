@@ -37,7 +37,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from orchestrator.api.schemas.common import ComponentType, PlanBranch
+from orchestrator.api.schemas.common import ComponentType, LLMJsonModel, PlanBranch
 
 PIPELINE_ANALYSIS_SCHEMA_VERSION = "1.0"
 
@@ -49,7 +49,7 @@ PIPELINE_ANALYSIS_SCHEMA_VERSION = "1.0"
 # ---------------------------------------------------------------------------
 
 
-class ActionClauseResult(BaseModel):
+class ActionClauseResult(LLMJsonModel):
     """Output of a narrow, single-purpose pass over the raw request:
     list every distinct action clause (verb + object), nothing else --
     no AWS knowledge, no grouping into components, no service names.
@@ -85,7 +85,7 @@ class ActionClauseResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class EnvironmentInference(BaseModel):
+class EnvironmentInference(LLMJsonModel):
     """Target platform is fixed for this product (AWS Step Functions --
     there is only one downstream code generator, asl_service.py), but
     execution characteristics are still inferred from cues in the
@@ -127,7 +127,7 @@ class EnvironmentInference(BaseModel):
 # import -- see that module for the full rationale.
 
 
-class ComponentDefinition(BaseModel):
+class ComponentDefinition(LLMJsonModel):
     id: str = Field(..., description="Short unique identifier, e.g. 'ValidateFile'.")
     service: str = Field(
         ...,
@@ -150,7 +150,7 @@ class ComponentDefinition(BaseModel):
     )
 
 
-class ComponentIdentificationResult(BaseModel):
+class ComponentIdentificationResult(LLMJsonModel):
     """Sub-stage 2 output. Same ready/needs_clarification contract as the
     rest of the extraction pipeline -- this is the ONE point in the
     five-stage chain where the structure of the workflow can still be
@@ -191,7 +191,7 @@ class ComponentIdentificationResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class FlowStep(BaseModel):
+class FlowStep(LLMJsonModel):
     """Same control-flow shape as PlanStep (schemas/common.py) plus the
     component_type carried over unchanged from sub-stage 2, so the flow
     artifact is self-contained without a second lookup against the
@@ -208,7 +208,7 @@ class FlowStep(BaseModel):
     branches: list[PlanBranch] = Field(default_factory=list)
 
 
-class FlowStructure(BaseModel):
+class FlowStructure(LLMJsonModel):
     pipeline_name: str = Field(..., description="Proposed short kebab-case workflow name.")
     pipeline_summary: str = Field(
         ..., description="One or two sentence description of the whole workflow."
@@ -235,7 +235,7 @@ class FlowStructure(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class CombinedComponentsAndFlow(BaseModel):
+class CombinedComponentsAndFlow(LLMJsonModel):
     """Single-call alternative to ComponentIdentificationResult then
     FlowStructure. Same ready/needs_clarification gate as component
     identification; when ready, both components and flow are required.
@@ -281,7 +281,7 @@ ParameterScope = Literal["global", "component", "environment"]
 ParameterDataType = Literal["string", "number", "boolean", "list", "object"]
 
 
-class ParameterSpec(BaseModel):
+class ParameterSpec(LLMJsonModel):
     name: str = Field(..., description="e.g. 'TODO_SNS_TOPIC_ARN', 'RETRY_COUNT'.")
     scope: ParameterScope = Field(
         ...,
@@ -322,7 +322,7 @@ class ParameterSpec(BaseModel):
         return v
 
 
-class ParameterExtractionResult(BaseModel):
+class ParameterExtractionResult(LLMJsonModel):
     parameters: list[ParameterSpec] = Field(default_factory=list)
 
 
@@ -334,7 +334,7 @@ IntegrationKind = Literal["api", "database", "file_system", "message_queue", "cl
 IntegrationDirection = Literal["inbound", "outbound", "bidirectional"]
 
 
-class IntegrationPoint(BaseModel):
+class IntegrationPoint(LLMJsonModel):
     name: str = Field(..., description="e.g. 'orders DynamoDB table', 'payments SNS topic'.")
     kind: IntegrationKind
     service: str = Field(..., description="AWS service or external system name.")
@@ -348,7 +348,7 @@ class IntegrationPoint(BaseModel):
     components: list[str] = Field(..., description="Ids of components that talk to this integration.")
 
 
-class IntegrationAnalysisResult(BaseModel):
+class IntegrationAnalysisResult(LLMJsonModel):
     integrations: list[IntegrationPoint] = Field(default_factory=list)
     primary_sources: list[str] = Field(
         default_factory=list, description="Component ids that are the pipeline's original data sources."
@@ -363,7 +363,7 @@ class IntegrationAnalysisResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class PipelineAnalysis(BaseModel):
+class PipelineAnalysis(LLMJsonModel):
     """Stage 1 output in full. This is what gets hashed/cached, shown to
     the user for transparency, and handed to Stage 2 (Structured
     Workflow Generation / enrichment_service.py) -- though today only

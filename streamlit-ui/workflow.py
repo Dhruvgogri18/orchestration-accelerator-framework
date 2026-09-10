@@ -861,10 +861,19 @@ def build_graphviz_dot(asl_definition: dict) -> str:
                     nxt = choice.get("Next")
                     if not nxt:
                         continue
-                    # Prefer a short human label when present
-                    lbl = choice.get("Comment") or choice.get("Variable") or f"case {i + 1}"
-                    if isinstance(lbl, str) and len(lbl) > 24:
-                        lbl = lbl[:21] + "..."
+                    # Prefer JSONata Condition, then Comment/Variable
+                    lbl = None
+                    cond = choice.get("Condition")
+                    if isinstance(cond, str) and cond.strip():
+                        t = cond.strip()
+                        if t.startswith("{%") and t.endswith("%}"):
+                            t = t[2:-2].strip()
+                        t = t.replace("$states.input.", "").replace("$states.context.", "")
+                        lbl = t[:28] + ("..." if len(t) > 28 else "")
+                    if not lbl:
+                        lbl = choice.get("Comment") or choice.get("Variable") or f"case {i + 1}"
+                        if isinstance(lbl, str) and len(lbl) > 24:
+                            lbl = lbl[:21] + "..."
                     _emit_edge(name, nxt, str(lbl))
                 default = state.get("Default")
                 if default:
