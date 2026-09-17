@@ -749,6 +749,8 @@ def build_graphviz_dot(asl_definition: dict) -> str:
 
     Walks top-level states and nested Map/Parallel branches so the UI
     graph matches the full workflow (not just StartAt → Next chains).
+    Only top-level terminals (End:true, Succeed, Fail) connect to the
+    shared End node — nested Map/Parallel ends stop inside their cluster.
     """
     if not isinstance(asl_definition, dict):
         return "digraph G {}"
@@ -801,6 +803,17 @@ def build_graphviz_dot(asl_definition: dict) -> str:
     ]
     emitted_nodes: set[str] = set()
     emitted_edges: set[tuple[str, str, str]] = set()
+    end_used = False
+
+    def _ensure_end_node() -> None:
+        nonlocal end_used
+        if end_used:
+            return
+        end_used = True
+        lines.append(
+            '  "__end" [label="End", shape=circle, style="filled", '
+            'fillcolor="#1f2937", fontcolor="#ffffff", width=0.7, fixedsize=true];'
+        )
 
     def _emit_node(name: str, state: dict) -> None:
         if name in emitted_nodes:
@@ -832,7 +845,9 @@ def build_graphviz_dot(asl_definition: dict) -> str:
         else:
             lines.append(f'  "{_esc(src)}" -> "{_esc(dst)}";')
 
-    def _walk_states(states: dict, *, cluster: str | None = None) -> None:
+    def _walk_states(
+        states: dict, *, cluster: str | None = None, top_level: bool = True
+    ) -> None:
         if not isinstance(states, dict):
             return
         cluster_id = None
@@ -852,6 +867,14 @@ def build_graphviz_dot(asl_definition: dict) -> str:
 
             if "Next" in state and state["Next"]:
                 _emit_edge(name, state["Next"])
+
+            # Only top-level terminals → global End. Nested Map/Parallel
+            # End:true ends an item/branch, not the workflow.
+            if top_level and (
+                state.get("End") is True or stype in ("succeed", "fail")
+            ):
+                _ensure_end_node()
+                _emit_edge(name, "__end")
 
             # Choice branches
             if stype == "choice":
@@ -910,6 +933,7 @@ def build_graphviz_dot(asl_definition: dict) -> str:
                         _walk_states(
                             inner_states,
                             cluster=f"{name} iterator",
+                            top_level=False,
                         )
 
             # Parallel branches
@@ -924,12 +948,13 @@ def build_graphviz_dot(asl_definition: dict) -> str:
                         _walk_states(
                             b_states,
                             cluster=f"{name} branch {bi + 1}",
+                            top_level=False,
                         )
 
         if cluster_id:
             lines.append("  }")
 
-    _walk_states(root_states)
+    _walk_states(root_states, top_level=True)
     lines.append("}")
     return "\n".join(lines)
 

@@ -2621,6 +2621,37 @@ def _latest_asl_carrying_message_id(chat_id):
     return None
 
 
+def _is_post_approve_artifact(art: dict | None) -> bool:
+    """True for deploy follow-up cards (approved / ask-deploy / deployed / failed)."""
+    art = art or {}
+    return bool(
+        art.get("asl_approved")
+        or art.get("ask_deploy")
+        or (
+            isinstance(art.get("deployment"), dict)
+            and art["deployment"].get("state_machine_arn")
+        )
+        or art.get("pre_deploy_reasons")
+        or art.get("deploy_failure_reasons")
+    )
+
+
+def _latest_asl_review_message_id(chat_id):
+    """Newest spec_approved card that is still the ASL review surface (has ASL,
+    not a post-approve deploy-only follow-up). Download belongs here."""
+    messages = get_messages(chat_id)
+    for m in reversed(messages):
+        art = m.get("artifact") or {}
+        if art.get("stage") != "spec_approved":
+            continue
+        if not (art.get("asl") or art.get("asl_json")):
+            continue
+        if _is_post_approve_artifact(art):
+            continue
+        return m["id"]
+    return None
+
+
 def render_enrichment_question(message_id, artifact, chat_id, controls_enabled: bool):
     """UI for Stage 3.5 enrichment clarification (pause during /approve)."""
     question = (artifact.get("enrichment_question") or "").strip()
@@ -2897,58 +2928,93 @@ def render_spec_approved(message_id, artifact, chat_id):
     if asl_error:
         st.error(f"ASL generation error: {asl_error}")
 
-    # --- Validation summary ---
-    vals = artifact.get("validations") or {}
-    if vals:
-        ok = vals.get("ok")
-        errs = vals.get("errors") or []
-        if ok is True:
-            st.success("ASL validations passed.")
-        elif ok is False:
-            st.warning(f"ASL has {len(errs)} validation issue(s).")
-            for e in errs[:8]:
-                if isinstance(e, dict):
-                    st.markdown(
-                        f"- `[{e.get('group')}/{e.get('code')}]` {e.get('message')}"
-                    )
-                else:
-                    st.markdown(f"- {e}")
-        aws = vals.get("aws_details") or {}
-        if aws.get("skipped"):
-            st.caption(f"AWS ValidateStateMachine skipped: {aws.get('reason') or 'n/a'}")
-        elif aws.get("attempted") and vals.get("aws_validate_ok") is False:
-            st.caption("AWS ValidateStateMachine reported issues (see errors above).")
+    # --- ASL approval / deploy flags (needed before deciding what to paint) ---
+    asl_approved_key = f"asl_approved_{session_id}" if session_id else None
+    asl_approved = bool(
+        (asl_approved_key and st.session_state.get(asl_approved_key))
+        or artifact.get("asl_approved")
+        or (
+            isinstance(artifact.get("deployment"), dict)
+            and artifact["deployment"].get("state_machine_arn")
+        )
+        or artifact.get("pre_deploy_reasons")
+        or artifact.get("deploy_failure_reasons")
+    )
+    deploy_prompt_key = f"deploy_prompt_{session_id}" if session_id else None
+    show_deploy_form = bool(
+        deploy_prompt_key and st.session_state.get(deploy_prompt_key)
+    )
 
-    # --- ASL graph (console-style) ---
-    # Prefer a client-side graph built from the ASL so nested Map/Parallel/
-    # Choice/Catch paths are shown even when the API graph_dot is incomplete.
-    dot = None
-    if asl:
-        try:
-            from workflow import build_graphviz_dot
+    # Show graph/JSON only on cards that are still in ASL review.
+    # Use this card's artifact only — not the session-wide approved flag —
+    # so the original generated ASL stays visible once; post-approve deploy
+    # cards (asl_approved / ask_deploy on the artifact) omit graph/JSON.
+    card_is_post_approve = _is_post_approve_artifact(artifact)
+    show_asl_details = bool(asl) and not card_is_post_approve
 
-            dot = build_graphviz_dot(asl)
-        except Exception:
-            dot = artifact.get("graph_dot")
-    if not dot:
+    # Post-approve cards (approve / skip deploy) store guidance in assistant_text
+    # but the thread renderer does not print message content for spec_approved —
+    # surface it here so "ASL approved…" / "deploy skipped…" stay visible.
+    assistant_text = (artifact.get("assistant_text") or "").strip()
+    if card_is_post_approve and assistant_text:
+        st.markdown(assistant_text)
+
+    if show_asl_details:
+        # --- Validation summary ---
+        vals = artifact.get("validations") or {}
+        if vals:
+            ok = vals.get("ok")
+            errs = vals.get("errors") or []
+            if ok is True:
+                st.success("ASL validations passed.")
+            elif ok is False:
+                st.warning(f"ASL has {len(errs)} validation issue(s).")
+                for e in errs[:8]:
+                    if isinstance(e, dict):
+                        st.markdown(
+                            f"- `[{e.get('group')}/{e.get('code')}]` {e.get('message')}"
+                        )
+                    else:
+                        st.markdown(f"- {e}")
+            aws = vals.get("aws_details") or {}
+            if aws.get("skipped"):
+                st.caption(
+                    f"AWS ValidateStateMachine skipped: {aws.get('reason') or 'n/a'}"
+                )
+            elif aws.get("attempted") and vals.get("aws_validate_ok") is False:
+                st.caption(
+                    "AWS ValidateStateMachine reported issues (see errors above)."
+                )
+
+        # --- ASL graph (console-style) ---
+        # Prefer the API-returned DOT (includes End node for terminals). Fall back
+        # to a client-side build only when the API did not supply a graph.
         dot = artifact.get("graph_dot")
-
-    if dot:
-        with st.expander("ASL graph", expanded=True):
+        if not dot and asl:
             try:
-                st.graphviz_chart(dot)
-            except Exception as exc:
-                st.warning(f"Could not render graph: {exc}")
-                st.code(dot, language="dot")
-    elif asl:
-        st.caption("ASL is present but no graph DOT was returned.")
+                from workflow import build_graphviz_dot
 
-    # --- ASL JSON (download only on the latest card that has ASL) ---
-    if asl:
+                dot = build_graphviz_dot(asl)
+            except Exception:
+                dot = None
+
+        if dot:
+            with st.expander("ASL graph", expanded=True):
+                try:
+                    st.graphviz_chart(dot)
+                except Exception as exc:
+                    st.warning(f"Could not render graph: {exc}")
+                    st.code(dot, language="dot")
+        elif asl:
+            st.caption("ASL is present but no graph DOT was returned.")
+
+        # --- ASL JSON (download on the latest *review* card, not deploy follow-ups) ---
         with st.expander("ASL definition (JSON)", expanded=False):
             st.json(asl)
-            # Download only on the latest approved card (is_active).
-            if is_active:
+            # After Approve ASL, is_active moves to the deploy card; download still
+            # belongs on this review card as long as it is the latest ASL review.
+            can_download = message_id == _latest_asl_review_message_id(chat_id)
+            if can_download:
                 def _local_asl_download_bytes(asl_obj):
                     name = "workflow"
                     if isinstance(asl_obj, dict) and asl_obj.get("Comment"):
@@ -2962,7 +3028,6 @@ def render_spec_approved(message_id, artifact, chat_id):
 
                 content = None
                 filename = None
-                # Prefer backend (locked session ASL); fall back to in-memory.
                 if session_id and not USE_MOCK:
                     cache_key = f"asl_download_{session_id}"
                     cached = st.session_state.get(cache_key)
@@ -2987,27 +3052,12 @@ def render_spec_approved(message_id, artifact, chat_id):
                 )
             else:
                 st.caption(
-                    "Download is available on the latest ASL card only."
+                    "Download is available on the latest ASL review card only."
                 )
-    else:
+    elif not asl and not asl_approved:
         st.info("ASL not generated yet.")
 
     # --- ASL review: Approve / Reject (not regenerate/revalidate) ---
-    asl_approved_key = f"asl_approved_{session_id}" if session_id else None
-    asl_approved = bool(
-        (asl_approved_key and st.session_state.get(asl_approved_key))
-        or artifact.get("asl_approved")
-        or (
-            isinstance(artifact.get("deployment"), dict)
-            and artifact["deployment"].get("state_machine_arn")
-        )
-        or artifact.get("pre_deploy_reasons")
-        or artifact.get("deploy_failure_reasons")
-    )
-    deploy_prompt_key = f"deploy_prompt_{session_id}" if session_id else None
-    show_deploy_form = bool(
-        deploy_prompt_key and st.session_state.get(deploy_prompt_key)
-    )
 
     # Cannot review ASL until placeholders are cleared and ASL exists.
     can_review_asl = bool(asl) and not remaining and not enrichment_question
@@ -3409,6 +3459,19 @@ def _render_read_only_diagrams(message_id, artifact, chat_id) -> None:
         if message_id == _first_spec_approved_message_id(chat_id):
             st.success("Plan approved and locked on the server.")
 
+        # Keep enrichment question visible while the LLM answer is in flight.
+        # Interactive form is skipped in simplify mode; only the question text.
+        enrichment_question = (artifact.get("enrichment_question") or "").strip()
+        if enrichment_question:
+            st.warning(
+                "Enrichment needs a clarification before the workflow spec can be completed."
+            )
+            st.markdown(enrichment_question)
+
+        enrichment_error = artifact.get("enrichment_error")
+        if enrichment_error:
+            st.error(f"Enrichment error: {enrichment_error}")
+
         asl = artifact.get("asl") or artifact.get("asl_json")
         # Mirror interactive cards: hide ASL until placeholders are resolved.
         remaining_ro: list[str] = []
@@ -3434,62 +3497,75 @@ def _render_read_only_diagrams(message_id, artifact, chat_id) -> None:
                 if token and token not in remaining_ro:
                     remaining_ro.append(token)
 
+        # Still waiting on enrichment (no ASL yet) — show question + pause only.
+        if enrichment_question and not asl:
+            st.caption("Working on your request… actions are paused until it finishes.")
+            return
+
         if remaining_ro:
             # Placeholders still open — hide ASL; list only appears on the
             # interactive active card, not during in-flight read-only paint.
             st.caption("Working on your request… actions are paused until it finishes.")
             return
 
-        asl_error = artifact.get("asl_error")
-        if asl_error:
-            st.error(f"ASL generation error: {asl_error}")
+        # Per-card only: keep original ASL visible; hide on post-approve cards.
+        card_is_post_approve_ro = _is_post_approve_artifact(artifact)
 
-        vals = artifact.get("validations") or {}
-        if vals:
-            ok = vals.get("ok")
-            errs = vals.get("errors") or []
-            if ok is True:
-                st.success("ASL validations passed.")
-            elif ok is False:
-                st.warning(f"ASL has {len(errs)} validation issue(s).")
+        if card_is_post_approve_ro:
+            assistant_text_ro = (artifact.get("assistant_text") or "").strip()
+            if assistant_text_ro:
+                st.markdown(assistant_text_ro)
 
-        dot = None
-        if asl:
-            try:
-                from workflow import build_graphviz_dot
+        if not card_is_post_approve_ro:
+            asl_error = artifact.get("asl_error")
+            if asl_error:
+                st.error(f"ASL generation error: {asl_error}")
 
-                dot = build_graphviz_dot(asl)
-            except Exception:
-                dot = artifact.get("graph_dot")
-        if not dot:
+            vals = artifact.get("validations") or {}
+            if vals:
+                ok = vals.get("ok")
+                errs = vals.get("errors") or []
+                if ok is True:
+                    st.success("ASL validations passed.")
+                elif ok is False:
+                    st.warning(f"ASL has {len(errs)} validation issue(s).")
+
+            # Prefer API graph_dot (includes End node); fall back to client-side build.
             dot = artifact.get("graph_dot")
-
-        if dot:
-            with st.expander("ASL graph", expanded=True):
+            if not dot and asl:
                 try:
-                    st.graphviz_chart(dot)
-                except Exception as exc:
-                    st.warning(f"Could not render graph: {exc}")
-                    st.code(dot, language="dot")
-        elif asl:
-            st.caption("ASL is present but no graph DOT was returned.")
+                    from workflow import build_graphviz_dot
 
-        if asl:
-            with st.expander("ASL definition (JSON)", expanded=False):
-                st.json(asl)
-                if message_id == _latest_spec_approved_message_id(chat_id):
-                    name = "workflow"
-                    if isinstance(asl, dict) and asl.get("Comment"):
-                        name = str(asl["Comment"]).split(":")[0].strip() or name
-                    st.download_button(
-                        "Download ASL JSON",
-                        data=json.dumps(asl, indent=2),
-                        file_name=f"{name}.asl.json",
-                        mime="application/json",
-                        key=f"download_asl_ro_{chat_id}_{message_id}",
-                    )
-        else:
-            st.info("ASL not generated yet.")
+                    dot = build_graphviz_dot(asl)
+                except Exception:
+                    dot = None
+
+            if dot:
+                with st.expander("ASL graph", expanded=True):
+                    try:
+                        st.graphviz_chart(dot)
+                    except Exception as exc:
+                        st.warning(f"Could not render graph: {exc}")
+                        st.code(dot, language="dot")
+            elif asl:
+                st.caption("ASL is present but no graph DOT was returned.")
+
+            if asl:
+                with st.expander("ASL definition (JSON)", expanded=False):
+                    st.json(asl)
+                    if message_id == _latest_spec_approved_message_id(chat_id):
+                        name = "workflow"
+                        if isinstance(asl, dict) and asl.get("Comment"):
+                            name = str(asl["Comment"]).split(":")[0].strip() or name
+                        st.download_button(
+                            "Download ASL JSON",
+                            data=json.dumps(asl, indent=2),
+                            file_name=f"{name}.asl.json",
+                            mime="application/json",
+                            key=f"download_asl_ro_{chat_id}_{message_id}",
+                        )
+            else:
+                st.info("ASL not generated yet.")
 
         pre_reasons = artifact.get("pre_deploy_reasons")
         if pre_reasons:

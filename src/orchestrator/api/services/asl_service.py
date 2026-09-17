@@ -3026,7 +3026,9 @@ def render_asl_graph(asl: dict) -> str:
             f'[style={style}, color="{color}"{lab}];'
         )
 
-    def walk_states(states: dict, *, cluster_label: str | None = None) -> None:
+    def walk_states(
+        states: dict, *, cluster_label: str | None = None, top_level: bool = True
+    ) -> None:
         if not isinstance(states, dict) or not states:
             return
 
@@ -3048,13 +3050,12 @@ def render_asl_graph(asl: dict) -> str:
             if "Next" in state and state["Next"]:
                 edge(name, state["Next"], "solid", "#4B5563")
 
-            # Terminal states always link to the shared End marker —
-            # including inside Map iterators and Parallel branches.
-            # Restricting this to top-level only hid every per-item End
-            # (Persist, Notify, …) and made graphs look like they had no
-            # terminal whenever the only Ends lived under a Map.
-            # Succeed/Fail are terminals by type (no End field required).
-            if state.get("End") is True or stype in ("Succeed", "Fail"):
+            # Only top-level terminals connect to the global End marker.
+            # Nested Map/Parallel End:true (or Succeed/Fail) ends an item or
+            # branch, not the workflow — linking them to __end is misleading.
+            if top_level and (
+                state.get("End") is True or stype in ("Succeed", "Fail")
+            ):
                 ensure_end_node()
                 edge(name, "__end", "solid", "#4B5563")
 
@@ -3102,6 +3103,7 @@ def render_asl_graph(asl: dict) -> str:
                         walk_states(
                             br_states,
                             cluster_label=f"{name} branch {i}",
+                            top_level=False,
                         )
 
             if stype == "Map":
@@ -3116,12 +3118,13 @@ def render_asl_graph(asl: dict) -> str:
                     walk_states(
                         it_states,
                         cluster_label=f"{name} iterator",
+                        top_level=False,
                     )
 
         if cluster_id:
             lines.append("  }")
 
-    walk_states(root_states)
+    walk_states(root_states, top_level=True)
     lines.append("}")
     return "\n".join(lines)
 
