@@ -81,3 +81,59 @@ class WorkflowState(TypedDict, total=False):
     # --- control ---
     error: Optional[str]
     last_stage: Optional[str]
+
+
+# ---------------------------------------------------------------------------
+# Turn-graph state (message / reject routing)
+# ---------------------------------------------------------------------------
+
+
+class GraphState(TypedDict, total=False):
+    """State for the session turn graph (route → extract|patch|revise|…)."""
+
+    session_id: str
+    user_message: str
+    action: Optional[str]  # "message" | "reject"
+    route: Optional[str]
+    route_rationale: Optional[str]
+
+    # Loaded context
+    phase: Optional[str]
+    has_plan: Optional[bool]
+    has_asl: Optional[bool]
+    enrichment_question: Optional[str]
+    plan_summary: Optional[str]
+
+    # Extraction / revision outputs (mirror WorkflowState subset)
+    extraction_status: Optional[ExtractionStatus]
+    analysis: Optional[dict[str, Any]]
+    plan: Optional[dict[str, Any]]
+    clarification_message: Optional[str]
+    out_of_scope_message: Optional[str]
+    summary_markdown: Optional[str]
+    diagram_dot: Optional[str]
+    placeholders: Optional[list[str]]
+
+    # Patch / restore
+    patch_overrides: Optional[dict[str, str]]
+    patch_rationale: Optional[str]
+    is_value_only: Optional[bool]
+
+    # Approve / enrichment side effects (when routed here)
+    resolved_plan: Optional[dict[str, Any]]
+    remaining_placeholders: Optional[list[str]]
+    workflow_spec: Optional[dict[str, Any]]
+    enrichment_status: Optional[EnrichmentStatus]
+    enrichment_error: Optional[str]
+    enrichment_pending: Optional[dict[str, Any]]
+    asl: Optional[dict[str, Any]]
+    asl_graph_dot: Optional[str]
+    asl_validations: Optional[dict[str, Any]]
+    asl_error: Optional[str]
+    spec_placeholders: Optional[list[str]]
+
+    error: Optional[str]
+    last_stage: Optional[str]
+    # Carries a MessageResponse-shaped dict for the service adapter
+    message_response: Optional[dict[str, Any]]
+    approve_response: Optional[dict[str, Any]]

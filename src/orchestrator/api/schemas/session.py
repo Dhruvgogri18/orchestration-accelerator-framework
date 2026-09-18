@@ -34,6 +34,20 @@ class MessageResponse(BaseModel):
     # status == "ready".
     pipeline_analysis: dict | None = None
 
+    # --- Value-only patch after ASL (cosmetic rename / TODO fill) ---
+    # When intent == "patch_params", the client should stay on the ASL
+    # review surface and render asl + asl_graph_dot instead of re-showing
+    # plan review. Structural revise leaves these unset.
+    intent: str | None = None
+    phase: str | None = None
+    workflow_spec: dict | None = None
+    remaining_placeholders: list[str] | None = None
+    spec_placeholders: list[str] | None = None
+    asl: dict | None = None
+    asl_graph_dot: str | None = None
+    asl_validations: dict | None = None
+    asl_error: str | None = None
+
 
 class ApproveRequest(BaseModel):
     # e.g. {"TODO_S3_BUCKET": "my-uploads-bucket", "TODO_GLUE_JOB_NAME": "nightly-etl-job"}

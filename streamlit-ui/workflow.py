@@ -196,15 +196,17 @@ def _normalize_message_response(session_id: str, data: dict) -> dict:
     if status == "ready":
         plan = data.get("plan")
         asl = data.get("asl")
-        # Value-only patch after ASL exists: stay on ASL review surface.
-        # Structural revise returns ready *without* asl (locked ASL cleared).
+        # Value-only patch: stay on ASL review surface (graph + JSON only).
+        # Do NOT re-open plan review. Structural revise returns ready without
+        # intent=patch_params and without asl (locked ASL cleared).
         has_asl = isinstance(asl, dict) and bool(asl)
         intent = (data.get("intent") or "").strip()
         phase = (data.get("phase") or "").strip()
-        if has_asl and (
-            intent == "patch_params"
-            or phase in ("asl_review", "spec_placeholders", "deployed")
-        ):
+        is_cosmetic_patch = intent == "patch_params"
+        stay_on_asl_surface = is_cosmetic_patch or (
+            has_asl and phase in ("asl_review", "spec_placeholders", "deployed")
+        )
+        if stay_on_asl_surface:
             art["stage"] = "spec_approved"
             art["plan"] = plan
             art["workflow_spec"] = data.get("workflow_spec") or plan
@@ -226,6 +228,8 @@ def _normalize_message_response(session_id: str, data: dict) -> dict:
             art["assistant_text"] = data.get("message") or (
                 "Updated values without redesigning the workflow. "
                 "ASL refreshed."
+                if has_asl
+                else "Updated values without redesigning the workflow."
             )
             art["summary"] = data.get("summary_markdown")
             return art

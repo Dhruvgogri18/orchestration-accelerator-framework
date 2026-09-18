@@ -170,64 +170,100 @@ def get_live_status(session_id: str) -> dict:
 
 
 def send_message(session_id: str, message: str) -> MessageResponse:
-    """User message → pipeline analysis + render + diagnose (LangGraph nodes).
+    """User message → turn graph (route → extract | patch_params | revise_plan | …).
 
-    Stops before plan_review interrupt so the client can show the plan and
-    call /approve or /reject explicitly (current product UX).
+    Value-only edits after a plan/ASL exists take the cheap patch path
+    (one small LLM + mechanical ASL regen). Structural changes re-run
+    pipeline analysis. Brand-new designs use extract.
     """
-    session = get_session_or_raise(session_id)
-    session_store.append_message(session_id, "user", message)
+    get_session_or_raise(session_id)
     start_request(session_id=session_id, user_message=message)
-
-    history = [*session.history, {"role": "user", "content": message}]
-    graph = _get_graph()
-    config = _config(session_id)
-
-    from .nodes import diagnose_match_node, pipeline_analysis_node, render_plan_node
-    from .state import WorkflowState
-
     try:
-        state: WorkflowState = {
-            "session_id": session_id,
-            "user_message": message,
-            "messages": history,
-        }
-        state.update(pipeline_analysis_node(state))
-        if state.get("extraction_status") == "ready":
-            state.update(render_plan_node(state))
-            state.update(diagnose_match_node(state))
-            log_event(
-                "plan_match",
-                tier=state.get("match_tier"),
-                archetype=state.get("match_archetype"),
-                score=state.get("match_score"),
-                signature_hash=state.get("signature_hash"),
-            )
-            graph.update_state(
-                config,
-                {**state, "plan_decision": "pending"},
-            )
+        from .graph import run_message_turn
 
-        end_request(status=state.get("extraction_status") or "error")
-        _persist_extraction(session_id, state)
-        return _message_response_from_state(state)
+        state = run_message_turn(session_id, message)
+        end_request(status=state.get("extraction_status") or state.get("last_stage") or "ok")
+        return _message_response_from_turn_state(state)
     except Exception as exc:  # noqa: BLE001
         end_request(status="error", error=str(exc))
         raise
 
 
 def reject_plan(session_id: str, feedback: str) -> MessageResponse:
-    """Reject current plan and re-run analysis with revision instructions."""
+    """Explicit reject — always structural revise (never param patch)."""
     session = get_session_or_raise(session_id)
     if session.latest_plan is None:
         raise NoApprovablePlanError(
             "No approvable plan yet -- conversation still needs clarification."
         )
-    revision = (
-        "REJECTED — revise the previous plan. Do not return the same "
-        f"plan unchanged.\n\nFeedback: {feedback}"
-    )
-    return send_message(session_id, revision)
+    start_request(session_id=session_id, user_message=feedback)
+    try:
+        from .graph import run_reject_turn
+
+        state = run_reject_turn(session_id, feedback)
+        end_request(status=state.get("extraction_status") or state.get("last_stage") or "ok")
+        return _message_response_from_turn_state(state)
+    except Exception as exc:  # noqa: BLE001
+        end_request(status="error", error=str(exc))
+        raise
+
+
+def _message_response_from_turn_state(state: dict) -> MessageResponse:
+    """Map turn-graph state (or nested message_response) to MessageResponse.
+
+    Value-only patches include asl / intent so the UI stays on ASL review.
+    """
+    nested = state.get("message_response") if isinstance(state.get("message_response"), dict) else {}
+    status = (nested.get("status") if nested else None) or state.get("extraction_status")
+
+    if status == "ready":
+        intent = (nested.get("intent") if nested else None) or state.get("route")
+        phase = (nested.get("phase") if nested else None) or state.get("phase")
+        return MessageResponse(
+            status="ready",
+            plan=_plan_obj((nested.get("plan") if nested else None) or state.get("plan")),
+            message=(nested.get("message") if nested else None),
+            summary_markdown=(nested.get("summary_markdown") if nested else None)
+            or state.get("summary_markdown"),
+            diagram_dot=(nested.get("diagram_dot") if nested else None)
+            or state.get("diagram_dot"),
+            placeholders=(nested.get("placeholders") if nested else None)
+            or state.get("placeholders")
+            or [],
+            pipeline_analysis=(nested.get("pipeline_analysis") if nested else None)
+            or state.get("analysis"),
+            intent=intent,
+            phase=phase,
+            workflow_spec=(nested.get("workflow_spec") if nested else None)
+            or state.get("workflow_spec"),
+            remaining_placeholders=(nested.get("remaining_placeholders") if nested else None),
+            spec_placeholders=(nested.get("spec_placeholders") if nested else None)
+            or state.get("spec_placeholders"),
+            asl=(nested.get("asl") if nested else None) or state.get("asl"),
+            asl_graph_dot=(nested.get("asl_graph_dot") if nested else None)
+            or state.get("asl_graph_dot"),
+            asl_validations=(nested.get("asl_validations") if nested else None)
+            or state.get("asl_validations"),
+            asl_error=(nested.get("asl_error") if nested else None)
+            or state.get("asl_error"),
+        )
+    if status == "out_of_scope":
+        return MessageResponse(
+            status="out_of_scope",
+            message=(nested.get("message") if nested else None)
+            or state.get("out_of_scope_message")
+            or (
+                "This assistant is only designed to help you build AWS Step "
+                "Functions workflows. Please describe a workflow to orchestrate."
+            ),
+        )
+    if status == "needs_clarification":
+        return MessageResponse(
+            status="needs_clarification",
+            question=(nested.get("question") if nested else None)
+            or state.get("clarification_message"),
+        )
+    return _message_response_from_state(state)
 
 
 def approve_plan(session_id: str, overrides: dict[str, str] | None = None) -> ApproveResponse:

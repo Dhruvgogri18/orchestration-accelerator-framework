@@ -268,30 +268,110 @@ def run_extraction_turn(session_id: str, session: Session, message: str) -> Mess
 
 
 def send_message(session_id: str, message: str) -> MessageResponse:
-    session = get_session_or_raise(session_id)
-    return run_extraction_turn(session_id, session, message)
+    """Route every free-text turn through the LangGraph turn graph.
+
+    Value-only edits (rename bucket/ARN/TODO, etc.) take patch_params
+    (one small LLM + mechanical ASL regen). Structural changes take
+    revise_plan (full re-extraction). New designs take extract.
+    """
+    get_session_or_raise(session_id)
+    start_request(session_id=session_id, user_message=message)
+    try:
+        from orchestrator.api.services.orchestration.graph import run_message_turn
+        from orchestrator.api.schemas.common import Plan
+
+        state = run_message_turn(session_id, message)
+        end_request(status=state.get("extraction_status") or state.get("last_stage") or "ok")
+        return _message_response_from_turn_state(state)
+    except Exception as exc:  # noqa: BLE001
+        end_request(status="error", error=str(exc))
+        raise
 
 
 def reject_plan(session_id: str, feedback: str) -> MessageResponse:
-    """User wants changes to the current plan.
-
-    Feedback is still one more user turn in the same extraction loop,
-    but it is wrapped with an explicit revision instruction so the
-    model cannot treat it as a soft comment and re-emit the previous
-    plan unchanged (common with temperature=0 and the prior plan JSON
-    still in history).
-    """
+    """Explicit reject — always structural revise (never param patch)."""
     session = get_session_or_raise(session_id)
     if session.latest_plan is None:
         raise NoApprovablePlanError(
             "No plan to reject -- conversation still needs clarification."
         )
-    revision_message = (
-        "REJECTED — revise the previous plan. Do not return the same "
-        "plan, steps, or structure. Apply this feedback:\n\n"
-        f"{feedback.strip()}"
+    start_request(session_id=session_id, user_message=feedback)
+    try:
+        from orchestrator.api.services.orchestration.graph import run_reject_turn
+
+        state = run_reject_turn(session_id, feedback)
+        end_request(status=state.get("extraction_status") or state.get("last_stage") or "ok")
+        return _message_response_from_turn_state(state)
+    except Exception as exc:  # noqa: BLE001
+        end_request(status="error", error=str(exc))
+        raise
+
+
+def _message_response_from_turn_state(state: dict) -> MessageResponse:
+    """Map turn-graph state to MessageResponse.
+
+    For value-only patches, include asl / asl_graph_dot / intent so the UI
+    stays on the ASL surface instead of re-showing plan review.
+    """
+    nested = state.get("message_response") if isinstance(state.get("message_response"), dict) else {}
+    status = (nested.get("status") if nested else None) or state.get("extraction_status") or "needs_clarification"
+
+    if status == "ready":
+        plan_raw = (nested.get("plan") if nested else None) or state.get("plan")
+        plan = None
+        if plan_raw is not None:
+            plan = plan_raw if isinstance(plan_raw, Plan) else Plan.model_validate(plan_raw)
+
+        intent = (nested.get("intent") if nested else None) or state.get("route")
+        phase = (nested.get("phase") if nested else None) or state.get("phase")
+        asl = (nested.get("asl") if nested else None) or state.get("asl")
+        asl_graph_dot = (nested.get("asl_graph_dot") if nested else None) or state.get(
+            "asl_graph_dot"
+        )
+
+        return MessageResponse(
+            status="ready",
+            plan=plan,
+            message=(nested.get("message") if nested else None),
+            summary_markdown=(nested.get("summary_markdown") if nested else None)
+            or state.get("summary_markdown"),
+            diagram_dot=(nested.get("diagram_dot") if nested else None)
+            or state.get("diagram_dot"),
+            placeholders=(nested.get("placeholders") if nested else None)
+            or state.get("placeholders")
+            or [],
+            pipeline_analysis=(nested.get("pipeline_analysis") if nested else None)
+            or state.get("analysis"),
+            intent=intent,
+            phase=phase,
+            workflow_spec=(nested.get("workflow_spec") if nested else None)
+            or state.get("workflow_spec"),
+            remaining_placeholders=(nested.get("remaining_placeholders") if nested else None),
+            spec_placeholders=(nested.get("spec_placeholders") if nested else None)
+            or state.get("spec_placeholders"),
+            asl=asl,
+            asl_graph_dot=asl_graph_dot,
+            asl_validations=(nested.get("asl_validations") if nested else None)
+            or state.get("asl_validations"),
+            asl_error=(nested.get("asl_error") if nested else None)
+            or state.get("asl_error"),
+        )
+
+    if status == "out_of_scope":
+        return MessageResponse(
+            status="out_of_scope",
+            message=(nested.get("message") if nested else None)
+            or state.get("out_of_scope_message")
+            or (
+                "This assistant is only designed to help you build AWS Step "
+                "Functions workflows. Please describe a workflow to orchestrate."
+            ),
+        )
+    return MessageResponse(
+        status="needs_clarification",
+        question=(nested.get("question") if nested else None)
+        or state.get("clarification_message"),
     )
-    return run_extraction_turn(session_id, session, revision_message)
 
 
 def _run_asl_stage(workflow_spec: dict) -> tuple[dict | None, str | None, dict | None, str | None]:
