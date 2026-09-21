@@ -42,6 +42,12 @@ MAX_NESTING_DEPTH = 8
 MAX_STATE_NAME_LEN = 80
 STATE_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,80}$")
 
+# Matches the first path segment of a "$states.input.<key>" reference
+# inside a JSONata expression, e.g. "foo" in "$states.input.foo.bar[0]".
+# Used by _check_output_consumer_consistency to check that a downstream
+# state only reads keys its predecessor's Output actually produces.
+_STATES_INPUT_REF_RE = re.compile(r"\$states\.input\.([A-Za-z_][A-Za-z0-9_]*)")
+
 # Same sentinel pattern plan/render.py uses for the thin Plan
 # (service/description text). Defined again here because this one
 # scans a completely different, later-stage document -- the full ASL
@@ -616,6 +622,52 @@ def describe_placeholders(
             or workflow_spec.get("steps")
             or []
         )
+
+        # Precompute every step that references each token, so a value
+        # asked for once but reused by several steps (see the "ask once,
+        # reuse everywhere" wiring rule) gets a description that says so,
+        # instead of only crediting whichever step happened to be seen
+        # first while walking the list below.
+        token_step_ids: dict[str, list[str]] = {}
+        if isinstance(components, list):
+            for comp in components:
+                if not isinstance(comp, dict):
+                    continue
+                cid0 = str(comp.get("id") or comp.get("name") or "")
+                resource0 = str(comp.get("resource") or comp.get("service") or "")
+                service_field0 = str(comp.get("service") or "")
+                params_blob0 = json.dumps(comp.get("parameters") or {}, default=str)
+                cdesc0 = (comp.get("description") or "").strip()
+                for t in token_set:
+                    if not t:
+                        continue
+                    if (
+                        t == resource0.strip()
+                        or t in params_blob0
+                        or t in service_field0
+                        or t in cdesc0
+                    ):
+                        ids = token_step_ids.setdefault(t, [])
+                        if cid0 and cid0 not in ids:
+                            ids.append(cid0)
+
+        def _also_used_by(t: str, primary_cid: str) -> str:
+            """' Step X also uses this same value.' / '' if not shared."""
+            extra = [s for s in token_step_ids.get(t, []) if s and s != primary_cid]
+            if not extra:
+                return ""
+            names = [f"`{s}`" for s in extra]
+            if len(names) == 1:
+                joined = names[0]
+                verb = "also uses"
+            elif len(names) == 2:
+                joined = f"{names[0]} and {names[1]}"
+                verb = "also use"
+            else:
+                joined = ", ".join(names[:-1]) + f", and {names[-1]}"
+                verb = "also use"
+            return f" Step {joined} {verb} this same answer, so you only need to fill it in once."
+
         if isinstance(components, list):
             for comp in components:
                 if not isinstance(comp, dict):
@@ -671,28 +723,33 @@ def describe_placeholders(
                         and field_key is None
                     )
                     if is_whole_resource:
+                        clause = _as_clause(cdesc)
                         if hint:
                             label, arn_example, _name_example = hint
                             details[t] = (
-                                f"AWS ARN for the {label} used by {step_ref}"
-                                + (f" — {cdesc}." if cdesc else ".")
-                                + f" Must be the full ARN, e.g. `{arn_example}`."
+                                f"The {label} that {step_ref} will use"
+                                + (f" to {clause}" if clause else "")
+                                + ". Enter its full AWS ID (called an ARN) —"
+                                f" it looks like `{arn_example}`."
                             )
                         else:
+                            step_ref_cap = f"Step `{cid}`" if cid else "This step"
                             details[t] = (
-                                f"AWS resource ARN required by {step_ref} "
-                                "(integration type wasn't identified — e.g. "
-                                "Lambda, SNS, or DynamoDB ARN)."
+                                f"{step_ref_cap} needs the full AWS ID "
+                                "(called an ARN) of whatever it calls. We "
+                                "couldn't tell exactly what kind of resource "
+                                "this is — it might be a Lambda function, an "
+                                "SNS topic, a DynamoDB table, or similar."
                             )
                     else:
                         clause = _as_clause(cdesc)
                         leaf = (field_key or "").split(".")[-1] if field_key else ""
                         if as_key_only:
                             # e.g. TODO_ATTRIBUTE_NAME as a DynamoDB Item key
-                            human = _humanize_todo_token(t)
                             details[t] = (
-                                f"{human} used as a field/attribute key by {step_ref}"
-                                + (f" to {clause}." if clause else ".")
+                                f"You're naming a field here, not entering data. "
+                                f"Whatever you type becomes the label {step_ref} "
+                                "uses" + (f" when it {clause}." if clause else ".")
                             )
                         # Field-aware label: JobName + Glue → "Glue job name";
                         # TopicArn + SNS → "SNS topic ARN". Generic for any
@@ -702,9 +759,10 @@ def describe_placeholders(
                             if kind == "arn":
                                 field_bit = f" ({leaf})" if leaf and not leaf.lower().endswith("arn") else ""
                                 details[t] = (
-                                    f"{label} ARN{field_bit} used by {step_ref}"
-                                    + (f" to {clause}." if clause else ".")
-                                    + f" Must be the full ARN, e.g. `{arn_example}`."
+                                    f"The full AWS ID (ARN) of the {label}"
+                                    f"{field_bit} that {step_ref} uses"
+                                    + (f" to {clause}" if clause else "")
+                                    + f". It looks like `{arn_example}`."
                                 )
                             else:
                                 # Prefer field leaf when it already names the
@@ -720,27 +778,31 @@ def describe_placeholders(
                                         r"([a-z])([A-Z])", r"\1 \2", role
                                     ).replace("_", " ").lower()
                                     details[t] = (
-                                        f"{label.split()[0]} {role_h} used by {step_ref}"
-                                        + (f" to {clause}." if clause else ".")
-                                        + f" Just the name, not the ARN — e.g. `{name_example}`."
+                                        f"The {label.split()[0]} {role_h} that "
+                                        f"{step_ref} uses"
+                                        + (f" to {clause}" if clause else "")
+                                        + f". Just the plain name — not the "
+                                        f"full ARN — e.g. `{name_example}`."
                                     )
                                 else:
                                     details[t] = (
-                                        f"{label} name used by {step_ref}"
-                                        + (f" to {clause}." if clause else ".")
-                                        + f" Just the name, not the ARN — e.g. `{name_example}`."
+                                        f"The name of the {label} that "
+                                        f"{step_ref} uses"
+                                        + (f" to {clause}" if clause else "")
+                                        + f". Just the plain name — not the "
+                                        f"full ARN — e.g. `{name_example}`."
                                     )
                         elif field_key and kind == "arn":
                             details[t] = (
-                                f"`{leaf}` (ARN) for {step_ref}"
+                                f"The full AWS ID (ARN) for `{leaf}`, needed "
+                                f"by {step_ref}"
                                 + (f" — {clause}." if clause else ".")
-                                + " Must be a full AWS ARN."
                             )
                         elif field_key and kind == "name":
                             details[t] = (
-                                f"`{leaf}` for {step_ref}"
+                                f"The plain name (not a full ARN) to use for "
+                                f"`{leaf}` in {step_ref}"
                                 + (f" — {clause}." if clause else ".")
-                                + " Just the resource name, not an ARN."
                             )
                         elif cdesc:
                             clean = _PLACEHOLDER_PATTERN.sub(
@@ -753,13 +815,20 @@ def describe_placeholders(
                         elif hint:
                             label, _arn_example, _name_example = hint
                             details[t] = (
-                                f"Value related to the {label} used by {step_ref}."
+                                f"A value {step_ref} needs — something "
+                                f"related to the {label}."
                             )
                         elif cid:
                             details[t] = (
-                                f"Resource for step `{cid}` "
-                                f"({_humanize_todo_token(t)})."
+                                f"A value step `{cid}` needs: "
+                                f"{_humanize_todo_token(t).lower()}."
                             )
+
+                    # A value asked for once but reused by other steps (the
+                    # "ask once, reuse everywhere" wiring rule) should say
+                    # so, regardless of which branch above wrote the text.
+                    if t in details:
+                        details[t] += _also_used_by(t, cid)
 
     # --- plan steps (service / description) ---
     if isinstance(plan, dict):
@@ -1403,8 +1472,38 @@ def _apply_output_reshape(
         # Only simple top-level keys (no dots) are safe as object keys in
         # the merge expression; nested paths fall back to Assign.
         if key and re.match(r"^[A-Za-z0-9_]+$", key):
+            echo = step.get("echo")
+            if isinstance(echo, dict) and echo:
+                # Fields the underlying AWS API never returns (e.g. a
+                # caller-supplied output URI) get merged alongside the
+                # real $states.result, so a value defined once upstream
+                # (execution input / TODO_ token) can still be read
+                # downstream via $states.input.<key>.<field> -- the same
+                # shape as a genuine API-returned field like JobRunId.
+                echo_pairs = []
+                for ek, ev in echo.items():
+                    ek_s = str(ek)
+                    if not re.match(r"^[A-Za-z0-9_]+$", ek_s):
+                        continue
+                    expr = _jsonpath_to_jsonata_expr(str(ev))
+                    echo_pairs.append("'" + ek_s + "': " + expr)
+                if echo_pairs:
+                    result_expr = (
+                        "$merge([$states.result, {"
+                        + ", ".join(echo_pairs)
+                        + "}])"
+                    )
+                    notes.append(
+                        f"Step '{sid}': echoed {list(echo.keys())} into "
+                        f"result_path '{rp}' alongside $states.result "
+                        "(value defined once, threaded to a later step)."
+                    )
+                else:
+                    result_expr = "$states.result"
+            else:
+                result_expr = "$states.result"
             state["Output"] = (
-                "{% $merge([$states.input, {'" + key + "': $states.result}]) %}"
+                "{% $merge([$states.input, {'" + key + "': " + result_expr + "}]) %}"
             )
             notes.append(
                 f"Step '{sid}': mapped legacy result_path '{rp}' to "
@@ -2490,8 +2589,158 @@ def _check_jsonata_purity(asl: dict, report: ValidationReport) -> bool:
     return ok
 
 
+def _check_bare_result_indexing(asl: dict, report: ValidationReport) -> bool:
+    """Flag "$[" -- a bare, unqualified JSONata root context indexed
+    directly, e.g. "{% $[0].foo %}" -- inside a Parallel/Map state's own
+    Output, Assign, or Catch[].Assign fields (including nested branches
+    and Iterator/ItemProcessor bodies).
+
+    Only $states.result and $states.errorOutput are documented, reserved
+    references to a state's raw result. Bare "$" is never specified
+    anywhere to be pre-bound to that array, so indexing it directly
+    (rather than writing $states.result[0], say) relies on undefined
+    behavior instead of the one guaranteed reference AWS actually
+    provides for a Parallel/Map state's per-branch/per-item result array.
+    """
+    ok = True
+
+    def scan_value(val: Any, path: str) -> None:
+        nonlocal ok
+        if isinstance(val, str) and "$[" in val:
+            report.issues.append(
+                ValidationIssue(
+                    "aws_constraints",
+                    "bare_result_index",
+                    f"{path} uses bare '$[...]' indexing; use "
+                    "'$states.result[...]' (or '$states.errorOutput[...]' "
+                    "in a Catch) instead -- bare '$' is not documented to "
+                    "be bound to the raw array result",
+                    path,
+                )
+            )
+            ok = False
+        elif isinstance(val, dict):
+            for k, v in val.items():
+                scan_value(v, f"{path}.{k}")
+        elif isinstance(val, list):
+            for i, v in enumerate(val):
+                scan_value(v, f"{path}[{i}]")
+
+    def walk_states(states_map: dict | None, path: str) -> None:
+        for name, state in (states_map or {}).items():
+            state_path = f"{path}.{name}"
+            if state.get("Type") in ("Parallel", "Map"):
+                if "Output" in state:
+                    scan_value(state["Output"], f"{state_path}.Output")
+                if "Assign" in state:
+                    scan_value(state["Assign"], f"{state_path}.Assign")
+                for i, c in enumerate(state.get("Catch") or []):
+                    if isinstance(c, dict) and "Assign" in c:
+                        scan_value(
+                            c["Assign"], f"{state_path}.Catch[{i}].Assign"
+                        )
+                for br in state.get("Branches") or []:
+                    if isinstance(br, dict):
+                        walk_states(br.get("States"), f"{state_path}.Branches")
+                iterator = state.get("ItemProcessor") or state.get("Iterator")
+                if isinstance(iterator, dict):
+                    walk_states(
+                        iterator.get("States"), f"{state_path}.ItemProcessor"
+                    )
+            else:
+                for br in state.get("Branches") or []:
+                    if isinstance(br, dict):
+                        walk_states(br.get("States"), f"{state_path}.Branches")
+
+    walk_states(asl.get("States"), "States")
+    return ok
+
+
+def _literal_output_keys(output: Any) -> set[str] | None:
+    """Return a state's Output top-level key set IF Output is a literal
+    JSON object -- unlike a "{% $merge(...) %}" string or an absent
+    Output (defaulting to $states.result), a literal object's key set is
+    fully known statically, with no ambiguity to guess at. Returns None
+    whenever the shape can't be determined this way; callers must skip
+    the check in that case rather than assume.
+    """
+    if isinstance(output, dict):
+        return set(output.keys())
+    return None
+
+
+def _referenced_input_keys(node: Any) -> set[str]:
+    """Collect the first path segment of every "$states.input.<key>"
+    reference found anywhere (recursively) inside a state's Arguments
+    (or any nested dict/list within it, e.g. a Payload sub-object)."""
+    found: set[str] = set()
+
+    def walk(val: Any) -> None:
+        if isinstance(val, str):
+            for m in _STATES_INPUT_REF_RE.finditer(val):
+                found.add(m.group(1))
+        elif isinstance(val, dict):
+            for v in val.values():
+                walk(v)
+        elif isinstance(val, list):
+            for v in val:
+                walk(v)
+
+    walk(node)
+    return found
+
+
+def _check_output_consumer_consistency(asl: dict, report: ValidationReport) -> bool:
+    """When a state's Output is a literal JSON object, the set of
+    top-level keys the next state will see in $states.input is fully
+    known statically. If that next state (reached via Next) references
+    $states.input.<key> for a key outside that set, the reference is
+    guaranteed to resolve to undefined at runtime -- flag it as a hard
+    error instead of letting it fail silently during execution (e.g. a
+    Parallel state's Output producing {"a": ..., "b": ...} while the next
+    state reads $states.input.combined, which was never produced).
+
+    Deliberately conservative: only checks the direct Next edge (not
+    Catch targets, not multi-hop chains), and only fires when the
+    predecessor's Output is a literal object -- a string/JSONata Output,
+    or no Output at all, is left unchecked rather than risk a false
+    positive from a shape we can't verify statically.
+    """
+    ok = True
+    states: dict = asl.get("States") or {}
+
+    for name, state in states.items():
+        next_name = state.get("Next")
+        if not next_name or next_name not in states:
+            continue
+        known_keys = _literal_output_keys(state.get("Output"))
+        if known_keys is None:
+            continue
+
+        next_state = states[next_name]
+        referenced = _referenced_input_keys(next_state.get("Arguments"))
+        missing = referenced - known_keys
+        if missing:
+            report.issues.append(
+                ValidationIssue(
+                    "aws_constraints",
+                    "dangling_input_reference",
+                    f"State '{next_name}' references "
+                    f"$states.input.{{{', '.join(sorted(missing))}}}, but "
+                    f"preceding state '{name}' Output only produces "
+                    f"{{{', '.join(sorted(known_keys))}}} -- this resolves "
+                    "to undefined at runtime",
+                    f"States.{next_name}.Arguments",
+                )
+            )
+            ok = False
+    return ok
+
+
 def _validate_aws_constraints(asl: dict, report: ValidationReport) -> None:
     ok = _check_jsonata_purity(asl, report)
+    ok = _check_bare_result_indexing(asl, report) and ok
+    ok = _check_output_consumer_consistency(asl, report) and ok
     states: dict = asl.get("States") or {}
 
     if len(states) > MAX_STATES_SOFT:

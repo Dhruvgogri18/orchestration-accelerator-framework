@@ -27,6 +27,22 @@ from orchestrator.api.schemas.common import Plan, PlanStep
 
 _PLACEHOLDER_PATTERN = re.compile(r"\bTODO_[A-Z0-9_]+\b")
 
+# A field value of exactly "$.TODO_X" is a JSONPath *reference* meaning
+# "look this up from execution input named TODO_X at runtime" -- it is
+# not literal text that merely contains the token. See the note in
+# apply_overrides_to_json() below.
+_JSONPATH_TODO_REF = re.compile(r"^\$\.(TODO_[A-Z0-9_]+)$")
+
+# A field value of exactly "{% TODO_X %}" is a JSONata-wrapped
+# placeholder. No known generator in this codebase currently emits this
+# exact shape (unresolved tokens are always prefixed with
+# "$states.input." -- see _todo_to_input_expr), but resolving it
+# defensively is cheap and correct: once TODO_X has a concrete value,
+# the field is a plain literal and the "{% %}" JSONata markers must be
+# dropped, not left wrapping raw unquoted text (which is not valid
+# JSONata and would fail to parse/deploy).
+_JSONATA_TODO_REF = re.compile(r"^\{%\s*(TODO_[A-Z0-9_]+)\s*%\}$")
+
 
 class PlanRenderError(Exception):
     """Raised when a plan reaches rendering with no structured control
@@ -92,6 +108,41 @@ def apply_overrides_to_json(node: Any, overrides: dict[str, str]) -> Any:
     Returns a new structure; the input is not mutated.
     """
     if isinstance(node, str):
+        # A whole-value JSONPath reference like "$.TODO_SOURCE_S3_BUCKET"
+        # must resolve to the literal value, not have the token replaced
+        # in place. A plain substring replace would turn it into
+        # "$.test-bucket" -- still a "$." reference, just now pointing at
+        # a field named "test-bucket" that will never exist in the
+        # execution input. asl_service.py's JSONPath->JSONata conversion
+        # then faithfully renders that bogus reference as
+        # "{% $states.input.test-bucket %}": syntactically broken
+        # (JSONata parses the hyphen as subtraction) and semantically
+        # wrong (it was supposed to be the literal bucket name). Once an
+        # override supplies a concrete value for the token, the field is
+        # no longer a runtime lookup at all -- resolve the reference to
+        # the literal value directly, dropping the "$." wrapper.
+        ref_match = _JSONPATH_TODO_REF.match(node.strip())
+        if (
+            ref_match
+            and ref_match.group(1) in overrides
+            and overrides[ref_match.group(1)] is not None
+        ):
+            return overrides[ref_match.group(1)]
+
+        # Same idea for a bare "{% TODO_X %}" JSONata-wrapped placeholder:
+        # substring-replacing the token inside it would leave the "{% %}"
+        # markers around raw, unquoted literal text -- invalid JSONata
+        # for anything that isn't itself a legal bare expression (a URI
+        # like "s3://bucket/key" is not). Drop the wrapper and use the
+        # literal value directly.
+        jsonata_match = _JSONATA_TODO_REF.match(node.strip())
+        if (
+            jsonata_match
+            and jsonata_match.group(1) in overrides
+            and overrides[jsonata_match.group(1)] is not None
+        ):
+            return overrides[jsonata_match.group(1)]
+
         result = node
         for token, value in overrides.items():
             if token and value is not None:
