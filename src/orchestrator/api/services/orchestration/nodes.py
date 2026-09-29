@@ -382,6 +382,7 @@ def asl_node(state: WorkflowState) -> dict:
             "asl": None,
             "asl_graph_dot": None,
             "asl_validations": None,
+            "asl_source": None,
             "asl_error": None,
             "spec_placeholders": spec_placeholders,
             "last_stage": "asl",
@@ -398,6 +399,7 @@ def asl_node(state: WorkflowState) -> dict:
             "asl": result.asl,
             "asl_graph_dot": result.graph_dot,
             "asl_validations": validations,
+            "asl_source": result.source,
             "asl_error": None,
             "spec_placeholders": [],
             "last_stage": "asl",
@@ -701,6 +703,7 @@ def patch_params_node(state: dict) -> dict:
     asl_out = None
     asl_graph_dot = None
     asl_validations = None
+    asl_source = None
     asl_error = None
     spec_placeholders: list[str] = []
 
@@ -718,19 +721,23 @@ def patch_params_node(state: dict) -> dict:
                     if hasattr(result.validations, "to_dict")
                     else result.validations
                 )
+                asl_source = result.source
                 asl_error = None
             except Exception as exc:  # noqa: BLE001
                 asl_error = str(exc)
                 asl_out = None
                 asl_graph_dot = None
                 asl_validations = None
+                asl_source = None
         else:
             asl_out = None
             asl_graph_dot = None
             asl_validations = None
+            asl_source = None
         new_locked["asl"] = asl_out
         new_locked["asl_graph_dot"] = asl_graph_dot
         new_locked["asl_validations"] = asl_validations
+        new_locked["asl_source"] = asl_source
         new_locked["asl_error"] = asl_error
         # Clear enrichment question if we successfully patched
         new_locked.pop("enrichment_question", None)
@@ -780,6 +787,7 @@ def patch_params_node(state: dict) -> dict:
         "asl": asl_out,
         "asl_graph_dot": asl_graph_dot,
         "asl_validations": asl_validations,
+        "asl_source": asl_source,
         "asl_error": asl_error,
         "spec_placeholders": spec_placeholders,
         "last_stage": "patch_params",
@@ -801,6 +809,7 @@ def patch_params_node(state: dict) -> dict:
             "asl": asl_out,
             "asl_graph_dot": asl_graph_dot,
             "asl_validations": asl_validations,
+            "asl_source": asl_source,
             "asl_error": asl_error,
         },
     }
@@ -891,6 +900,7 @@ def answer_enrichment_node(state: dict) -> dict:
             "asl": response.asl,
             "asl_graph_dot": response.asl_graph_dot,
             "asl_validations": response.asl_validations,
+            "asl_source": response.asl_source,
             "asl_error": response.asl_error,
             "spec_placeholders": response.spec_placeholders,
             # Surface as ready plan if we still have one
@@ -938,6 +948,7 @@ def approve_plan_node(state: dict) -> dict:
             "asl": response.asl,
             "asl_graph_dot": response.asl_graph_dot,
             "asl_validations": response.asl_validations,
+            "asl_source": response.asl_source,
             "asl_error": response.asl_error,
             "spec_placeholders": response.spec_placeholders,
             "extraction_status": "ready",

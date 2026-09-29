@@ -43,6 +43,35 @@ _JSONPATH_TODO_REF = re.compile(r"^\$\.(TODO_[A-Z0-9_]+)$")
 # JSONata and would fail to parse/deploy).
 _JSONATA_TODO_REF = re.compile(r"^\{%\s*(TODO_[A-Z0-9_]+)\s*%\}$")
 
+# Whole-value "{% $states.input.TODO_X %}" (post-translation JSONata form
+# of an unresolved placeholder). Same whole-expression replacement rule
+# as the two patterns above: once filled, the field becomes a plain
+# literal and the wrapper must not remain around the substituted text.
+_JSONATA_STATES_INPUT_TODO_REF = re.compile(
+    r"^\{%\s*\$states\.input\.(TODO_[A-Z0-9_]+)\s*%\}$"
+)
+
+# Bare unresolved TODO token used as a whole value.
+_BARE_TODO_TOKEN = re.compile(r"^TODO_[A-Z0-9_]+$")
+
+
+def _is_path_or_expression_value(value: str) -> bool:
+    """True when a parameter value is still a runtime path / expression.
+
+    After placeholder fill, a former ``$.TODO_X`` becomes a plain constant
+    (bucket name, S3 URI, table name, …). Callers use this to decide
+    whether a leftover JSONPath ``.$`` key suffix should be stripped so
+    ASL generation does not re-wrap the constant as invalid JSONata.
+    """
+    s = (value or "").strip()
+    if not s:
+        return False
+    if s.startswith("$") or s.startswith("{%"):
+        return True
+    if _BARE_TODO_TOKEN.match(s):
+        return True
+    return False
+
 
 class PlanRenderError(Exception):
     """Raised when a plan reaches rendering with no structured control
@@ -121,7 +150,8 @@ def apply_overrides_to_json(node: Any, overrides: dict[str, str]) -> Any:
         # override supplies a concrete value for the token, the field is
         # no longer a runtime lookup at all -- resolve the reference to
         # the literal value directly, dropping the "$." wrapper.
-        ref_match = _JSONPATH_TODO_REF.match(node.strip())
+        stripped = node.strip()
+        ref_match = _JSONPATH_TODO_REF.match(stripped)
         if (
             ref_match
             and ref_match.group(1) in overrides
@@ -135,13 +165,25 @@ def apply_overrides_to_json(node: Any, overrides: dict[str, str]) -> Any:
         # for anything that isn't itself a legal bare expression (a URI
         # like "s3://bucket/key" is not). Drop the wrapper and use the
         # literal value directly.
-        jsonata_match = _JSONATA_TODO_REF.match(node.strip())
+        jsonata_match = _JSONATA_TODO_REF.match(stripped)
         if (
             jsonata_match
             and jsonata_match.group(1) in overrides
             and overrides[jsonata_match.group(1)] is not None
         ):
             return overrides[jsonata_match.group(1)]
+
+        # Post-translation form: "{% $states.input.TODO_X %}". Whole-
+        # expression replacement yields the plain literal so generation
+        # does not re-wrap it (and so substring replace cannot produce
+        # "{% $states.input.my-input-bucket %}" — still-broken JSONata).
+        states_match = _JSONATA_STATES_INPUT_TODO_REF.match(stripped)
+        if (
+            states_match
+            and states_match.group(1) in overrides
+            and overrides[states_match.group(1)] is not None
+        ):
+            return overrides[states_match.group(1)]
 
         result = node
         for token, value in overrides.items():
@@ -156,7 +198,20 @@ def apply_overrides_to_json(node: Any, overrides: dict[str, str]) -> Any:
                 for token, value in overrides.items():
                     if token and value is not None and token in k:
                         new_k = k.replace(token, value)
-            out[new_k] = apply_overrides_to_json(v, overrides)
+            new_v = apply_overrides_to_json(v, overrides)
+            # After a path-style TODO under a JSONPath '.$' key is filled
+            # with a constant, strip the '.$' suffix. Leaving it would
+            # cause ASL generation to treat the constant as a path and
+            # emit invalid JSONata like "{% s3://bucket/key %}" or
+            # "{% $states.input.my-table %}" for a filled table name.
+            if (
+                isinstance(new_k, str)
+                and new_k.endswith(".$")
+                and isinstance(new_v, str)
+                and not _is_path_or_expression_value(new_v)
+            ):
+                new_k = new_k[:-2]
+            out[new_k] = new_v
         return out
     if isinstance(node, list):
         return [apply_overrides_to_json(v, overrides) for v in node]

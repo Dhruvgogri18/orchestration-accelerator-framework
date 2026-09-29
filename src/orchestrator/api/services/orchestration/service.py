@@ -97,6 +97,7 @@ def _approve_response_from_state(state: dict) -> ApproveResponse:
         asl=state.get("asl"),
         asl_graph_dot=state.get("asl_graph_dot"),
         asl_validations=state.get("asl_validations"),
+        asl_source=state.get("asl_source"),
         asl_error=state.get("asl_error"),
     )
 
@@ -244,6 +245,8 @@ def _message_response_from_turn_state(state: dict) -> MessageResponse:
             or state.get("asl_graph_dot"),
             asl_validations=(nested.get("asl_validations") if nested else None)
             or state.get("asl_validations"),
+            asl_source=(nested.get("asl_source") if nested else None)
+            or state.get("asl_source"),
             asl_error=(nested.get("asl_error") if nested else None)
             or state.get("asl_error"),
         )

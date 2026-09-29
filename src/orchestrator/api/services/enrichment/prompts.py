@@ -128,6 +128,25 @@ ignore them.
       `max_concurrency`. Fixed-size batching ("groups of 500") with no
       earlier partitioning step -> `items_batcher.max_items_per_batch`;
       skip this if an earlier step already partitions the data.
+    - "Distributed Map" / "at once" / high fan-out → MUST set
+      `distributed: true` and
+      `processor_config: {"Mode": "DISTRIBUTED", "ExecutionType": "STANDARD"}`
+      on the Map step. "Fail the whole/entire map if any item fails" /
+      "failure-intolerant" → MUST set `tolerated_failure_count: 0` and
+      `tolerated_failure_percentage: 0`. Do not leave these as prose only.
+    - **Map `items_path`:** must point at the collection that actually
+      holds the items *after* prior steps run. If a previous step
+      produces the list (via `result_path`), use that path
+      (e.g. `$.<result_path_key>.<list_field>`), not a stale execution-
+      input field, unless the user truly maps over original input.
+    - **Map `item_selector` (required when Distributed, or when the
+      worker needs parent fields):** pass the raw item as `item` from
+      `$$.Map.Item.Value`, plus every parent-scoped field the iterator
+      reads (ids, config, prior-step outputs). Iterator Tasks must read
+      those from `$states.input.<field>` / `$states.input.item` — never
+      rely on `$states.context.Execution.Input` inside Distributed
+      children. JSONPath-style `.$` paths are fine; the generator
+      rewrites them.
     - Don't invent Parallel/Map without a clear signal ("in parallel",
       "for each item"); if unclear, stay sequential or ask.
   - *Terminals carry no resource:* Succeed/Fail/Choice/Wait/Parallel/Map
@@ -200,14 +219,22 @@ ignore them.
   - *Prior-step result* paths are fine to write directly (not TODO_)
     whenever they read a `result_path` this same enrichment pass set on
     the producer step -- that shape is known, not invented.
-  - *Target-job argument keys* (Glue `Arguments.--source-key`, a Lambda
-    payload's own field names, etc.) are dictated by the called job's/
-    function's own contract, never by execution input, and must NEVER
-    be guessed -- even common-looking ones like `--source-bucket`. Use
-    a `TODO_<JOB>_ARG_<PURPOSE>` placeholder as the key itself unless
-    the user/plan states the job's real argument name. The value on
-    that key still follows the execution-input / prior-step-result
-    rules above.
+  - *Integration / job argument keys are NEVER TODO_ tokens.*
+    Dict keys under `parameters` / `Arguments` / `Payload` must be real
+    structural names — the field names the AWS integration (or the
+    called job/function) expects. Put every unknown or user-specific
+    value on the *value* side as a `TODO_<PURPOSE>` token (or a path).
+    Never place a `TODO_` token as a dict key — key-side TODOs become
+    corrupted when filled (the fill value replaces the key) and produce
+    invalid ASL.
+    Prefer the field/argument names the user or plan already stated.
+    When the exact contract is unknown, still emit conventional
+    purpose-descriptive keys for that integration and put TODOs only
+    in the values (e.g. a publish step uses `TopicArn` / `Message`; a
+    named job run uses `JobName` plus purpose-descriptive argument
+    keys under nested `Arguments`; an invoke uses `FunctionName` plus
+    payload fields). Do not invent concrete resource *values* (names,
+    URIs, ARNs) — those stay as TODO_ values.
   - *Every `TODO_` token is asked for exactly once, full stop -- this
     applies to every service and every kind of value, not a Glue-only
     rule.* Whenever more than one step in the workflow needs the same
@@ -257,19 +284,43 @@ ignore them.
   notifiers stay outcome-specific static text and must not copy failure
   wording.
 
-- **Load / persist patterns — match the data shape:**
-  - *Single record* the user described (one item, one row, one id) →
-    `dynamodb:putItem` / similar with real attribute names as
-    `TODO_ATTR_*` placeholders only when the schema was not given.
-  - *Bulk load of a file, CSV, or transform output* into a database →
-    do NOT invent a one-row `putItem` with fake attributes. Prefer one
-    of: (a) the upstream Glue/ETL job writes to the DB — pass table /
-    connection as Glue `Arguments` and keep the "load" step only if the
-    plan has a distinct load action that should invoke a loader Lambda
-    (`TODO_LOAD_FUNCTION_ARN`) or supported bulk API; (b) ask ONE
-    clarifying question naming the load mechanism if none is implied.
-  - Never invent DynamoDB key attribute names that the user did not
-    state; use `TODO_<ATTR>_NAME` placeholders (values) or ask.
+- **Write / load / publish patterns — match the data shape and collect required config:**
+  - *Single record or message* the user described (one item, one row,
+    one event, one message) → use the integration that fits the stated
+    sink, with real field names as keys. For any identifier or payload
+    field the user did not state, put a `TODO_*` on the *value* side only.
+  - *Bulk transfer of a file, stream, or transform output* into a sink →
+    do NOT invent a one-row / one-message API call with fake fields.
+    Prefer: (a) an upstream ETL/job step that already writes to the
+    sink — pass every required targeting parameter as that step's
+    argument/parameter *values*; keep a separate load/write step only
+    if the plan has a distinct action that should call a different
+    integration; (b) ask ONE clarifying question naming the transfer
+    mechanism if none is implied.
+  - *Required configuration for any external sink (service-agnostic):*
+    when a step writes, loads, publishes, puts, or sends to an external
+    resource and the plan does not already supply the concrete
+    identifiers, emit value-side `TODO_` placeholders under the
+    conventional field names that integration expects, for every
+    parameter needed to target the sink correctly. Infer the slots from
+    the chosen service and action (emit only those that apply; never
+    invent the *values*). Typical categories:
+      • resource identity — whatever names/addresses that sink
+        (table, collection, bucket, key/prefix, queue, topic, bus,
+        stream, function, job, …)
+      • addressing / routing fields the API needs when the store is
+        key- or path-addressed (key attributes, partition/sort keys,
+        object key, message group id, …) only when relevant to that
+        integration
+      • connection / endpoint / region only when the integration
+        requires it and it was not already given
+    Reuse a single TODO token for the same real-world value across
+    steps. Do not hardcode any concrete resource name, key, or
+    attribute value.
+  - Never invent concrete resource *values* the user did not state;
+    use `TODO_*` placeholders on the value side, or ask one clarifying
+    question when the write/load mechanism itself is structurally
+    undecidable.
 
 - **Linkage:** every non-terminal step needs `next_step` or `end:
   true`; Choice routes via `choices`/`default_next` instead. Infer from

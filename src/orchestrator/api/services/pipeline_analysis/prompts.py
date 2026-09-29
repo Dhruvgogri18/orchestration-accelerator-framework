@@ -146,6 +146,23 @@ Nothing else.
   into the clause it modifies (e.g. "retry three times", "with two
   retries"); do not drop it.
  
+- **Implementation details are not clauses** (fold into the action they
+  modify; never list them alone). These describe *how* a step runs in
+  ASL, not a separate business action:
+  - I/O shaping on the same state (unwrap/parse a service response,
+    reshape payload, "in that same Task/call")
+  - Building arguments inline (compose a path, key, or parameter from
+    known parts inside the call that uses them)
+  - Sequencing or placement prose (linear, then, next after a Map/
+    Parallel, "not a branch") that only orders steps already listed
+  - Failure/success *configuration* (stop on first failure, fail a
+    Map/Parallel if any item/branch fails, tolerated-failure zero) —
+    not a separate notify/alert action
+  - Bare termination wording ("end", "then end") when it only closes
+    the last action
+  - Explicit step-count or "do not add extra states" constraints —
+    bounds on structure, not actions
+
 - **Parallel join is not a clause:** phrases like "wait for both/all to
   finish", "then after both complete", "join" after concurrent jobs are
   the Parallel state's built-in barrier -- do NOT list them as separate
@@ -225,26 +242,41 @@ description, component_type). Do NOT decide control flow \
   stage produces and cannot add or retype one to fix a collapsed
   action+routing component later.
  
+- **Implementation details are not components** (same categories as
+  the action-clause stage): same-state I/O shaping, inline argument
+  construction, sequencing/placement prose, Map/Parallel failure
+  configuration, and bare end-on-last-step wording are attributes of
+  the component they apply to -- fold them into that component's
+  description. Never emit a separate component for them. When the
+  user states an explicit step/component count or "do not add extra
+  states," treat that as a bound on component count, not as additional
+  clauses to expand.
+
 - **Completeness:** you will be given an "Action clauses identified from
   this request" list from an earlier, independent pass.
-  - Every clause needs its own component unless it is purely a
-    retry/timeout attribute (see Retry) or a bare control-flow condition
-    with no action of its own.
-  - Do not merge or drop clauses just because they feel related.
-  - Two clauses joined by "and" under a parallel/concurrent/simultaneous
-    verb are always two components.
+  - Every *action* clause needs its own component unless it is purely a
+    retry/timeout attribute (see Retry), a bare control-flow condition
+    with no action of its own, or an implementation detail (see above).
+  - Do not merge or drop real action clauses just because they feel
+    related.
+  - Two action clauses joined by "and" under a parallel/concurrent/
+    simultaneous verb are always two components.
   - A clause never reuses another clause's component id just because
     both are failure paths -- distinct triggers get distinct components.
-  - If your component count comes out noticeably lower than the clause
-    count, go back through the clause list one entry at a time before
-    responding.
- 
-- **Clarifying questions:** only ask when the STRUCTURE (what components
-  exist, what order) is genuinely unclear -- not for resource-level
-  details (those become TODO_ placeholders later). At most ONE question.
-  Check conversation history first -- never re-ask something already
+  - If clause count is inflated by implementation-detail phrases, fold
+    those into the owning action components. Do not ask whether to
+    split them into extra components when the user already required
+    same-state behavior or a fixed step count -- honor that structure.
+
+- **Clarifying questions:** only ask when the STRUCTURE (what *action*
+  components exist, what order) is genuinely unclear -- not for
+  resource-level details (those become TODO_ placeholders later), and
+  not when the only tension is "one component per phrase" vs same-state
+  or fixed-count instructions (always keep implementation details
+  folded into the action components). At most ONE question. Check
+  conversation history first -- never re-ask something already
   answered.
- 
+
 - **Plan revision:** if the latest message is feedback rejecting/changing
   a previous component list, produce a REVISED list reflecting that
   feedback -- do not repeat the same components unchanged.
@@ -571,9 +603,32 @@ Enumerate every configurable value the pipeline needs.
   (bucket names, ARNs, table names, topic/queue names, thresholds, API
   tokens) must appear here as its own parameter -- do not leave them
   only in free text.
- 
+
+- **Implied required config for external resources (service-agnostic):**
+  when a component reads from, writes to, loads into, publishes to, or
+  invokes an external resource, and the conversation did not already
+  supply the concrete identifiers, still enumerate the parameters that
+  integration needs to target the resource correctly. Use
+  `TODO_<PURPOSE>` names and mark them required. Infer slots from the
+  component's service and action (emit only those that apply; never
+  invent concrete values). Typical categories:
+  - resource identity (whatever names or addresses that resource —
+    table, collection, bucket, key/prefix, queue, topic, bus, stream,
+    function, job, API endpoint, …)
+  - addressing / routing fields the API needs when relevant (key
+    attributes, object key, message group id, partition key, …)
+  - source location when the component reads from object storage and
+    the location was not already listed
+  - named job / function / API identifier when the component runs or
+    calls one and the name was not already given
+  Do not hardcode any specific resource, key, or attribute name — only
+  the parameter *slots* the runtime needs. Reuse one TODO token for
+  the same real-world value across components.
+
 - **Nothing configurable?** Return an empty "parameters" array -- do not
-  invent parameters never mentioned or implied.
+  invent parameters never mentioned or implied. The implied-required
+  rule above is not invention: it surfaces configuration the chosen
+  integration cannot run without.
 </rules>
  
 <output_format>

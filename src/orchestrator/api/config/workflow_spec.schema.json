@@ -246,6 +246,44 @@
             }
           }
         },
+        "item_selector": {
+          "type": "object",
+          "description": "Map ItemSelector: shapes each iterator input. Required when the Map is Distributed or the iterator needs parent-scoped fields (bucket, run_id, config, prior-step outputs) in addition to the raw item. Typical keys: item from $$.Map.Item.Value plus parent fields. Only meaningful on a Map step."
+        },
+        "distributed": {
+          "type": "boolean",
+          "description": "When true, this Map is a Distributed Map. Stage 4 emits ProcessorConfig Mode=DISTRIBUTED with ExecutionType=STANDARD. Prefer setting this explicitly when the plan/description says Distributed Map, high fan-out, or 'at once' over a large collection."
+        },
+        "processor_config": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Map ProcessorConfig. For Distributed Map use {\"Mode\": \"DISTRIBUTED\", \"ExecutionType\": \"STANDARD\"}. Inline maps may omit or use {\"Mode\": \"INLINE\"}.",
+          "properties": {
+            "Mode": {
+              "type": "string",
+              "enum": ["INLINE", "DISTRIBUTED"]
+            },
+            "ExecutionType": {
+              "type": "string",
+              "enum": ["STANDARD", "EXPRESS"]
+            }
+          }
+        },
+        "tolerated_failure_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Map ToleratedFailureCount. Set to 0 when the plan requires failing the entire Map if any item fails (failure-intolerant). Only meaningful on a Map step."
+        },
+        "tolerated_failure_percentage": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Map ToleratedFailurePercentage. Set to 0 when the plan requires failing the entire Map if any item fails. Only meaningful on a Map step."
+        },
+        "echo": {
+          "type": "object",
+          "description": "Optional fields to thread forward under this step's result_path when the integration does not return them (e.g. caller-supplied values). Keys are result field names; values are path or constant expressions. Consumed by Stage 4 when merging Output."
+        },
         "result_path": {
           "type": "string",
           "description": "ASL ResultPath: JSONPath where this state's result is written on the execution state (e.g. '$.batch'). Use null-equivalent omission to keep prior state; '$' replaces the entire state. Allowed on Task, Parallel, Map, Pass, and Wait."
@@ -261,6 +299,7 @@
           "type": "string"
         }
       },
+
       "allOf": [
         {
           "if": {

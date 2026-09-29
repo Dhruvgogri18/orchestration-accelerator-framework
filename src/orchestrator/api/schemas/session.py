@@ -47,6 +47,10 @@ class MessageResponse(BaseModel):
     asl_graph_dot: str | None = None
     asl_validations: dict | None = None
     asl_error: str | None = None
+    # Which generator produced `asl`: "mechanical", "llm", or
+    # "mechanical_fallback" -- see asl_service.AslResult.source. None
+    # when no ASL has been generated yet (e.g. spec_placeholders pending).
+    asl_source: str | None = None
 
 
 class ApproveRequest(BaseModel):
@@ -88,6 +92,8 @@ class ApproveResponse(BaseModel):
     asl_graph_dot: str | None = None
     asl_validations: dict | None = None
     asl_error: str | None = None
+    # See MessageResponse.asl_source above.
+    asl_source: str | None = None
 
 
 class SpecPlaceholdersRequest(BaseModel):
@@ -116,6 +122,10 @@ class AslValidateResponse(BaseModel):
     asl: dict | None = None
     validations: dict
     graph_dot: str | None = None
+    # See MessageResponse.asl_source above. None for a client-supplied
+    # payload re-validated via POST /session/{id}/asl/validate, since
+    # that ASL didn't come from either generator this request.
+    asl_source: str | None = None
 
 
 class DeployRequest(BaseModel):

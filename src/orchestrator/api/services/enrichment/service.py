@@ -510,9 +510,14 @@ def _check_addition_validity(plan: Plan, spec: dict) -> str | None:
     return None
 
 
-# Keywords that justify inventing Parallel / Map. Without at least one
-# of these somewhere in the plan text, those types are treated as
-# unnecessary structural invention and rejected by the repair loop.
+# Signals that justify Parallel / Map. Without at least one text or
+# structural cue, those types are treated as unnecessary invention and
+# rejected by the repair loop.
+#
+# Text matching uses regex (not fixed multi-word phrases only) so that
+# natural variants still count, e.g. "each discovered item", "process
+# every document", "over the documents" — not just the exact strings
+# "each item" / "map over a list".
 _PARALLEL_HINTS = (
     "parallel",
     "concurrent",
@@ -520,17 +525,32 @@ _PARALLEL_HINTS = (
     "at the same time",
     "in parallel",
     "concurrently",
+    "in concurrent",
+    "fan-out",
+    "fan out",
 )
-_MAP_HINTS = (
-    "for each",
-    "for every",
-    "map over",
-    "iterate over",
-    "each item",
-    "each element",
-    "over a list",
-    "over the list",
-    "for all",
+# Iteration over a collection. Word-boundary aware; "each X" / "every X"
+# for any noun, not only a fixed list of nouns.
+_MAP_HINT_RE = re.compile(
+    r"(?:"
+    r"\bfor\s+each\b|"
+    r"\bfor\s+every\b|"
+    r"\bmap\s+over\b|"
+    r"\biterate\s+over\b|"
+    r"\biterate\s+through\b|"
+    r"\biteration\s+over\b|"
+    r"\beach\s+\w+\b|"
+    r"\bevery\s+\w+\b|"
+    r"\bper[\s-]?item\b|"
+    r"\bper[\s-]?document\b|"
+    r"\bper[\s-]?record\b|"
+    r"\bover\s+(?:a|the)\s+(?:list|items|documents|records|files|entries)\b|"
+    r"\bprocess\s+each\b|"
+    r"\bprocess\s+every\b|"
+    r"\bfor\s+all\b|"
+    r"\bindependently\b"  # common with concurrent per-item Map fan-out
+    r")",
+    re.IGNORECASE,
 )
 
 
@@ -544,14 +564,60 @@ def _plan_text_blob(plan: Plan) -> str:
     return " ".join(parts).lower()
 
 
-def _check_no_unjustified_nesting(plan: Plan, spec: dict) -> str | None:
-    """Reject Parallel/Map unless the plan text clearly signals concurrency
-    or iteration. Stops enrichment from inventing nesting to 'improve'
-    a linear plan.
+def _plan_allows_parallel(plan: Plan) -> bool:
+    """True when the thin plan justifies a Parallel state.
+
+    Text cues (concurrent / in parallel / …) OR structural: an
+    Orchestrator with two or more branches (fan-out arms). Branch count
+    is the same disambiguation used in PlanStep.component_type docs
+    (1 branch → Map body, >=2 → Parallel arms).
     """
     blob = _plan_text_blob(plan)
-    allows_parallel = any(h in blob for h in _PARALLEL_HINTS)
-    allows_map = any(h in blob for h in _MAP_HINTS)
+    if any(h in blob for h in _PARALLEL_HINTS):
+        return True
+    for s in plan.steps:
+        n_branches = len(s.branches or [])
+        if s.component_type == "Orchestrator" and n_branches >= 2:
+            return True
+        if n_branches >= 2:
+            # Multi-arm container even if taxonomy was omitted/wrong
+            return True
+    return False
+
+
+def _plan_allows_map(plan: Plan) -> bool:
+    """True when the thin plan justifies a Map state.
+
+    Text cues (for each / each <noun> / map over / …) OR structural: an
+    Orchestrator with exactly one branch (the per-item iterator body),
+    or any single branch whose condition labels iteration (e.g. "Each
+    discovered item").
+    """
+    blob = _plan_text_blob(plan)
+    if _MAP_HINT_RE.search(blob):
+        return True
+    for s in plan.steps:
+        branches = s.branches or []
+        if s.component_type == "Orchestrator" and len(branches) == 1:
+            return True
+        if len(branches) == 1:
+            cond = (branches[0].condition or "").lower()
+            if _MAP_HINT_RE.search(cond) or any(
+                k in cond for k in ("item", "document", "record", "file", "entry")
+            ):
+                return True
+    return False
+
+
+def _check_no_unjustified_nesting(plan: Plan, spec: dict) -> str | None:
+    """Reject Parallel/Map unless the plan text or structure clearly
+    signals concurrency or iteration. Stops enrichment from inventing
+    nesting to 'improve' a linear plan, without rejecting legitimate
+    Orchestrator → Map/Parallel shapes or natural-language variants
+    like 'each discovered item independently and concurrently'.
+    """
+    allows_parallel = _plan_allows_parallel(plan)
+    allows_map = _plan_allows_map(plan)
 
     for step in _iter_all_steps(spec.get("steps")):
         stype = step.get("type")
@@ -567,8 +633,8 @@ def _check_no_unjustified_nesting(plan: Plan, spec: dict) -> str | None:
             return (
                 f"Step '{sid}' has type Map, but the plan does not clearly "
                 f"describe iteration over a collection (e.g. 'for each', "
-                f"'map over a list'). Prefer sequential steps. Only use Map "
-                f"when the plan explicitly requires it."
+                f"'map over a list', 'each item'). Prefer sequential steps. "
+                f"Only use Map when the plan explicitly requires it."
             )
     return None
 

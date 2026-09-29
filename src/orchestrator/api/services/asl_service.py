@@ -912,18 +912,116 @@ def describe_placeholders(
     return details
 
 
+# Keys that are exactly a TODO_ token (or contain only such tokens) must
+# rewrite to a structural identifier, not a runtime data value.
+_STRUCTURAL_ARG_KEY_RE = re.compile(
+    r"^(--[A-Za-z0-9][A-Za-z0-9_\-]*|[A-Za-z][A-Za-z0-9_]*)$"
+)
+
+
+def _looks_like_data_value_not_identifier(s: str) -> bool:
+    """True when a string looks like a runtime data value, not a structural
+    field / argument name.
+
+    Used to refuse rewriting dict keys into values (e.g. replacing a
+    ``TODO_GLUE_JOB_ARG_SOURCE`` key with ``s3://bucket/key``), which
+    produces invalid ASL. Safe identifiers and conventional argument
+    names (``JobName``, ``--source_csv_uri``, ``TableName``) return False.
+    """
+    if not s or not isinstance(s, str):
+        return False
+    v = s.strip()
+    if not v:
+        return False
+    lower = v.lower()
+    if lower.startswith(("s3://", "http://", "https://", "arn:")):
+        return True
+    # Spaces or JSON/path punctuation → almost certainly a value
+    if any(ch in v for ch in (" ", "{", "}", "[", "]", '"', "'")):
+        return True
+    # JSONata / path expressions are values, not keys
+    if v.startswith("{%") or v.startswith("$"):
+        return True
+    return False
+
+
+def _is_safe_structural_key(original_key: str, candidate: str) -> bool:
+    """Whether rewriting ``original_key`` → ``candidate`` is safe.
+
+    - Always reject candidates that look like runtime data values.
+    - When the original key is itself a TODO_ placeholder (the dangerous
+      enrichment pattern), require the candidate to look like a real
+      argument/field name (``--foo_bar`` or ``CamelCase`` / ``snake_case``).
+    """
+    if _looks_like_data_value_not_identifier(candidate):
+        return False
+    # Original key is exactly one TODO_ token → only accept identifier-shaped
+    # replacements so "DynamoDB" or a URI cannot become the key by accident.
+    if _PLACEHOLDER_PATTERN.fullmatch(original_key.strip()):
+        return bool(_STRUCTURAL_ARG_KEY_RE.match(candidate.strip()))
+    return True
+
+
+# Whole-string shapes that are a REFERENCE to a single TODO_ token, not
+# text that happens to contain one -- used by apply_placeholder_overrides
+# to replace the entire expression (not splice a substring) when that
+# token gets filled in. Covers the token at every stage it can appear:
+#   pre-translation JSONPath  (workflow_spec parameters): "$.TODO_X"
+#   post-translation JSONata, wrapped   (generated ASL):  "{% $states.input.TODO_X %}"
+#   post-translation JSONata, unwrapped (e.g. a Condition
+#     string assembled without the {% %} delimiters yet): "$states.input.TODO_X"
+_FULL_TODO_REFERENCE_PATTERNS = [
+    re.compile(r"^\{%\s*\$states\.input\.(TODO_[A-Z0-9_]+)\s*%\}$"),
+    re.compile(r"^\$states\.input\.(TODO_[A-Z0-9_]+)$"),
+    re.compile(r"^\$\.(TODO_[A-Z0-9_]+)$"),
+]
+
+
 def apply_placeholder_overrides(node: Any, overrides: dict[str, str]) -> Any:
     """Deep-replace TODO_ tokens in a JSON tree (string values AND dict keys).
 
     Used after Stage 4 so user-supplied values from /approve overrides
     land in the locked ASL / workflow_spec — not only in the thin Plan
-    service/description fields. Enrichment routinely re-emits TODOs in
-    Parameters, Resource, and as DynamoDB Item attribute *keys*; without
-    key rewriting, Apply placeholders would leave those keys unresolved.
+    service/description fields. Enrichment may still emit TODOs in
+    Parameters, Resource, and (rarely) as DynamoDB Item attribute *keys*;
+    without key rewriting, Apply placeholders would leave those keys
+    unresolved.
+
+    Safety: a key is rewritten only when the replacement still looks like
+    a structural identifier (argument/field name). If the fill value looks
+    like runtime data (URI, ARN, JSONata, free text), or when a pure
+    TODO_ key would become a non-identifier, the key is left unchanged so
+    we never produce ASL such as ``{"s3://bucket/key": "..."}`` under
+    Glue Arguments.
+
+    Whole-expression TODO references get whole-expression replacement,
+    not a substring splice: a workflow_spec parameter written as
+    ``"--source-bucket.$": "$.TODO_SOURCE_S3_BUCKET"`` (pre-translation
+    JSONPath) or an already-generated ``"{% $states.input.TODO_SOURCE_S3_BUCKET %}"``
+    (post-translation JSONata) is a *reference* to the token, not text
+    containing it -- filling the token means "this whole expression is
+    now the literal value", not "splice the literal into the middle of
+    the path". A blind ``str.replace`` turns
+    ``{% $states.input.TODO_SOURCE_S3_BUCKET %}`` into
+    ``{% $states.input.my-input-bucket %}`` -- still-broken JSONata (an
+    unquoted hyphenated identifier), just with the corruption spliced
+    one level deeper instead of left bare. Matching the whole reference
+    first and substituting the entire node with the plain literal
+    produces the correct ``"my-input-bucket"`` / ``"s3://bucket/key"``
+    instead. Free text, ARNs, and plain non-path literal values (e.g.
+    ``"JobName": "TODO_JOB_NAME"``) don't match these patterns and keep
+    using the existing substring behavior below.
     """
     if not overrides:
         return node
     if isinstance(node, str):
+        stripped = node.strip()
+        for pattern in _FULL_TODO_REFERENCE_PATTERNS:
+            m = pattern.match(stripped)
+            if m:
+                token = m.group(1)
+                if token in overrides and overrides[token] is not None:
+                    return overrides[token]
         out = node
         for token, value in overrides.items():
             if token and value is not None:
@@ -936,8 +1034,22 @@ def apply_placeholder_overrides(node: Any, overrides: dict[str, str]) -> Any:
             if isinstance(k, str):
                 for token, value in overrides.items():
                     if token and value is not None and token in k:
-                        new_k = k.replace(token, value)
-            new_dict[new_k] = apply_placeholder_overrides(v, overrides)
+                        candidate = k.replace(token, value)
+                        if not _is_safe_structural_key(k, candidate):
+                            continue
+                        new_k = candidate
+            new_v = apply_placeholder_overrides(v, overrides)
+            # Path-style TODO under a '.$' key filled with a constant:
+            # strip the '.$' so generation does not re-wrap the constant
+            # as invalid JSONata (see _convert_parameters_to_arguments).
+            if (
+                isinstance(new_k, str)
+                and new_k.endswith(".$")
+                and isinstance(new_v, str)
+                and not _is_path_or_jsonata_expression(new_v)
+            ):
+                new_k = new_k[:-2]
+            new_dict[new_k] = new_v
         return new_dict
     if isinstance(node, list):
         return [apply_placeholder_overrides(v, overrides) for v in node]
@@ -1030,6 +1142,12 @@ class AslResult:
     validations: ValidationReport
     graph_dot: str
     generation_notes: list[str] = field(default_factory=list)
+    # Which generator actually produced `asl`: "mechanical" (the default,
+    # deterministic translator), "llm" (asl_generation/llm_service.py), or
+    # "mechanical_fallback" (LLM path failed under asl_generation_mode
+    # "llm_with_fallback" and the mechanical translator ran instead). Purely
+    # informational -- nothing downstream requires a particular value.
+    source: str = "mechanical"
 
 
 class AslGenerationError(Exception):
@@ -1119,6 +1237,93 @@ _TODO_TOKEN = re.compile(r"^TODO_[A-Z0-9_]+$")
 # "$varName" already a variable reference (not JSONPath $. or $$.)
 _VAR_REF = re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*$")
 
+# A "{% ... %}" wrapper whose contents look like a bare, unquoted literal
+# rather than an actual JSONata expression: no leading "$" (no state
+# input / context / workflow-variable reference), no operators, no
+# function calls, no string quoting -- just letters/digits/./_/-//:.
+# This is the shape a bucket name, table name, job name, etc. takes
+# when something upstream mistakenly wrapped a plain constant instead
+# of leaving it as a JSON literal. Real JSONata expressions always
+# involve at least one of "$", "(", quotes, or an operator, so this
+# pattern should never false-positive on legitimate JSONata.
+_BARE_LITERAL_INSIDE_WRAPPER = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_./:-]*$"
+)
+
+
+def _is_path_or_jsonata_expression(s: str) -> bool:
+    """True when ``s`` is a runtime path / JSONata expression, not a constant.
+
+    Used by Parameters→Arguments conversion so that a filled-in literal
+    under a leftover ``.$`` key (e.g. ``"--bucket.$": "my-input-bucket"``
+    after placeholder fill replaced ``$.TODO_BUCKET``) is emitted as a
+    plain JSON string, never wrapped in ``{% ... %}``.
+
+    Real expressions always start with ``$`` (JSONPath / JSONata / $var)
+    or ``{%``, or are an unresolved ``TODO_*`` token that must bind from
+    execution input. Everything else is a constant (bucket name, S3 URI,
+    table name, file key, etc.).
+    """
+    text = (s or "").strip()
+    if not text:
+        return False
+    if text.startswith("$") or text.startswith("{%"):
+        return True
+    if _TODO_TOKEN.match(text):
+        return True
+    return False
+
+
+def _unwrap_if_mistakenly_wrapped_literal(s: str) -> str:
+    """If ``s`` is a "{% ... %}" string whose inner text is a bare literal
+    (not a real JSONata expression), return the unwrapped plain string.
+    Otherwise return ``s`` unchanged.
+
+    This guards the "already wrapped, trust it" fast path in
+    ``_convert_value_to_jsonata`` / ``_convert_parameters_to_arguments``:
+    without it, a literal that some upstream stage incorrectly wrapped
+    (e.g. ``"{% my-input-bucket %}"``) sails through unchanged and
+    reaches AWS as invalid JSONata (the un-quoted hyphens parse as
+    subtraction). Genuine JSONata -- ``$states.input.x``, ``$errorInfo``,
+    ``'literal'``, function calls, comparisons -- never matches this
+    pattern and is left untouched.
+    """
+    text = s.strip()
+    if not (text.startswith("{%") and text.endswith("%}")):
+        return s
+    inner = text[2:-2].strip()
+    if inner and _BARE_LITERAL_INSIDE_WRAPPER.match(inner):
+        return inner
+    return s
+
+
+def sanitize_asl_literals(node: Any) -> Any:
+    """Recursively apply ``_unwrap_if_mistakenly_wrapped_literal`` to every
+    string in an already-built ASL document (any depth, any field).
+
+    ``_convert_value_to_jsonata`` / ``_convert_parameters_to_arguments``
+    only ever see this guard while translating a workflow_spec's
+    ``parameters`` into ``Arguments`` during ``generate_asl()``. A raw
+    ASL document handed to us directly -- e.g. a client-supplied payload
+    to ``/asl/validate``, or any other path that bypasses spec-to-ASL
+    translation -- never passes through that translator and so never
+    gets the fix, even though it's exactly the kind of mistakenly
+    wrapped literal (``"{% s3://bucket/key %}"``) the guard exists for.
+
+    Safe to call on any ASL tree, generated or hand-edited, generated-
+    then-re-validated, or freshly uploaded: genuine JSONata expressions
+    (anything with ``$``, quotes, operators, or function calls) are left
+    completely untouched by the underlying regex, so this is a no-op on
+    already-correct documents.
+    """
+    if isinstance(node, dict):
+        return {k: sanitize_asl_literals(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [sanitize_asl_literals(v) for v in node]
+    if isinstance(node, str):
+        return _unwrap_if_mistakenly_wrapped_literal(node)
+    return node
+
 # Workflow-variable names introduced by Catch Assign (and similar) during
 # the current generate_asl() call. Paths like $.errorInfo must become
 # $errorInfo (Assign variable), NOT $states.input.errorInfo — the latter
@@ -1187,7 +1392,198 @@ def _todo_to_input_expr(token: str) -> str:
     return _as_jsonata_string(f"$states.input.{token}")
 
 
-def _convert_value_to_jsonata(value: Any) -> Any:
+# JSONPath intrinsic helpers that enrichment still emits (workflow_spec stage
+# is allowed to use familiar States.* forms). Under QueryLanguage=JSONata
+# these must become real JSONata — leaving them as plain strings produces
+# invalid mixed ASL (the user's generated Output
+# ``{"output": "States.StringToJson($.Payload.body)"}`` is the canonical
+# failure mode).
+# Accept both JSONPath ($.Payload.body) and already-rooted JSONata
+# ($states.result.Payload.body) inside States.StringToJson(...).
+_STATES_STRING_TO_JSON = re.compile(
+    r"^States\.StringToJson\(\s*(\$[.\w\[\]'\"$]*)\s*\)$",
+    re.IGNORECASE,
+)
+# Same intrinsic embedded inside a larger JSONata body / {% %} string.
+_STATES_STRING_TO_JSON_EMBEDDED = re.compile(
+    r"States\.StringToJson\(\s*(\$[.\w\[\]'\"$]*)\s*\)",
+    re.IGNORECASE,
+)
+_STATES_FORMAT = re.compile(
+    r"^States\.Format\(\s*'((?:\\'|[^'])*)'\s*,\s*(.+)\s*\)$",
+    re.IGNORECASE,
+)
+
+
+def _path_with_root(path: str, root: str) -> str:
+    """Map a JSONPath ``$`` / ``$.foo`` reference onto a JSONata root.
+
+    ``root`` is typically ``$states.input`` (Arguments) or
+    ``$states.result`` (ResultSelector / Output reshape of a Task).
+    """
+    text = (path or "").strip()
+    if not text:
+        return root
+    if text == "$":
+        return root
+    if text.startswith("$."):
+        return root + "." + text[2:]
+    if text.startswith("$$."):
+        return "$states.context." + text[3:]
+    if text.startswith("$states"):
+        return text
+    return _jsonpath_to_jsonata_expr(text)
+
+
+def _format_args_to_jsonata(args_blob: str, root: str) -> list[str]:
+    """Split States.Format argument list into JSONata expression fragments."""
+    parts: list[str] = []
+    buf = ""
+    in_str = False
+    str_ch = ""
+    depth = 0
+    for ch in args_blob:
+        if in_str:
+            buf += ch
+            if ch == str_ch and not buf.endswith("\\" + str_ch):
+                in_str = False
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            str_ch = ch
+            buf += ch
+            continue
+        if ch == "(":
+            depth += 1
+            buf += ch
+            continue
+        if ch == ")":
+            depth -= 1
+            buf += ch
+            continue
+        if ch == "," and depth == 0:
+            parts.append(buf.strip())
+            buf = ""
+            continue
+        buf += ch
+    if buf.strip():
+        parts.append(buf.strip())
+    out: list[str] = []
+    for p in parts:
+        if (p.startswith("'") and p.endswith("'")) or (
+            p.startswith('"') and p.endswith('"')
+        ):
+            # String literal — keep single-quoted for JSONata
+            inner = p[1:-1].replace("\\'", "'")
+            out.append("'" + inner.replace("'", "\\'") + "'")
+        elif p.startswith("$"):
+            out.append(_path_with_root(p, root))
+        else:
+            # Bare number / identifier — quote as string if non-numeric
+            if re.match(r"^-?\d+(\.\d+)?$", p):
+                out.append(p)
+            else:
+                out.append("'" + p.replace("'", "\\'") + "'")
+    return out
+
+
+def _states_intrinsic_to_jsonata(expr: str, root: str = "$states.input") -> str | None:
+    """Translate a States.* intrinsic into a JSONata expression body.
+
+    Returns the bare JSONata body (no ``{% %}``) or None if ``expr`` is
+    not a recognized intrinsic. ``root`` selects whether ``$`` paths bind
+    to state input (Arguments) or task result (ResultSelector/Output).
+
+    Also rewrites *embedded* ``States.StringToJson(...)`` inside a larger
+    expression (e.g. a ``$merge([...])`` body) so mixed forms like
+    ``States.StringToJson($states.result.Payload.body)`` never reach AWS.
+    """
+    text = (expr or "").strip()
+    # Strip a single outer {% %} wrapper if present so we can match the body.
+    if text.startswith("{%") and text.endswith("%}"):
+        text = text[2:-2].strip()
+
+    m = _STATES_STRING_TO_JSON.match(text)
+    if m:
+        return "$parse(" + _path_with_root(m.group(1), root) + ")"
+    m = _STATES_FORMAT.match(text)
+    if m:
+        # States.Format('s3://{}/{}', 'bucket', $.doc)
+        # → JSONata string concat. For simple single-{} templates we
+        # substitute positionally; multi-{} uses successive & joins of
+        # the literal segments and args (good enough for S3 URI builds).
+        template = m.group(1).replace("\\'", "'")
+        args = _format_args_to_jsonata(m.group(2), root)
+        # Split template on '{}' placeholders
+        segments = template.split("{}")
+        pieces: list[str] = []
+        for i, seg in enumerate(segments):
+            if seg:
+                pieces.append("'" + seg.replace("'", "\\'") + "'")
+            if i < len(args):
+                pieces.append(args[i])
+        if not pieces:
+            return "''"
+        return " & ".join(pieces)
+
+    # Embedded States.StringToJson anywhere in the expression body.
+    if _STATES_STRING_TO_JSON_EMBEDDED.search(text):
+        def _repl(match: re.Match[str]) -> str:
+            return "$parse(" + _path_with_root(match.group(1), root) + ")"
+
+        return _STATES_STRING_TO_JSON_EMBEDDED.sub(_repl, text)
+    return None
+
+
+def _scrub_states_intrinsics_in_tree(
+    node: Any, *, path_root: str = "$states.result"
+) -> Any:
+    """Final pass: replace any residual States.StringToJson / States.Format
+    strings in an ASL tree with pure JSONata (including inside ``{% %}``).
+    """
+    if isinstance(node, dict):
+        return {
+            k: _scrub_states_intrinsics_in_tree(v, path_root=path_root)
+            for k, v in node.items()
+        }
+    if isinstance(node, list):
+        return [
+            _scrub_states_intrinsics_in_tree(v, path_root=path_root) for v in node
+        ]
+    if isinstance(node, str):
+        s = node.strip()
+        # Whole-string intrinsic (with or without {% %})
+        converted = _states_intrinsic_to_jsonata(s, root=path_root)
+        if converted is not None:
+            # If original was {% %}-wrapped or contains operators, keep wrap
+            if (s.startswith("{%") and s.endswith("%}")) or converted.startswith(
+                "$"
+            ) or " & " in converted or converted.startswith("$parse"):
+                # Prefer {% %} when original had it or result is an expression
+                if s.startswith("{%"):
+                    return _as_jsonata_string(converted)
+                # Output field that was a bare States.* string → wrap
+                if converted.startswith("$parse") or " & " in converted:
+                    return _as_jsonata_string(converted)
+                return _as_jsonata_string(converted)
+            return converted
+        # Embedded in a {% %} body that didn't fully match
+        if "States.StringToJson" in s or "States.Format" in s:
+            inner = s
+            wrapped = False
+            if inner.startswith("{%") and inner.endswith("%}"):
+                inner = inner[2:-2].strip()
+                wrapped = True
+            fixed = _states_intrinsic_to_jsonata(inner, root=path_root)
+            if fixed is not None:
+                return _as_jsonata_string(fixed) if wrapped or True else fixed
+        return node
+    return node
+
+
+def _convert_value_to_jsonata(
+    value: Any, *, path_root: str = "$states.input"
+) -> Any:
     """Recursively apply AWS JSONata value rules to Arguments / Output trees.
 
     Nested dicts are converted with the same key rules as top-level
@@ -1199,37 +1595,65 @@ def _convert_value_to_jsonata(value: Any) -> Any:
 
     would keep JSONPath ``.$`` keys under QueryLanguage=JSONata and
     fail purity validation / AWS deploy.
+
+    ``path_root`` selects where bare ``$`` / ``$.foo`` paths bind:
+    ``$states.input`` for Arguments (default), ``$states.result`` for
+    ResultSelector / task Output reshape.
     """
     if isinstance(value, list):
-        return [_convert_value_to_jsonata(v) for v in value]
+        return [_convert_value_to_jsonata(v, path_root=path_root) for v in value]
     if isinstance(value, dict):
         # Same key rewrite as _convert_parameters_to_arguments — nested
         # objects must not leak JSONPath '.$' suffixes.
-        return _convert_parameters_to_arguments(value)
+        return _convert_parameters_to_arguments(value, path_root=path_root)
     if isinstance(value, str):
         s = value.strip()
+        intrinsic = _states_intrinsic_to_jsonata(s, root=path_root)
+        if intrinsic is not None:
+            return _as_jsonata_string(intrinsic)
         if _TODO_TOKEN.match(s):
             return _as_jsonata_string(f"$states.input.{s}")
         if s.startswith("$.") or s.startswith("$$") or s == "$" or s == "$$":
-            return _as_jsonata_string(_jsonpath_to_jsonata_expr(s))
+            return _as_jsonata_string(_path_with_root(s, path_root))
         if s.startswith("{%") and s.endswith("%}"):
-            return s
+            # {% States.StringToJson(...) %} or {% $merge([..., States.StringToJson(...)]) %}
+            if "States.StringToJson" in s or "States.Format" in s:
+                fixed = _states_intrinsic_to_jsonata(s, root=path_root)
+                if fixed is not None:
+                    return _as_jsonata_string(fixed)
+            return _unwrap_if_mistakenly_wrapped_literal(s)
         if _VAR_REF.match(s):
             return _as_jsonata_string(s)
         return value
     return value
 
 
-def _convert_parameters_to_arguments(params: dict) -> dict:
+def _convert_parameters_to_arguments(
+    params: dict, *, path_root: str = "$states.input"
+) -> dict:
     """JSONPath Parameters object → JSONata Arguments object (AWS rules).
 
-    - Keys ending in '.$' become bare keys with {% path-expr %} values.
+    - Keys ending in '.$' become bare keys with {% path-expr %} values
+      **only when the value is actually a path / JSONata expression /
+      unresolved TODO_ token / States.* intrinsic**.
+    - If a ``.$`` key holds a plain constant (typical after placeholder
+      fill replaced ``$.TODO_X`` with a literal bucket name, S3 URI,
+      table name, etc.), the ``.$`` suffix is stripped and the value is
+      emitted as a plain JSON literal — never wrapped in ``{% ... %}``.
+      Wrapping constants produces invalid JSONata (``{% s3://... %}``,
+      ``{% my-input-bucket %}``) that AWS ValidateStateMachineDefinition
+      rejects.
     - Nested objects/arrays are walked recursively (same key rewrite
       at every depth, so ``Arguments.--source-bucket.$`` and
       ``Item.pk.S.$`` are both cleaned).
-    - TODO_ tokens and $. paths become {% $states.input... %} expressions.
+    - TODO_ tokens and $. paths become {% $states.input... %} expressions
+      (or ``path_root`` when converting ResultSelector → Output).
+    - ``States.StringToJson`` / ``States.Format`` are rewritten to
+      JSONata ``$parse`` / string concat so they never leak into pure
+      JSONata ASL as opaque strings.
     - Plain constants stay as plain JSON literals.
-    - Values that are already ``{% ... %}`` JSONata strings are kept.
+    - Values that are already ``{% ... %}`` JSONata strings are kept
+      (mistakenly-wrapped bare literals are unwrapped).
     """
     if not isinstance(params, dict):
         return params
@@ -1243,13 +1667,31 @@ def _convert_parameters_to_arguments(params: dict) -> dict:
                 # Already a JSONata expression (e.g. after a prior pass
                 # or enrichment wrote {% %} directly under a '.$' key).
                 if s.startswith("{%") and s.endswith("%}"):
-                    out[new_key] = s
+                    out[new_key] = _unwrap_if_mistakenly_wrapped_literal(s)
                 else:
-                    out[new_key] = _as_jsonata_string(_jsonpath_to_jsonata_expr(s))
+                    intrinsic = _states_intrinsic_to_jsonata(s, root=path_root)
+                    if intrinsic is not None:
+                        out[new_key] = _as_jsonata_string(intrinsic)
+                    elif _is_path_or_jsonata_expression(s):
+                        # Real path / $var / unresolved TODO_ → JSONata wrap.
+                        if _TODO_TOKEN.match(s):
+                            out[new_key] = _as_jsonata_string(
+                                f"$states.input.{s}"
+                            )
+                        else:
+                            out[new_key] = _as_jsonata_string(
+                                _path_with_root(s, path_root)
+                            )
+                    else:
+                        # Plain constant under a leftover '.$' key (filled
+                        # placeholder). Emit as JSON literal; do not wrap.
+                        out[new_key] = s
             else:
-                out[new_key] = _convert_value_to_jsonata(val)
+                out[new_key] = _convert_value_to_jsonata(
+                    val, path_root=path_root
+                )
         else:
-            out[key_s] = _convert_value_to_jsonata(val)
+            out[key_s] = _convert_value_to_jsonata(val, path_root=path_root)
     return out
 
 
@@ -1457,9 +1899,56 @@ def _apply_output_reshape(
     dropping the field on the other four types.
     """
     if step.get("output") is not None:
-        state["Output"] = _convert_value_to_jsonata(step["output"])
+        state["Output"] = _convert_value_to_jsonata(
+            step["output"], path_root="$states.result"
+        )
     elif step.get("result_selector") is not None:
-        state["Output"] = _convert_parameters_to_arguments(step["result_selector"])
+        # ResultSelector paths bind to the *task result* ($), not state
+        # input — convert with path_root=$states.result so
+        # States.StringToJson($.Payload.body) becomes
+        # {% $parse($states.result.Payload.body) %}.
+        selected = _convert_parameters_to_arguments(
+            step["result_selector"], path_root="$states.result"
+        )
+        rp = step.get("result_path")
+        if isinstance(rp, str) and rp.strip():
+            # ResultPath + ResultSelector together: reshape task result,
+            # then merge under the ResultPath key (JSONPath semantics).
+            key = rp.strip()
+            key = key[2:] if key.startswith("$.") else key.lstrip("$")
+            if key and re.match(r"^[A-Za-z0-9_]+$", key):
+                # Build {% $merge([$states.input, {"key": <selected>}]) %}
+                # where selected is an object of JSONata field expressions.
+                if isinstance(selected, dict):
+                    pairs = []
+                    for sk, sv in selected.items():
+                        if not re.match(r"^[A-Za-z0-9_]+$", str(sk)):
+                            continue
+                        if (
+                            isinstance(sv, str)
+                            and sv.startswith("{%")
+                            and sv.endswith("%}")
+                        ):
+                            body = sv[2:-2].strip()
+                        elif isinstance(sv, str):
+                            body = "'" + sv.replace("'", "\\'") + "'"
+                        else:
+                            continue
+                        pairs.append('"' + str(sk) + '": ' + body)
+                    inner = "{" + ", ".join(pairs) + "}"
+                    state["Output"] = (
+                        '{% $merge([$states.input, {"'
+                        + key
+                        + '": '
+                        + inner
+                        + "}]) %}"
+                    )
+                    notes.append(
+                        f"Step '{sid}': ResultPath '{rp}' + ResultSelector "
+                        f"→ JSONata Output $merge under '{key}'."
+                    )
+                    return
+        state["Output"] = selected
     elif isinstance(step.get("result_path"), str) and step["result_path"].strip():
         # JSONPath ResultPath "$.foo" MERGES the task result under "foo"
         # while preserving the rest of the input. A bare Output object
@@ -1486,7 +1975,11 @@ def _apply_output_reshape(
                     if not re.match(r"^[A-Za-z0-9_]+$", ek_s):
                         continue
                     expr = _jsonpath_to_jsonata_expr(str(ev))
-                    echo_pairs.append("'" + ek_s + "': " + expr)
+                    # Double-quoted string keys only. AWS JSONata rejects
+                    # unquoted identifier keys in object constructors
+                    # (UNSUPPORTED_JSONATA_EXPRESSION: "Reference to 'X'
+                    # at the top level is not supported").
+                    echo_pairs.append('"' + ek_s + '": ' + expr)
                 if echo_pairs:
                     result_expr = (
                         "$merge([$states.result, {"
@@ -1502,8 +1995,17 @@ def _apply_output_reshape(
                     result_expr = "$states.result"
             else:
                 result_expr = "$states.result"
+            # ResultPath semantics via $merge: task result under <key>,
+            # prior input preserved. Object keys MUST be double-quoted
+            # strings — unquoted identifiers are rejected by AWS with
+            # UNSUPPORTED_JSONATA_EXPRESSION ("Reference to 'X' at the
+            # top level is not supported").
             state["Output"] = (
-                "{% $merge([$states.input, {'" + key + "': " + result_expr + "}]) %}"
+                '{% $merge([$states.input, {"'
+                + key
+                + '": '
+                + result_expr
+                + "}]) %}"
             )
             notes.append(
                 f"Step '{sid}': mapped legacy result_path '{rp}' to "
@@ -1524,6 +2026,173 @@ def _apply_output_reshape(
                 f"Step '{sid}': mapped nested result_path '{rp}' to "
                 f"Assign.{leaf} + Output=$states.input."
             )
+
+
+# Parent-scoped fields referenced from inside a Map iterator that must be
+# injected via ItemSelector for Distributed Map (child executions do not
+# inherit the parent $states.input).
+_EXECUTION_INPUT_FIELD_RE = re.compile(
+    r"\$states\.context\.Execution\.Input\.([A-Za-z_][A-Za-z0-9_]*)"
+)
+# $states.input.foo inside iterator may be parent-scoped when ItemSelector
+# has not yet been applied; we only auto-inject common external keys when
+# Distributed and selector is missing — see _ensure_map_item_selector.
+_STATES_INPUT_FIELD_RE = re.compile(
+    r"\$states\.input\.([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _walk_strings(node: Any):
+    """Yield every string in a JSON-like tree."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for v in node.values():
+            yield from _walk_strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _walk_strings(v)
+
+
+def _collect_map_parent_field_refs(processor: dict) -> set[str]:
+    """Fields that the iterator reads from parent execution scope.
+
+    Distributed Map children only see ItemSelector output as
+    ``$states.input``. Collect:
+    - ``$states.context.Execution.Input.<field>``
+    - ``$states.input.<field>`` except the reserved item key ``item``
+      (those parent-scoped fields must be injected via ItemSelector).
+    """
+    found: set[str] = set()
+    for s in _walk_strings(processor):
+        for m in _EXECUTION_INPUT_FIELD_RE.finditer(s):
+            found.add(m.group(1))
+        for m in _STATES_INPUT_FIELD_RE.finditer(s):
+            field = m.group(1)
+            if field != "item":
+                found.add(field)
+    return found
+
+
+def _rewrite_map_iterator_parent_refs(node: Any) -> Any:
+    """Rewrite parent Execution.Input refs to ItemSelector-local input.
+
+    After ItemSelector injects ``run_id`` (etc.) onto the item payload,
+    the iterator should read ``$states.input.run_id`` rather than
+    ``$states.context.Execution.Input.run_id`` (unreliable in Distributed
+    child executions).
+    """
+    if isinstance(node, str):
+        return _EXECUTION_INPUT_FIELD_RE.sub(
+            r"$states.input.\1", node
+        )
+    if isinstance(node, dict):
+        return {k: _rewrite_map_iterator_parent_refs(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_rewrite_map_iterator_parent_refs(v) for v in node]
+    return node
+
+
+def _rewrite_bare_states_input_to_item(node: Any, item_key: str = "item") -> Any:
+    """When ItemSelector wraps the raw item under ``item``, fix path builds
+    that concatenated the whole ``$states.input`` (object/string item).
+
+    Matches JSONata fragments like ``& $states.input %}`` or
+    ``& $states.input)`` so ``'s3://bucket/' & $states.input`` becomes
+    ``'s3://bucket/' & $states.input.item``.
+    """
+    if isinstance(node, str):
+        # Only rewrite $states.input when it is not already a field access
+        # ($states.input.foo stays). Word-boundary after "input".
+        return re.sub(
+            r"\$states\.input(?!\s*\.|[A-Za-z0-9_])",
+            f"$states.input.{item_key}",
+            node,
+        )
+    if isinstance(node, dict):
+        return {
+            k: _rewrite_bare_states_input_to_item(v, item_key)
+            for k, v in node.items()
+        }
+    if isinstance(node, list):
+        return [_rewrite_bare_states_input_to_item(v, item_key) for v in node]
+    return node
+
+
+def _ensure_map_item_selector(
+    state: dict,
+    processor: dict,
+    *,
+    distributed: bool,
+    explicit_selector: dict | None,
+    notes: list[str],
+    sid: str,
+) -> dict:
+    """Ensure Distributed (and parent-ref) Maps get a safe ItemSelector.
+
+    Generic rules (any domain):
+    - Always place the raw Map item under a stable key ``item`` from
+      ``$states.context.Map.Item.Value`` when we synthesize a selector.
+    - Copy any parent fields the iterator needs
+      (``$states.context.Execution.Input.<field>``) into the selector from
+      parent ``$states.input.<field>``.
+    - Explicit enrichment ItemSelector wins for keys it defines; we only
+      fill gaps.
+    """
+    parent_fields = _collect_map_parent_field_refs(processor)
+    need_synthetic = distributed or bool(parent_fields)
+
+    if not need_synthetic and not explicit_selector:
+        return processor
+
+    # Start from explicit selector (converted) or empty
+    selector: dict[str, Any] = {}
+    if isinstance(explicit_selector, dict) and explicit_selector:
+        selector = dict(
+            _convert_parameters_to_arguments(
+                explicit_selector, path_root="$states.input"
+            )
+        )
+
+    # Ensure raw item is addressable under "item" when missing and we are
+    # synthesizing or Distributed (child input must be an object if we
+    # also inject parent fields).
+    has_item_value = any(
+        isinstance(v, str) and "Map.Item.Value" in v for v in selector.values()
+    )
+    if (distributed or parent_fields) and not has_item_value and "item" not in selector:
+        selector["item"] = "{% $states.context.Map.Item.Value %}"
+
+    for field in sorted(parent_fields):
+        if field not in selector:
+            selector[field] = _as_jsonata_string(f"$states.input.{field}")
+
+    if not selector:
+        return processor
+
+    state["ItemSelector"] = selector
+    # Iterator should read injected fields from $states.input
+    processor = _rewrite_map_iterator_parent_refs(processor)
+    if "item" in selector and has_item_value is False:
+        # Only rewrite bare $states.input → $states.input.item when we
+        # introduced the item wrapper (otherwise enrichment already shaped
+        # the item payload).
+        if not (isinstance(explicit_selector, dict) and explicit_selector):
+            processor = _rewrite_bare_states_input_to_item(processor, "item")
+        elif "item" in selector and not any(
+            isinstance(explicit_selector.get(k), str)
+            and "Map.Item.Value" in str(explicit_selector.get(k))
+            for k in explicit_selector
+            if k != "item"
+        ):
+            # Explicit selector lacked Map.Item.Value; we added item=
+            processor = _rewrite_bare_states_input_to_item(processor, "item")
+
+    notes.append(
+        f"Step '{sid}': ItemSelector ensures Map item + parent fields "
+        f"({', '.join(sorted(selector.keys()))}) reach the iterator."
+    )
+    return processor
 
 
 def _step_to_state(step: dict, notes: list[str]) -> dict:
@@ -1614,10 +2283,129 @@ def _step_to_state(step: dict, notes: list[str]) -> dict:
         )
         # ItemProcessor is the JSONata-era name; Iterator still accepted by
         # AWS for compatibility — emit ItemProcessor for pure JSONata ASL.
-        state["ItemProcessor"] = _build_branch_asl(iterator, notes)
+        processor = _build_branch_asl(iterator, notes)
+
+        # --- Distributed Map + fail-whole-map intent ---
+        # Prefer explicit workflow_spec fields; fall back to description /
+        # comment heuristics so plans that say "Distributed Map" or
+        # "fail the entire map if any item fails" still get the right ASL
+        # when enrichment omitted processor_config / tolerated_failure_*.
+        proc_cfg = step.get("processor_config") or step.get("ProcessorConfig")
+        text_blob = " ".join(
+            str(x or "")
+            for x in (
+                step.get("description"),
+                step.get("comment"),
+                step.get("Comment"),
+                sid,
+            )
+        ).lower()
+        distributed = (
+            step.get("distributed") is True
+            or str(step.get("distributed") or "").lower() in ("true", "1", "yes")
+            or str(step.get("map_mode") or "").upper() == "DISTRIBUTED"
+            or (
+                isinstance(proc_cfg, dict)
+                and str(
+                    proc_cfg.get("Mode") or proc_cfg.get("mode") or ""
+                ).upper()
+                == "DISTRIBUTED"
+            )
+            or bool(
+                re.search(
+                    r"\bdistributed\s+map\b|\bdistributed\b|"
+                    r"\bat\s+once\b|\bhigh\s+fan-?out\b|"
+                    r"\bfor\s+every\b.*\bat\s+once\b",
+                    text_blob,
+                )
+            )
+        )
+        fail_whole = (
+            step.get("tolerated_failure_count") == 0
+            or step.get("ToleratedFailureCount") == 0
+            or step.get("tolerated_failure_percentage") == 0
+            or step.get("ToleratedFailurePercentage") == 0
+            or bool(
+                re.search(
+                    r"fail(s|ing)?\s+(the\s+)?(entire\s+|whole\s+)?map|"
+                    r"fail(s|ing)?\s+if\s+any|"
+                    r"failure-?intolerant|"
+                    r"tolerated\s+failure\s*(count|percentage)?\s*[:=]?\s*0|"
+                    r"no\s+tolerated\s+failure|"
+                    r"stop\s+on\s+(first\s+)?(item\s+)?failure",
+                    text_blob,
+                )
+            )
+        )
+
+        if distributed or proc_cfg:
+            cfg: dict[str, Any] = {}
+            if isinstance(proc_cfg, dict):
+                mode = proc_cfg.get("Mode") or proc_cfg.get("mode")
+                exec_type = (
+                    proc_cfg.get("ExecutionType")
+                    or proc_cfg.get("execution_type")
+                )
+                if mode:
+                    cfg["Mode"] = str(mode).upper()
+                if exec_type:
+                    cfg["ExecutionType"] = str(exec_type).upper()
+            if distributed and "Mode" not in cfg:
+                cfg["Mode"] = "DISTRIBUTED"
+            if cfg.get("Mode") == "DISTRIBUTED" and "ExecutionType" not in cfg:
+                cfg["ExecutionType"] = "STANDARD"
+            if cfg:
+                processor["ProcessorConfig"] = cfg
+                if distributed:
+                    notes.append(
+                        f"Step '{sid}': Distributed Map "
+                        f"(ProcessorConfig.Mode=DISTRIBUTED)."
+                    )
+        state["ItemProcessor"] = processor
+
         max_concurrency = step.get("max_concurrency")
         if max_concurrency is not None:
             state["MaxConcurrency"] = max_concurrency
+
+        # Explicit tolerated-failure fields from the spec win; otherwise
+        # apply 0/0 when the plan text requires fail-whole-map.
+        for src, dest in (
+            ("tolerated_failure_count", "ToleratedFailureCount"),
+            ("tolerated_failure_percentage", "ToleratedFailurePercentage"),
+            ("ToleratedFailureCount", "ToleratedFailureCount"),
+            ("ToleratedFailurePercentage", "ToleratedFailurePercentage"),
+        ):
+            if step.get(src) is not None and dest not in state:
+                state[dest] = step[src]
+        if fail_whole:
+            state.setdefault("ToleratedFailureCount", 0)
+            state.setdefault("ToleratedFailurePercentage", 0)
+            notes.append(
+                f"Step '{sid}': fail-whole-map "
+                f"(ToleratedFailureCount/Percentage=0)."
+            )
+
+        # ItemSelector (JSONata) — reshape each item before the iterator.
+        # Explicit enrichment item_selector / parameters win for defined
+        # keys; Distributed Maps and iterators that read parent fields
+        # always get a safe selector (item + injected parent fields).
+        explicit_selector = (
+            step.get("item_selector")
+            or step.get("ItemSelector")
+            or step.get("parameters")
+        )
+        if not isinstance(explicit_selector, dict):
+            explicit_selector = None
+        processor = _ensure_map_item_selector(
+            state,
+            processor,
+            distributed=distributed,
+            explicit_selector=explicit_selector,
+            notes=notes,
+            sid=sid,
+        )
+        state["ItemProcessor"] = processor
+
         items_batcher = step.get("items_batcher")
         if items_batcher and items_batcher.get("max_items_per_batch"):
             state["ItemBatcher"] = {
@@ -2791,6 +3579,39 @@ def _validate_aws_constraints(asl: dict, report: ValidationReport) -> None:
                 )
                 ok = False
 
+        # Glue / Lambda-style nested Arguments: keys must be structural
+        # identifiers (JobName, --source_csv_uri, TableName, …), never
+        # runtime data values (s3://…, arn:…, free text). Catches the
+        # class of bug where a TODO_ token was used as a key and then
+        # filled with a URI or similar.
+        args = state.get("Arguments")
+        if isinstance(args, dict):
+            nested = args.get("Arguments")
+            keys_to_check: list[tuple[str, str]] = []
+            for k in args:
+                if k != "Arguments":
+                    keys_to_check.append((k, f"States.{name}.Arguments"))
+            if isinstance(nested, dict):
+                for k in nested:
+                    keys_to_check.append(
+                        (k, f"States.{name}.Arguments.Arguments")
+                    )
+            for key, path in keys_to_check:
+                if isinstance(key, str) and _looks_like_data_value_not_identifier(key):
+                    report.issues.append(
+                        ValidationIssue(
+                            "aws_constraints",
+                            "arguments_key_is_value",
+                            f"State '{name}' has an Arguments key that looks "
+                            f"like a data value ('{key[:80]}'), not a field or "
+                            f"job argument name. Argument keys must be "
+                            f"identifiers (e.g. JobName, --source_csv_uri, "
+                            f"TableName); put URIs/ARNs/values on the value side.",
+                            path,
+                        )
+                    )
+                    ok = False
+
         for field_name, minimum in (
             ("TimeoutSeconds", 1),
             ("HeartbeatSeconds", 1),
@@ -2943,12 +3764,20 @@ def call_aws_validate_state_machine(asl: dict) -> dict:
             definition=definition,
             type=sm_type,
         )
-        # AWS returns result = RESULT_PASS | RESULT_FAIL and diagnostics list.
+        # AWS ValidateStateMachineDefinition result field is OK | FAIL
+        # (API reference). Some SDK/docs shapes also use RESULT_PASS /
+        # RESULT_FAIL — accept both so a real pass is never mis-classified
+        # as failure (which was blocking deploy with a green
+        # "[extras/aws_validate_failed] OK" message).
         result = response.get("result") or response.get("Result")
         diagnostics = response.get("diagnostics") or response.get("Diagnostics") or []
-        passed = result in ("RESULT_PASS", "PASS", True) or (
-            result is None and not diagnostics
-        )
+        result_norm = (result if isinstance(result, str) else str(result or "")).upper()
+        passed = result_norm in (
+            "OK",
+            "PASS",
+            "RESULT_PASS",
+            "TRUE",
+        ) or (result is None and not diagnostics)
         # Some SDK shapes only return diagnostics on failure.
         if result is None and diagnostics:
             severity_fail = any(
@@ -2958,6 +3787,17 @@ def call_aws_validate_state_machine(asl: dict) -> dict:
                 if isinstance(d, dict)
             )
             passed = not severity_fail
+        # If AWS said OK/PASS but also returned ERROR diagnostics, trust
+        # the diagnostics (defensive).
+        if passed and diagnostics:
+            severity_fail = any(
+                (d.get("severity") or d.get("Severity") or "").upper()
+                in ("ERROR", "FATAL")
+                for d in diagnostics
+                if isinstance(d, dict)
+            )
+            if severity_fail:
+                passed = False
 
         return {
             "attempted": True,
@@ -3002,7 +3842,11 @@ def call_aws_validate_state_machine(asl: dict) -> dict:
 
 
 def _validate_extras(
-    asl: dict, spec: dict, report: ValidationReport, graph_dot: str
+    asl: dict,
+    spec: dict,
+    report: ValidationReport,
+    graph_dot: str,
+    include_aws_validate: bool = True,
 ) -> None:
     ok = True
 
@@ -3059,41 +3903,61 @@ def _validate_extras(
             )
             ok = False
 
-    # Live AWS ValidateStateMachineDefinition
-    details = call_aws_validate_state_machine(asl)
-    report.aws_details = details
-    if details.get("skipped") or not details.get("attempted"):
-        report.aws_validate_ok = None
-    elif details.get("passed"):
-        report.aws_validate_ok = True
-    elif details.get("soft_failure"):
-        # Env/credential problem — show in UI but do not fail extras/overall.
-        report.aws_validate_ok = None
-        report.issues.append(
-            ValidationIssue(
-                "extras",
-                "aws_validate_unavailable",
-                details.get("error") or "AWS validation unavailable (credentials/network)",
+    # Live AWS ValidateStateMachineDefinition. Skippable via
+    # include_aws_validate=False for callers that need the mechanical
+    # checks repeatedly (e.g. asl_generation/llm_service.py's repair
+    # loop) without hammering the AWS API once per retry -- see that
+    # module's docstring for why. aws_validate_ok stays None (its
+    # "not attempted" value) rather than True/False, since skipping is
+    # not the same as passing.
+    if include_aws_validate:
+        details = call_aws_validate_state_machine(asl)
+        report.aws_details = details
+        if details.get("skipped") or not details.get("attempted"):
+            report.aws_validate_ok = None
+        elif details.get("passed"):
+            report.aws_validate_ok = True
+        elif details.get("soft_failure"):
+            # Env/credential problem — show in UI but do not fail extras/overall.
+            report.aws_validate_ok = None
+            report.issues.append(
+                ValidationIssue(
+                    "extras",
+                    "aws_validate_unavailable",
+                    details.get("error") or "AWS validation unavailable (credentials/network)",
+                )
             )
-        )
-    else:
-        report.aws_validate_ok = False
-        msg = details.get("error") or details.get("result") or "AWS validation failed"
-        diagnostics = details.get("diagnostics") or []
-        if diagnostics:
-            diag_txt = "; ".join(
-                str(d.get("message") or d.get("Message") or d)
-                for d in diagnostics[:5]
+        else:
+            report.aws_validate_ok = False
+            msg = details.get("error") or details.get("result") or "AWS validation failed"
+            diagnostics = details.get("diagnostics") or []
+            if diagnostics:
+                parts: list[str] = []
+                for d in diagnostics[:8]:
+                    if not isinstance(d, dict):
+                        parts.append(str(d))
+                        continue
+                    severity = d.get("severity") or d.get("Severity") or ""
+                    code = d.get("code") or d.get("Code") or ""
+                    message = d.get("message") or d.get("Message") or str(d)
+                    loc = d.get("location") or d.get("Location") or ""
+                    bit = message
+                    if code:
+                        bit = f"[{code}] {bit}"
+                    if severity:
+                        bit = f"{severity}: {bit}"
+                    if loc:
+                        bit = f"{bit} @ {loc}"
+                    parts.append(bit)
+                msg = f"{msg}: " + "; ".join(parts)
+            report.issues.append(
+                ValidationIssue(
+                    "extras",
+                    "aws_validate_failed",
+                    msg,
+                )
             )
-            msg = f"{msg}: {diag_txt}"
-        report.issues.append(
-            ValidationIssue(
-                "extras",
-                "aws_validate_failed",
-                msg,
-            )
-        )
-        ok = False
+            ok = False
 
     report.extras_ok = ok
 
@@ -3102,9 +3966,17 @@ def _validate_extras(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-def validate_asl(asl: Any, spec: dict | None = None, graph_dot: str = "") -> ValidationReport:
+def validate_asl(
+    asl: Any,
+    spec: dict | None = None,
+    graph_dot: str = "",
+    include_aws_validate: bool = True,
+) -> ValidationReport:
     """Run all five validation groups. `spec` is required for groups 3 & 5
-    full fidelity; AWS live validation still runs when asl is valid JSON.
+    full fidelity; AWS live validation runs when asl is valid JSON, unless
+    include_aws_validate=False (used by repair loops that call this
+    repeatedly and don't want to hit the live AWS API on every attempt --
+    see asl_generation/llm_service.py).
     """
     report = ValidationReport()
     root = _validate_json_shape(asl, report)
@@ -3122,7 +3994,7 @@ def validate_asl(asl: Any, spec: dict | None = None, graph_dot: str = "") -> Val
     _validate_aws_constraints(root, report)
 
     if spec is not None:
-        _validate_extras(root, spec, report, graph_dot)
+        _validate_extras(root, spec, report, graph_dot, include_aws_validate)
     else:
         # No spec to round-trip against, but deploy-readiness still
         # applies -- same placeholder scan _validate_extras() would
@@ -3140,34 +4012,35 @@ def validate_asl(asl: Any, spec: dict | None = None, graph_dot: str = "") -> Val
             )
             ok = False
         report.extras_ok = ok
-        details = call_aws_validate_state_machine(root)
-        report.aws_details = details
-        if details.get("skipped") or not details.get("attempted"):
-            report.aws_validate_ok = None
-        elif details.get("passed"):
-            report.aws_validate_ok = True
-        elif details.get("soft_failure"):
-            report.aws_validate_ok = None
-            report.issues.append(
-                ValidationIssue(
-                    "extras",
-                    "aws_validate_unavailable",
-                    details.get("error")
-                    or "AWS validation unavailable (credentials/network)",
+        if include_aws_validate:
+            details = call_aws_validate_state_machine(root)
+            report.aws_details = details
+            if details.get("skipped") or not details.get("attempted"):
+                report.aws_validate_ok = None
+            elif details.get("passed"):
+                report.aws_validate_ok = True
+            elif details.get("soft_failure"):
+                report.aws_validate_ok = None
+                report.issues.append(
+                    ValidationIssue(
+                        "extras",
+                        "aws_validate_unavailable",
+                        details.get("error")
+                        or "AWS validation unavailable (credentials/network)",
+                    )
                 )
-            )
-        else:
-            report.aws_validate_ok = False
-            report.issues.append(
-                ValidationIssue(
-                    "extras",
-                    "aws_validate_failed",
-                    details.get("error")
-                    or details.get("result")
-                    or "AWS validation failed",
+            else:
+                report.aws_validate_ok = False
+                report.issues.append(
+                    ValidationIssue(
+                        "extras",
+                        "aws_validate_failed",
+                        details.get("error")
+                        or details.get("result")
+                        or "AWS validation failed",
+                    )
                 )
-            )
-            report.extras_ok = False
+                report.extras_ok = False
         if graph_dot and "digraph" not in graph_dot:
             report.extras_ok = False
 
@@ -3382,11 +4255,69 @@ def render_asl_graph(asl: dict) -> str:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def build_asl_from_spec(spec: dict) -> AslResult:
+def build_asl_from_spec(spec: dict, *, mode: str | None = None) -> AslResult:
     """Generate ASL, render graph, run all validations. Always returns a
     result object; check ``result.validations.ok`` before deploying.
+
+    ``mode`` overrides ``APISettings.asl_generation_mode`` for this one
+    call (mainly for tests/tooling); every real call site omits it and
+    gets whatever ASL_GENERATION_MODE is configured to. This is the ONLY
+    place that decides whether generation is deterministic or
+    LLM-driven -- every caller (session_service, the LangGraph nodes)
+    is unchanged and unaware of the choice. Default mode is
+    "mechanical", so existing behavior is unaffected unless
+    ASL_GENERATION_MODE is explicitly set.
     """
-    asl, notes = generate_asl(spec)
+    # Local import, matching this module's existing convention for
+    # config access (see _sfn_client / call_aws_validate_state_machine
+    # above) rather than importing it at module scope.
+    from orchestrator.api.config.settings import get_api_settings
+
+    effective_mode = mode or get_api_settings().asl_generation_mode
+    source = "mechanical"
+
+    if effective_mode in ("llm", "llm_with_fallback"):
+        # Imported here, not at module scope: asl_generation/llm_service.py
+        # imports THIS module back (for validate_asl/sanitize_asl_literals/
+        # render_asl_graph), so a top-level import here would be circular.
+        from orchestrator.api.services.asl_generation.llm_service import (
+            AslLlmGenerationError,
+            generate_asl_via_llm,
+        )
+
+        try:
+            asl, notes = generate_asl_via_llm(spec)
+            source = "llm"
+        except AslLlmGenerationError as exc:
+            if effective_mode == "llm_with_fallback":
+                asl, notes = generate_asl(spec)
+                notes = [
+                    f"LLM ASL generation failed, fell back to the mechanical "
+                    f"translator ({exc}).",
+                    *notes,
+                ]
+                source = "mechanical_fallback"
+            else:
+                raise AslGenerationError(str(exc)) from exc
+    else:
+        asl, notes = generate_asl(spec)
+    # Final, unconditional normalization pass over the WHOLE generated
+    # document -- not just the values that flowed through
+    # _convert_parameters_to_arguments. generate_asl() assembles a state
+    # from several independent branches (Task Arguments, Pass Output,
+    # Wait Seconds, Choice Condition, Map Items, Catch Assign, ...), and
+    # any branch that sets a field from spec data without routing it
+    # through _convert_value_to_jsonata would silently skip the
+    # mistakenly-wrapped-literal guard. Running sanitize_asl_literals
+    # here, once, over the fully assembled tree makes that guarantee
+    # structural instead of depending on every branch remembering to
+    # call the per-value guard correctly. No-op on a document that's
+    # already correct (see _BARE_LITERAL_INSIDE_WRAPPER / the guard's
+    # own docstring for why real JSONata is never touched).
+    asl = sanitize_asl_literals(asl)
+    # Scrub residual States.StringToJson / States.Format (including
+    # embedded inside $merge Output expressions).
+    asl = _scrub_states_intrinsics_in_tree(asl, path_root="$states.result")
     graph_dot = render_asl_graph(asl)
     report = validate_asl(asl, spec=spec, graph_dot=graph_dot)
     return AslResult(
@@ -3394,4 +4325,5 @@ def build_asl_from_spec(spec: dict) -> AslResult:
         validations=report,
         graph_dot=graph_dot,
         generation_notes=notes,
+        source=source,
     )

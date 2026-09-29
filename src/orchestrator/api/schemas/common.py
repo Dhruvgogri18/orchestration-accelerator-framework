@@ -74,8 +74,7 @@ ComponentType = Literal[
     "Terminal",
     "Other",
 ]
-"""LLM-assigned taxonomy classification for a step (Prompt2DAG-style,
-see schemas/pipeline_analysis.py). Lives here, not in
+"""LLM-assigned taxonomy classification for a step. Lives here, not in
 schemas/pipeline_analysis.py, so that `PlanStep` below can carry it as
 a first-class field without a circular import (pipeline_analysis.py
 already imports PlanBranch from this module).

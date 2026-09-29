@@ -33,6 +33,7 @@ from orchestrator.api.services.asl_service import (
     describe_placeholders,
     find_asl_placeholders,
     render_asl_graph,
+    sanitize_asl_literals,
     validate_asl,
     validate_placeholder_value,
 )
@@ -328,6 +329,7 @@ def _message_response_from_turn_state(state: dict) -> MessageResponse:
         asl_graph_dot = (nested.get("asl_graph_dot") if nested else None) or state.get(
             "asl_graph_dot"
         )
+        asl_source = (nested.get("asl_source") if nested else None) or state.get("asl_source")
 
         return MessageResponse(
             status="ready",
@@ -353,6 +355,7 @@ def _message_response_from_turn_state(state: dict) -> MessageResponse:
             asl_graph_dot=asl_graph_dot,
             asl_validations=(nested.get("asl_validations") if nested else None)
             or state.get("asl_validations"),
+            asl_source=asl_source,
             asl_error=(nested.get("asl_error") if nested else None)
             or state.get("asl_error"),
         )
@@ -374,11 +377,16 @@ def _message_response_from_turn_state(state: dict) -> MessageResponse:
     )
 
 
-def _run_asl_stage(workflow_spec: dict) -> tuple[dict | None, str | None, dict | None, str | None]:
+def _run_asl_stage(
+    workflow_spec: dict,
+) -> tuple[dict | None, str | None, dict | None, str | None, str | None]:
     """Stage 4: workflow_spec -> ASL + validations + graph.
 
-    Returns (asl, graph_dot, validations_dict, error_message).
-    Never raises — ASL failures are reported alongside a successful approval.
+    Returns (asl, graph_dot, validations_dict, source, error_message).
+    `source` is result.source ("mechanical" / "llm" / "mechanical_fallback"
+    -- see asl_service.AslResult) so callers can surface which generator
+    actually ran, e.g. after setting ASL_GENERATION_MODE. Never raises —
+    ASL failures are reported alongside a successful approval.
     """
     try:
         with llm_stage("asl_generation"):
@@ -387,17 +395,18 @@ def _run_asl_stage(workflow_spec: dict) -> tuple[dict | None, str | None, dict |
             result.asl,
             result.graph_dot,
             result.validations.to_dict(),
+            result.source,
             None,
         )
     except AslGenerationError as exc:
-        return None, None, None, str(exc)
+        return None, None, None, None, str(exc)
     except Exception as exc:  # noqa: BLE001 — surface unexpected translator bugs
-        return None, None, None, f"ASL generation failed unexpectedly: {exc}"
+        return None, None, None, None, f"ASL generation failed unexpectedly: {exc}"
 
 
 def _finalize_workflow_spec(
     workflow_spec: dict,
-) -> tuple[dict | None, str | None, dict | None, str | None, list[str]]:
+) -> tuple[dict | None, str | None, dict | None, str | None, str | None, list[str]]:
     """The gate between Stage 3.5 (enrichment) and Stage 4 (ASL
     generation): scan the WHOLE workflow_spec for TODO_ placeholders
     before generating anything from it.
@@ -418,16 +427,16 @@ def _finalize_workflow_spec(
     specific logic, so it works identically against a workflow_spec
     dict.
 
-    Returns (asl, graph_dot, validations_dict, asl_error,
+    Returns (asl, graph_dot, validations_dict, source, asl_error,
     spec_placeholders). When spec_placeholders is non-empty, the first
-    four are always (None, None, None, None) -- ASL generation is
+    five are always (None, None, None, None, None) -- ASL generation is
     skipped entirely, not attempted-and-reported.
     """
     spec_placeholders = find_asl_placeholders(workflow_spec)
     if spec_placeholders:
-        return None, None, None, None, spec_placeholders
-    asl, graph_dot, validations, asl_error = _run_asl_stage(workflow_spec)
-    return asl, graph_dot, validations, asl_error, []
+        return None, None, None, None, None, spec_placeholders
+    asl, graph_dot, validations, source, asl_error = _run_asl_stage(workflow_spec)
+    return asl, graph_dot, validations, source, asl_error, []
 
 
 def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
@@ -463,6 +472,7 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
     asl: dict | None = None
     asl_graph_dot: str | None = None
     asl_validations: dict | None = None
+    asl_source: str | None = None
     asl_error: str | None = None
     spec_placeholders: list[str] = []
     start_request(session_id=session_id)
@@ -470,7 +480,7 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
         result = enrich_plan(resolved_plan)
         if result.status == "complete":
             workflow_spec = result.spec
-            asl, asl_graph_dot, asl_validations, asl_error, spec_placeholders = (
+            asl, asl_graph_dot, asl_validations, asl_source, asl_error, spec_placeholders = (
                 _finalize_workflow_spec(workflow_spec)
             )
         else:  # needs_clarification -- pause, persist state for answer endpoint
@@ -499,6 +509,7 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
         "asl": asl,
         "asl_graph_dot": asl_graph_dot,
         "asl_validations": asl_validations,
+        "asl_source": asl_source,
         "asl_error": asl_error,
     }
     if enrichment_question is not None:
@@ -520,6 +531,7 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
         asl=asl,
         asl_graph_dot=asl_graph_dot,
         asl_validations=asl_validations,
+        asl_source=asl_source,
         asl_error=asl_error,
     )
 
@@ -543,6 +555,7 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
     asl: dict | None = None
     asl_graph_dot: str | None = None
     asl_validations: dict | None = None
+    asl_source: str | None = None
     asl_error: str | None = None
     spec_placeholders: list[str] = []
     start_request(session_id=session_id)
@@ -552,7 +565,7 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
         )
         if result.status == "complete":
             workflow_spec = result.spec
-            asl, asl_graph_dot, asl_validations, asl_error, spec_placeholders = (
+            asl, asl_graph_dot, asl_validations, asl_source, asl_error, spec_placeholders = (
                 _finalize_workflow_spec(workflow_spec)
             )
         else:
@@ -574,6 +587,7 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
     locked["asl"] = asl
     locked["asl_graph_dot"] = asl_graph_dot
     locked["asl_validations"] = asl_validations
+    locked["asl_source"] = asl_source
     locked["asl_error"] = asl_error
     if enrichment_question is not None:
         locked["enrichment_pending"] = {
@@ -596,6 +610,7 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
         asl=asl,
         asl_graph_dot=asl_graph_dot,
         asl_validations=asl_validations,
+        asl_source=asl_source,
         asl_error=asl_error,
     )
 
@@ -654,10 +669,11 @@ def fill_spec_placeholders(session_id: str, overrides: dict[str, str]) -> Approv
     asl: dict | None = None
     asl_graph_dot: str | None = None
     asl_validations: dict | None = None
+    asl_source: str | None = None
     asl_error: str | None = None
     start_request(session_id=session_id)
     try:
-        asl, asl_graph_dot, asl_validations, asl_error, spec_placeholders = (
+        asl, asl_graph_dot, asl_validations, asl_source, asl_error, spec_placeholders = (
             _finalize_workflow_spec(updated_spec)
         )
     finally:
@@ -674,6 +690,7 @@ def fill_spec_placeholders(session_id: str, overrides: dict[str, str]) -> Approv
     locked["asl"] = asl
     locked["asl_graph_dot"] = asl_graph_dot
     locked["asl_validations"] = asl_validations
+    locked["asl_source"] = asl_source
     locked["asl_error"] = asl_error
     session_store.set_locked_spec(session_id, locked)
 
@@ -690,6 +707,7 @@ def fill_spec_placeholders(session_id: str, overrides: dict[str, str]) -> Approv
         asl=asl,
         asl_graph_dot=asl_graph_dot,
         asl_validations=asl_validations,
+        asl_source=asl_source,
         asl_error=asl_error,
     )
 
@@ -724,12 +742,13 @@ def generate_asl_for_session(session_id: str) -> AslValidateResponse:
             "POST /session/{id}/spec/placeholders before generating ASL."
         )
 
-    asl, graph_dot, validations, error = _run_asl_stage(spec)
+    asl, graph_dot, validations, source, error = _run_asl_stage(spec)
     if error:
         # Still persist whatever we can; validations may be partial.
         locked["asl"] = asl
         locked["asl_graph_dot"] = graph_dot
         locked["asl_validations"] = validations
+        locked["asl_source"] = source
         locked["asl_error"] = error
         session_store.set_locked_spec(session_id, locked)
         return AslValidateResponse(
@@ -740,14 +759,18 @@ def generate_asl_for_session(session_id: str) -> AslValidateResponse:
                 "errors": [{"group": "generation", "code": "error", "message": error}],
             },
             graph_dot=graph_dot,
+            asl_source=source,
         )
 
     locked["asl"] = asl
     locked["asl_graph_dot"] = graph_dot
     locked["asl_validations"] = validations
+    locked["asl_source"] = source
     locked["asl_error"] = None
     session_store.set_locked_spec(session_id, locked)
-    return AslValidateResponse(asl=asl, validations=validations or {}, graph_dot=graph_dot)
+    return AslValidateResponse(
+        asl=asl, validations=validations or {}, graph_dot=graph_dot, asl_source=source
+    )
 
 
 def revalidate_asl_payload(
@@ -758,15 +781,31 @@ def revalidate_asl_payload(
     """
     spec: dict | None = None
     stored_asl: dict | None = None
+    stored_source: str | None = None
     if session_id:
         session = get_session_or_raise(session_id)
         locked = session.locked_spec or {}
         spec = locked.get("workflow_spec")
         stored_asl = locked.get("asl")
+        stored_source = locked.get("asl_source")
 
     target = asl if asl is not None else stored_asl
     if target is None:
         raise NoWorkflowSpecError("No ASL provided and none stored on the session.")
+    # asl_source only makes sense for the stored ASL (we know what
+    # generated it); a client-supplied payload's origin is unknown to us.
+    source = stored_source if asl is None else None
+
+    # Client-supplied ASL (the ``asl`` branch above) never passed through
+    # generate_asl()'s translator, so it never got the "mistakenly wrapped
+    # literal" fix -- e.g. a hand-edited "{% s3://bucket/key %}" that
+    # should just be a plain string. Apply the same fix here so a re-
+    # validated payload is held to the same bar as a freshly generated
+    # one, instead of failing opaquely at AWS's live validator with no
+    # actionable message. No-op on values that are already correct
+    # (stored_asl, or an asl payload with no mistaken wraps).
+    if isinstance(target, dict):
+        target = sanitize_asl_literals(target)
 
     graph_dot = render_asl_graph(target) if isinstance(target, dict) else ""
     report = validate_asl(target, spec=spec, graph_dot=graph_dot)
@@ -774,6 +813,7 @@ def revalidate_asl_payload(
         asl=target if isinstance(target, dict) else None,
         validations=report.to_dict(),
         graph_dot=graph_dot or None,
+        asl_source=source,
     )
 
 

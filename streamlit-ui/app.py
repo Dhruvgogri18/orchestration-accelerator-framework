@@ -2969,7 +2969,7 @@ def render_spec_approved(message_id, artifact, chat_id):
                 st.success("ASL validations passed.")
             elif ok is False:
                 st.warning(f"ASL has {len(errs)} validation issue(s).")
-                for e in errs[:8]:
+                for e in errs[:12]:
                     if isinstance(e, dict):
                         st.markdown(
                             f"- `[{e.get('group')}/{e.get('code')}]` {e.get('message')}"
@@ -2985,6 +2985,14 @@ def render_spec_approved(message_id, artifact, chat_id):
                 st.caption(
                     "AWS ValidateStateMachine reported issues (see errors above)."
                 )
+                # Surface raw diagnostics so the exact AWS message is visible
+                # even if it was truncated in the issues list.
+                diags = aws.get("diagnostics") or []
+                if diags:
+                    with st.expander("AWS diagnostics (raw)", expanded=False):
+                        st.json(diags)
+                elif aws.get("error"):
+                    st.caption(f"AWS error: {aws.get('error')}")
 
         # --- ASL graph (console-style) ---
         # Prefer the API-returned DOT (includes End node for terminals). Fall back
