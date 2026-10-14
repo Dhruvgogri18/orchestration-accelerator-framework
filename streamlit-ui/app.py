@@ -1237,21 +1237,25 @@ div[data-testid="stSpinner"] {
 
 EXAMPLE_PROMPTS = [
     (
-        "Build a workflow that reads a CSV file from S3, transforms it with a "
-        "Glue job, and loads the result into a database. If any step fails, "
-        "send a failure alert to our ops SNS topic. Otherwise, publish a "
-        "success message."
+        "Build an AWS Step Functions workflow that runs a single AWS Glue job "
+        "to read a CSV file from S3, transform the data, and load the "
+        "transformed result into a DynamoDB table. If the Glue job fails, send "
+        "a failure alert to the ops SNS topic; otherwise, publish a success "
+        "message."
     ),
     (
-        "Create a workflow where a request is submitted, then reviewed. If "
-        "it's approved, run the approval action and publish a success "
-        "notification. If it's rejected, publish a failure alert."
+        "Create a workflow for an employee leave request. Submit the leave "
+        "request for review. If the request is approved, record the approval "
+        "and send a confirmation notification. If the request is rejected, "
+        "send a rejection notification."
     ),
     (
-        "Design a pipeline that validates the input, then runs two independent "
-        "processing jobs at the same time, waits for both to finish, checks "
-        "data quality on the combined output, and finally persists the "
-        "results. Send a failure alert if anything goes wrong."
+        "Design a data processing pipeline that first validates the input "
+        "data. Once validation succeeds, run two independent processing jobs "
+        "in parallel and wait for both to complete. Then, in a single final "
+        "processing step, combine the outputs, validate the combined data for "
+        "quality, and persist the validated results to DynamoDB. If any "
+        "processing or validation step fails, send a failure alert."
     ),
 ]
 
@@ -1894,6 +1898,20 @@ _EXTRACTION_STEPS: list[tuple[str, str]] = [
 _APPROVE_STEPS: list[tuple[str, str]] = [
     ("enrichment", "Filling in the remaining details"),
     ("asl_generation", "Generating the Step Functions definition"),
+    ("asl_validation", "Validating the generated workflow"),
+]
+
+# Apply placeholders → regenerate ASL (no re-planning).
+_FILL_PLACEHOLDER_STEPS: list[tuple[str, str]] = [
+    ("apply_placeholders", "Applying your values to the workflow"),
+    ("asl_generation", "Generating the Step Functions definition"),
+    ("asl_validation", "Validating the generated workflow"),
+]
+
+# Explicit "Generate ASL" / re-validate from a locked spec.
+_ASL_STEPS: list[tuple[str, str]] = [
+    ("asl_generation", "Generating the Step Functions definition"),
+    ("asl_validation", "Validating the generated workflow"),
 ]
 
 _STAGE_CHECK_ICON = (
@@ -1907,9 +1925,19 @@ _STAGE_DOT_ICON = '<span class="stage-icon"><span class="stage-dot"></span></spa
 
 def _stage_steps_for_chat(chat_id) -> list[tuple[str, str]]:
     """Which step checklist applies to whatever request is in flight for
-    this chat: approve / answer-enrichment share one (enrichment -> ASL),
-    everything else (send message / reject) is the extraction pipeline.
+    this chat. Fill-placeholders and ASL regen use ASL-backend steps;
+    approve / enrichment use enrichment → ASL; everything else uses the
+    extraction pipeline.
     """
+    pending_fill = st.session_state.get("pending_fill_placeholders")
+    if pending_fill and pending_fill.get("chat_id") == chat_id:
+        return _FILL_PLACEHOLDER_STEPS
+    pending_gen = st.session_state.get("pending_generate_asl")
+    if pending_gen and pending_gen.get("chat_id") == chat_id:
+        return _ASL_STEPS
+    pending_reval = st.session_state.get("pending_revalidate_asl")
+    if pending_reval and pending_reval.get("chat_id") == chat_id:
+        return _ASL_STEPS
     pending_approve = st.session_state.get("pending_approve")
     if pending_approve and pending_approve.get("chat_id") == chat_id:
         return _APPROVE_STEPS
@@ -2567,6 +2595,181 @@ def _find_todo_placeholders_in_value(node, seen=None) -> list[str]:
     return seen
 
 
+def _humanize_todo_token_local(token: str) -> str:
+    """TODO_SUCCESS_TOPIC_ARN → 'Success topic ARN' (UI-side fallback)."""
+    raw = (token or "").strip()
+    if raw.upper().startswith("TODO_"):
+        raw = raw[5:]
+    parts = [p for p in raw.replace("-", "_").split("_") if p]
+    acronyms = {
+        "ARN", "AWS", "S3", "SNS", "SQS", "IAM", "API", "URL", "URI", "ID",
+        "ETL", "CSV", "JSON", "DB", "RDS", "ECS", "EKS", "VPC", "KMS", "SES",
+        "SFN",
+    }
+    words = []
+    for i, w in enumerate(parts):
+        up = w.upper()
+        if up in acronyms:
+            words.append(up)
+        elif i == 0:
+            words.append(w.capitalize())
+        else:
+            words.append(w.lower())
+    return " ".join(words) if words else token
+
+
+def _enrich_placeholder_details(
+    tokens: list[str],
+    existing: dict,
+    workflow_spec,
+    plan,
+) -> dict[str, str]:
+    """Ensure every fill-form token has a useful description.
+
+    Prefer API-provided placeholder_details. When a token is missing or
+    only has a bare humanized name (no step/service context), rebuild
+    from workflow_spec / plan metadata so the form still shows what the
+    value is for and which step uses it.
+    """
+    import json as _json
+    import re as _re
+
+    details = {str(k): str(v) for k, v in (existing or {}).items()}
+    if not tokens:
+        return details
+
+    humanized = {t: _humanize_todo_token_local(t) for t in tokens if t}
+
+    def _is_weak(text: str, token: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return True
+        # Bare humanized token name only — no step/service context.
+        if t == humanized.get(token):
+            return True
+        if t.lower() == humanized.get(token, "").lower():
+            return True
+        return False
+
+    need = [t for t in tokens if t and _is_weak(details.get(t, ""), t)]
+    if not need:
+        return details
+
+    need_set = set(need)
+    components: list = []
+    if isinstance(workflow_spec, dict):
+        components = list(
+            workflow_spec.get("components")
+            or workflow_spec.get("steps")
+            or []
+        )
+        # Parameters with explicit descriptions
+        for param in workflow_spec.get("parameters") or []:
+            if not isinstance(param, dict):
+                continue
+            name = str(param.get("name") or "")
+            if name not in need_set:
+                continue
+            desc = (param.get("description") or "").strip()
+            cid = param.get("component_id")
+            bits = []
+            if desc:
+                bits.append(desc)
+            if cid:
+                bits.append(f"Used by step `{cid}`.")
+            if bits:
+                details[name] = " ".join(bits)
+                need_set.discard(name)
+
+        for integ in workflow_spec.get("integrations") or []:
+            if not isinstance(integ, dict):
+                continue
+            conn = str(integ.get("connection_details") or "")
+            matched = [t for t in need_set if t in conn]
+            if not matched:
+                continue
+            label = (integ.get("name") or "").strip()
+            service = (integ.get("service") or "").strip()
+            comps = integ.get("components") or []
+            parts = []
+            if label:
+                parts.append(label)
+            elif service:
+                parts.append(f"{service} resource")
+            if isinstance(comps, list) and comps:
+                parts.append(
+                    "Used by: " + ", ".join(f"`{c}`" for c in comps[:4]) + "."
+                )
+            text = " ".join(parts).strip()
+            if text:
+                for t in matched:
+                    details[t] = text
+                    need_set.discard(t)
+
+    def _clause_connector(clause: str) -> str:
+        c = (clause or "").lstrip()
+        if not c:
+            return ""
+        first = c.split(None, 1)[0].lower() if c else ""
+        if first in {
+            "if", "when", "whenever", "after", "before", "once", "while",
+            "unless", "until", "because", "since", "although", "though",
+            "where", "wherever", "as",
+        }:
+            return f" {c}"
+        return f" to {c}"
+
+    def _scrub_todos(text: str) -> str:
+        return _re.sub(
+            r"\bTODO_[A-Z0-9_]+\b",
+            lambda m: _humanize_todo_token_local(m.group(0)),
+            text or "",
+        )
+
+    # Walk components / steps for token usage
+    def _walk_components(comps: list) -> None:
+        for comp in comps:
+            if not isinstance(comp, dict):
+                continue
+            cid = str(comp.get("id") or comp.get("name") or "")
+            raw_desc = (comp.get("description") or "").strip()
+            cdesc = _scrub_todos(raw_desc)
+            resource = str(comp.get("resource") or comp.get("service") or "")
+            service = str(comp.get("service") or "")
+            params_blob = _json.dumps(comp.get("parameters") or {}, default=str)
+            step_ref = f"step `{cid}`" if cid else "this step"
+            for t in list(need_set):
+                if not (
+                    t == resource.strip()
+                    or t in params_blob
+                    or t in service
+                    or t in raw_desc
+                ):
+                    continue
+                clause = cdesc.rstrip(".") if cdesc else ""
+                if clause and len(clause) > 1:
+                    clause = clause[0].lower() + clause[1:]
+                hum = humanized.get(t, t)
+                if clause:
+                    details[t] = f"{hum} used by {step_ref}{_clause_connector(clause)}."
+                else:
+                    details[t] = f"{hum} used by {step_ref}."
+                need_set.discard(t)
+
+    if components:
+        _walk_components(components)
+
+    if need_set and isinstance(plan, dict):
+        _walk_components(list(plan.get("steps") or []))
+
+    # Final fallback
+    for t in need:
+        if _is_weak(details.get(t, ""), t):
+            details[t] = humanized.get(t, t)
+
+    return details
+
+
 def _latest_spec_approved_message_id(chat_id):
     """Return the message id of the newest spec_approved artifact in this chat."""
     messages = get_messages(chat_id)
@@ -2790,6 +2993,15 @@ def render_spec_approved(message_id, artifact, chat_id):
             ph_details = artifact.get("placeholder_details") or {}
             if not isinstance(ph_details, dict):
                 ph_details = {}
+            # Rebuild weak/missing descriptions from workflow_spec / plan so
+            # the form never shows only a bare humanized token name when
+            # step context is available on the artifact.
+            ph_details = _enrich_placeholder_details(
+                remaining,
+                ph_details,
+                artifact.get("workflow_spec"),
+                artifact.get("plan"),
+            )
             # token → reason the last-submitted value was rejected (wrong
             # shape: a bare name where an ARN is required, an ARN/URI
             # where a bare name is required, etc.). Set on the response
@@ -2803,24 +3015,6 @@ def render_spec_approved(message_id, artifact, chat_id):
                     "were not applied — fix them below.",
                     icon="⚠️",
                 )
-
-            def _fallback_desc(tok: str) -> str:
-                raw = tok[5:] if tok.upper().startswith("TODO_") else tok
-                parts = [p for p in raw.replace("-", "_").split("_") if p]
-                acronyms = {
-                    "ARN", "AWS", "S3", "SNS", "SQS", "IAM", "API", "URL",
-                    "ID", "ETL", "CSV", "JSON", "DB", "RDS", "KMS", "SES",
-                }
-                words = []
-                for i, w in enumerate(parts):
-                    up = w.upper()
-                    if up in acronyms:
-                        words.append(up)
-                    elif i == 0:
-                        words.append(w.capitalize())
-                    else:
-                        words.append(w.lower())
-                return " ".join(words) if words else tok
 
             import re as _re
 
@@ -2836,17 +3030,28 @@ def render_spec_approved(message_id, artifact, chat_id):
                 value if the description has one; otherwise fall back
                 to a short prompt.
                 """
-                m = _re.search(r"e\.g\.\s*`([^`]+)`", desc)
+                m = _re.search(
+                    r"(?:e\.g\.|looks like|—)\s*`([^`]+)`", desc, _re.IGNORECASE
+                )
                 if m:
                     return m.group(1)
+                m2 = _re.search(r"`(arn:[^`]+)`", desc)
+                if m2:
+                    return m2.group(1)
                 return f"Enter a value for {tok}"
 
             ph_overrides: dict[str, str] = {}
             for idx, token in enumerate(remaining):
-                desc = str(ph_details.get(token) or "").strip() or _fallback_desc(
-                    token
+                desc = str(ph_details.get(token) or "").strip() or (
+                    _humanize_todo_token_local(token)
                 )
-                # Token + short description of what the user should enter.
+                # Never echo raw TODO_ tokens inside help text.
+                desc = _re.sub(
+                    r"\bTODO_[A-Z0-9_]+\b",
+                    lambda m: _humanize_todo_token_local(m.group(0)),
+                    desc,
+                )
+                # Token + description of what the user should enter.
                 st.markdown(f"**`{token}`**  \n{desc}")
                 ph_overrides[token] = st.text_input(
                     f"Value for {token}",

@@ -70,6 +70,16 @@ class APISettings(BaseSettings):
         validation_alias="USE_LANGGRAPH",
     )
 
+    # --- Part B: repository retrieval (RAG) ---
+    # false (default) -> pipeline behaves exactly as before Part B: no
+    #                    embedding calls, no vector-store access.
+    # true            -> retrieval stages are active (added in Part B).
+    # Same env var is read by orchestrator.config.Settings.
+    retrieval_enabled: bool = Field(
+        default=False,
+        validation_alias="RETRIEVAL_ENABLED",
+    )
+
     # Primary chat model (also set via GATEWAY_CHAT_MODEL in gateway_client).
     gateway_chat_model: str | None = Field(
         default=None,

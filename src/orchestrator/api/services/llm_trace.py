@@ -263,6 +263,7 @@ _STAGE_LABELS: dict[str, str] = {
     "parameter_extraction": "Extracting parameters…",
     "integration_analysis": "Checking integrations…",
     "enrichment": "Filling in the remaining details…",
+    "apply_placeholders": "Applying your values to the workflow…",
     "asl_generation": "Generating the Step Functions definition…",
     "asl_validation": "Validating the generated workflow…",
 }

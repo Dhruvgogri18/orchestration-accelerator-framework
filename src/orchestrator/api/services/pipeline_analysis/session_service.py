@@ -391,10 +391,19 @@ def _run_asl_stage(
     try:
         with llm_stage("asl_generation"):
             result = build_asl_from_spec(workflow_spec)
+        # Surface a distinct validation stage so the live-status checklist
+        # can advance past generation (validations already ran inside
+        # build_asl_from_spec; this stage is for UI progress only).
+        with llm_stage("asl_validation"):
+            validations = (
+                result.validations.to_dict()
+                if hasattr(result.validations, "to_dict")
+                else result.validations
+            )
         return (
             result.asl,
             result.graph_dot,
-            result.validations.to_dict(),
+            validations,
             result.source,
             None,
         )
@@ -664,8 +673,6 @@ def fill_spec_placeholders(session_id: str, overrides: dict[str, str]) -> Approv
         else:
             valid_overrides[token] = value
 
-    updated_spec = apply_overrides_to_json(workflow_spec, valid_overrides)
-
     asl: dict | None = None
     asl_graph_dot: str | None = None
     asl_validations: dict | None = None
@@ -673,6 +680,8 @@ def fill_spec_placeholders(session_id: str, overrides: dict[str, str]) -> Approv
     asl_error: str | None = None
     start_request(session_id=session_id)
     try:
+        with llm_stage("apply_placeholders"):
+            updated_spec = apply_overrides_to_json(workflow_spec, valid_overrides)
         asl, asl_graph_dot, asl_validations, asl_source, asl_error, spec_placeholders = (
             _finalize_workflow_spec(updated_spec)
         )

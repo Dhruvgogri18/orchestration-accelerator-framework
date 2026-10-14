@@ -531,12 +531,13 @@ def validate_placeholder_value(kind: PlaceholderKind, value: str) -> str | None:
 
 
 def _as_clause(desc: str) -> str:
-    """'Submit and capture the request.' -> 'submit and capture the request'.
+    """Fold a step description into a trailing clause for help text.
 
-    Folds an existing step description into a "used ... to <do the
-    thing>" sentence instead of repeating it verbatim. TODO_ tokens in
-    the description are humanized so the fill form never echoes the
-    raw placeholder name inside help text.
+    - Humanizes any TODO_ tokens so the fill form never echoes raw
+      placeholder names.
+    - Lowercases the first letter for mid-sentence use.
+    - Caller is responsible for the connecting preposition ("to",
+      "when", etc.); use _clause_connector() for that.
     """
     d = (desc or "").strip().rstrip(".")
     if not d:
@@ -544,7 +545,27 @@ def _as_clause(desc: str) -> str:
     d = _PLACEHOLDER_PATTERN.sub(
         lambda m: _humanize_todo_token(m.group(0)), d
     )
-    return d[0].lower() + d[1:]
+    return d[0].lower() + d[1:] if d else d
+
+
+def _clause_connector(clause: str) -> str:
+    """Pick 'to' / 'when' / 'if' / 'after' so help text stays grammatical.
+
+    Step descriptions often already start with a subordinate conjunction
+    ("if the job fails…", "when approved…"). Prefixing those with "to"
+    produces "to if the job fails…". Detect that and skip the extra "to".
+    """
+    c = (clause or "").lstrip()
+    if not c:
+        return ""
+    first = c.split(None, 1)[0].lower() if c else ""
+    if first in {
+        "if", "when", "whenever", "after", "before", "once", "while",
+        "unless", "until", "because", "since", "although", "though",
+        "where", "wherever", "as",
+    }:
+        return f" {c}"
+    return f" to {c}"
 
 
 def describe_placeholders(
@@ -728,7 +749,7 @@ def describe_placeholders(
                             label, arn_example, _name_example = hint
                             details[t] = (
                                 f"The {label} that {step_ref} will use"
-                                + (f" to {clause}" if clause else "")
+                                + (_clause_connector(clause) if clause else "")
                                 + ". Enter its full AWS ID (called an ARN) —"
                                 f" it looks like `{arn_example}`."
                             )
@@ -761,7 +782,7 @@ def describe_placeholders(
                                 details[t] = (
                                     f"The full AWS ID (ARN) of the {label}"
                                     f"{field_bit} that {step_ref} uses"
-                                    + (f" to {clause}" if clause else "")
+                                    + (_clause_connector(clause) if clause else "")
                                     + f". It looks like `{arn_example}`."
                                 )
                             else:
@@ -780,7 +801,7 @@ def describe_placeholders(
                                     details[t] = (
                                         f"The {label.split()[0]} {role_h} that "
                                         f"{step_ref} uses"
-                                        + (f" to {clause}" if clause else "")
+                                        + (_clause_connector(clause) if clause else "")
                                         + f". Just the plain name — not the "
                                         f"full ARN — e.g. `{name_example}`."
                                     )
@@ -788,7 +809,7 @@ def describe_placeholders(
                                     details[t] = (
                                         f"The name of the {label} that "
                                         f"{step_ref} uses"
-                                        + (f" to {clause}" if clause else "")
+                                        + (_clause_connector(clause) if clause else "")
                                         + f". Just the plain name — not the "
                                         f"full ARN — e.g. `{name_example}`."
                                     )
@@ -858,26 +879,28 @@ def describe_placeholders(
                     if kind == "arn":
                         details[t] = (
                             f"{label} ARN used by {step_ref}"
-                            + (f" to {clause}." if clause else ".")
+                            + ((_clause_connector(clause) + ".") if clause else ".")
                             + f" Must be the full ARN, e.g. `{arn_example}`."
                         )
                     elif kind == "name":
                         details[t] = (
                             f"{label} name used by {step_ref}"
-                            + (f" to {clause}." if clause else ".")
+                            + ((_clause_connector(clause) + ".") if clause else ".")
                             + f" Just the name, not the ARN — e.g. `{name_example}`."
                         )
                     else:
                         details[t] = (
                             f"{label} name or ARN used by {step_ref}"
-                            + (f" to {clause}." if clause else ".")
+                            + ((_clause_connector(clause) + ".") if clause else ".")
                             + f" e.g. `{arn_example}`."
                         )
                 elif sdesc:
                     details[t] = (
                         f"AWS service + resource identifier (e.g. a Lambda "
                         f"function name/ARN or SNS topic ARN) used by "
-                        f"{step_ref} to {clause}."
+                        f"{step_ref}"
+                        + (_clause_connector(clause) if clause else "")
+                        + "."
                     )
                 else:
                     details[t] = (
@@ -1315,14 +1338,49 @@ def sanitize_asl_literals(node: Any) -> Any:
     (anything with ``$``, quotes, operators, or function calls) are left
     completely untouched by the underlying regex, so this is a no-op on
     already-correct documents.
+
+    Also rewrites Catch[].ResultPath (JSONPath-only, illegal under
+    QueryLanguage=JSONata) into Catch[].Assign matching the mechanical
+    translator -- so an LLM that still copies result_path → ResultPath
+    does not need a full repair-loop retry for that alone.
     """
     if isinstance(node, dict):
-        return {k: sanitize_asl_literals(v) for k, v in node.items()}
+        out = {k: sanitize_asl_literals(v) for k, v in node.items()}
+        catchers = out.get("Catch")
+        if isinstance(catchers, list):
+            out["Catch"] = [_sanitize_catch_entry(c) for c in catchers]
+        return out
     if isinstance(node, list):
         return [sanitize_asl_literals(v) for v in node]
     if isinstance(node, str):
         return _unwrap_if_mistakenly_wrapped_literal(node)
     return node
+
+
+def _sanitize_catch_entry(catcher: Any) -> Any:
+    """Convert Catch ResultPath → Assign for JSONata purity.
+
+    Mirrors ``_catch_to_asl``: key from ResultPath (strip ``$.``), default
+    ``errorInfo``, value ``{% $states.errorOutput %}``. Drops ResultPath
+    (and ResultSelector if present). Leaves an existing Assign alone when
+    ResultPath is absent.
+    """
+    if not isinstance(catcher, dict):
+        return catcher
+    item = dict(catcher)
+    rp = item.pop("ResultPath", None)
+    item.pop("ResultSelector", None)
+    item.pop("OutputPath", None)
+    item.pop("InputPath", None)
+    if "Assign" not in item:
+        if isinstance(rp, str) and rp.strip():
+            key = rp.strip()
+            key = key[2:] if key.startswith("$.") else key.lstrip("$")
+            key = re.sub(r"[^A-Za-z0-9_]", "_", key) or "errorInfo"
+        else:
+            key = "errorInfo"
+        item["Assign"] = {key: "{% $states.errorOutput %}"}
+    return item
 
 # Workflow-variable names introduced by Catch Assign (and similar) during
 # the current generate_asl() call. Paths like $.errorInfo must become

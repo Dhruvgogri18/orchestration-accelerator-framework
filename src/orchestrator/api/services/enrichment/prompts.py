@@ -278,11 +278,14 @@ ignore them.
 - **Failure-notification Message must carry the error:** every step
   that is an `on_failure` / Catch target and publishes/alerts (SNS,
   email, chat) MUST put the caught error into `parameters.Message` (or
-  body) via a path such as `"Message.$": "$.errorInfo"` (Catch entries
-  use `result_path: "$.errorInfo"`). A static "something failed" string
-  alone is not enough -- operators need the error payload. Success
-  notifiers stay outcome-specific static text and must not copy failure
-  wording.
+  body) via a path such as `"Message.$": "$.errorInfo"`. On the
+  throwing step's Catch entry, set `result_path: "$.errorInfo"` — that
+  is only a *name* for the error variable the ASL generator will bind
+  with JSONata `Assign` (`{% $states.errorOutput %}`); it is not ASL
+  `ResultPath` (illegal under QueryLanguage=JSONata). A static
+  "something failed" string alone is not enough -- operators need the
+  error payload. Success notifiers stay outcome-specific static text
+  and must not copy failure wording.
 
 - **Write / load / publish patterns — match the data shape and collect required config:**
   - *Single record or message* the user described (one item, one row,

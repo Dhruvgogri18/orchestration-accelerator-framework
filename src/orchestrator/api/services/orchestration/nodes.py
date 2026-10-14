@@ -366,6 +366,7 @@ def asl_node(state: WorkflowState) -> dict:
     from orchestrator.api.services.asl_service import (
         AslGenerationError,
         build_asl_from_spec,
+        describe_placeholders,
         find_asl_placeholders,
     )
 
@@ -378,6 +379,8 @@ def asl_node(state: WorkflowState) -> dict:
 
     spec_placeholders = find_asl_placeholders(spec)
     if spec_placeholders:
+        plan = state.get("resolved_plan") or state.get("plan")
+        plan_dict = plan.model_dump() if hasattr(plan, "model_dump") else plan
         return {
             "asl": None,
             "asl_graph_dot": None,
@@ -385,6 +388,9 @@ def asl_node(state: WorkflowState) -> dict:
             "asl_source": None,
             "asl_error": None,
             "spec_placeholders": spec_placeholders,
+            "placeholder_details": describe_placeholders(
+                spec, spec_placeholders, plan=plan_dict
+            ),
             "last_stage": "asl",
         }
 
@@ -638,7 +644,11 @@ def patch_params_node(state: dict) -> dict:
     """
     from orchestrator.api.repositories import session_repository as session_store
     from orchestrator.api.schemas.common import Plan
-    from orchestrator.api.services.asl_service import build_asl_from_spec, find_asl_placeholders
+    from orchestrator.api.services.asl_service import (
+        build_asl_from_spec,
+        describe_placeholders,
+        find_asl_placeholders,
+    )
     from orchestrator.api.services.orchestration.patch import (
         apply_overrides_to_plan_and_artifacts,
         collect_known_tokens,
@@ -739,6 +749,15 @@ def patch_params_node(state: dict) -> dict:
         new_locked["asl_validations"] = asl_validations
         new_locked["asl_source"] = asl_source
         new_locked["asl_error"] = asl_error
+        new_locked["placeholder_details"] = (
+            describe_placeholders(
+                new_spec,
+                spec_placeholders,
+                plan=new_plan.model_dump() if new_plan is not None else None,
+            )
+            if spec_placeholders
+            else {}
+        )
         # Clear enrichment question if we successfully patched
         new_locked.pop("enrichment_question", None)
         new_locked.pop("enrichment_pending", None)
@@ -806,6 +825,15 @@ def patch_params_node(state: dict) -> dict:
             "workflow_spec": new_spec,
             "remaining_placeholders": remaining if isinstance(remaining, list) else placeholders,
             "spec_placeholders": spec_placeholders,
+            "placeholder_details": (
+                describe_placeholders(
+                    new_spec,
+                    spec_placeholders,
+                    plan=new_plan.model_dump() if new_plan is not None else None,
+                )
+                if spec_placeholders
+                else {}
+            ),
             "asl": asl_out,
             "asl_graph_dot": asl_graph_dot,
             "asl_validations": asl_validations,

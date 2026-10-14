@@ -86,14 +86,24 @@ def _message_response_from_state(state: dict) -> MessageResponse:
 
 
 def _approve_response_from_state(state: dict) -> ApproveResponse:
+    from orchestrator.api.services.asl_service import describe_placeholders
+
+    spec = state.get("workflow_spec")
+    tokens = list(state.get("spec_placeholders") or [])
+    plan = state.get("resolved_plan")
+    plan_dict = plan.model_dump() if hasattr(plan, "model_dump") else plan
+    details = state.get("placeholder_details")
+    if not isinstance(details, dict) or (tokens and not details):
+        details = describe_placeholders(spec, tokens, plan=plan_dict)
     return ApproveResponse(
         status="approved",
         resolved_plan=_plan_obj(state.get("resolved_plan")),
         remaining_placeholders=state.get("remaining_placeholders") or [],
-        workflow_spec=state.get("workflow_spec"),
+        workflow_spec=spec,
         enrichment_error=state.get("enrichment_error"),
         enrichment_question=state.get("enrichment_question"),
-        spec_placeholders=state.get("spec_placeholders") or [],
+        spec_placeholders=tokens,
+        placeholder_details=details or {},
         asl=state.get("asl"),
         asl_graph_dot=state.get("asl_graph_dot"),
         asl_validations=state.get("asl_validations"),
@@ -128,13 +138,23 @@ def _persist_extraction(session_id: str, state: dict) -> None:
 
 
 def _persist_locked(session_id: str, state: dict) -> None:
+    from orchestrator.api.services.asl_service import describe_placeholders
+
+    spec = state.get("workflow_spec")
+    tokens = list(state.get("spec_placeholders") or [])
+    plan = state.get("resolved_plan")
+    plan_dict = plan.model_dump() if hasattr(plan, "model_dump") else plan
+    details = state.get("placeholder_details")
+    if not isinstance(details, dict) or (tokens and not details):
+        details = describe_placeholders(spec, tokens, plan=plan_dict)
     locked = {
         "resolved_plan": state.get("resolved_plan"),
         "remaining_placeholders": state.get("remaining_placeholders") or [],
-        "workflow_spec": state.get("workflow_spec"),
+        "workflow_spec": spec,
         "enrichment_error": state.get("enrichment_error"),
         "enrichment_question": state.get("enrichment_question"),
-        "spec_placeholders": state.get("spec_placeholders") or [],
+        "spec_placeholders": tokens,
+        "placeholder_details": details or {},
         "asl": state.get("asl"),
         "asl_graph_dot": state.get("asl_graph_dot"),
         "asl_validations": state.get("asl_validations"),

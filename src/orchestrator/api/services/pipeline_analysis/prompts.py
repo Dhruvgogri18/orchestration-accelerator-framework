@@ -130,17 +130,30 @@ Nothing else.
 - **Granularity:** a clause has its own verb + object (e.g. "discover
   files", "validate reference data", "notify and continue on an invalid
   file"). Enumerate at maximum granularity -- if unsure whether something
-  is one clause or two, list it as two.
+  is one clause or two, list it as two. Exception: see Same-state /
+  fixed-count grouping below.
  
 - **Don't group or classify:** never merge related clauses together, and
   never decide which AWS service a clause belongs to, control flow,
   ordering logic, or component boundaries -- a later stage does all of
-  that.
+  that. Exception: Same-state / fixed-count grouping (below) forces one
+  clause when the user declared those actions share one step or a fixed
+  step count.
+ 
+- **Same-state / fixed-count grouping (overrides maximum granularity):**
+  when the user indicates that several actions share one step/state or
+  constrains the total number of steps/states (any wording that means
+  "these happen together in one unit" or "use N steps / do not add
+  extra states"), list that group as ONE clause keeping the full
+  grouped wording. Do not split the grouped verbs into separate
+  clauses. Ordinary sequential "and"/"then" without such a bound still
+  yields separate clauses.
  
 - **Parallel/sequential "and":** two clauses joined by "and"/"then" under
   a parallel, concurrent, or sequential verb are always separate entries
   (e.g. "validate customer and account data in parallel" -> two entries,
-  not one).
+  not one). This does not apply when the same chain is under a
+  same-state / fixed-count grouping (above).
  
 - **Retry/timeout modifiers:** not their own clause -- fold the wording
   into the clause it modifies (e.g. "retry three times", "with two
@@ -252,21 +265,36 @@ description, component_type). Do NOT decide control flow \
   states," treat that as a bound on component count, not as additional
   clauses to expand.
 
+- **Same-state / fixed-count grouping (overrides one-clause-one-component):**
+  when the user indicates several actions share one step/state, or
+  constrains total step/state count (any wording that means "these
+  happen together in one unit" or "use N steps / do not add extra
+  states"), emit exactly ONE component whose description covers the
+  whole group. Prefer a concrete service when the group has a clear
+  primary sink or dominant action; otherwise use the dominant action's
+  service. Do not split that group into separate components even if the
+  clause list listed the verbs separately.
+
 - **Completeness:** you will be given an "Action clauses identified from
   this request" list from an earlier, independent pass.
   - Every *action* clause needs its own component unless it is purely a
     retry/timeout attribute (see Retry), a bare control-flow condition
-    with no action of its own, or an implementation detail (see above).
+    with no action of its own, an implementation detail (see above),
+    or part of a same-state / fixed-count group (see above).
   - Do not merge or drop real action clauses just because they feel
-    related.
+    related -- unless the user required a same-state or fixed-count
+    grouping for them.
   - Two action clauses joined by "and" under a parallel/concurrent/
-    simultaneous verb are always two components.
+    simultaneous verb are always two components (unless under a
+    same-state / fixed-count grouping).
   - A clause never reuses another clause's component id just because
     both are failure paths -- distinct triggers get distinct components.
   - If clause count is inflated by implementation-detail phrases, fold
     those into the owning action components. Do not ask whether to
     split them into extra components when the user already required
     same-state behavior or a fixed step count -- honor that structure.
+  - Plan revision that asks to merge or collapse named steps into one
+    means merge those components into one and drop the extras.
 
 - **Clarifying questions:** only ask when the STRUCTURE (what *action*
   components exist, what order) is genuinely unclear -- not for
@@ -511,14 +539,20 @@ COMPONENT RULES (apply first):
 - Component ids MUST match ^[A-Za-z][A-Za-z0-9_]{0,79}$ (letters, digits,
   underscore only — no hyphens). Example: ReadCsvFromS3, not read-csv-from-s3.
 - One component per distinct action / decision / parallel construct /
-  notification the user described.
+  notification the user described — unless the user indicates several
+  actions share one step/state or constrains total step/state count
+  (any wording that means "these happen together in one unit" or
+  "use N steps / do not add extra states"). In that case emit exactly
+  ONE component covering the whole group.
 - Use the component taxonomy (DataLoader, Transformer, QualityCheck,
   DecisionGate, Orchestrator, Notifier, Exporter, ExternalCall, Terminal,
   etc.).
 - DecisionGate components have service "None" and own exclusive branches;
   never put branches on a Task-shaped action component.
 - Honor every action clause from the independent enumeration pass when
-  provided — do not drop or silently merge clauses.
+  provided — do not drop or silently merge clauses, except when the
+  user required a same-state / fixed-count grouping or later feedback
+  asks to merge or collapse named steps into one.
  
 FLOW RULES (apply to the components you just listed):
 - steps[].id/service/description/component_type must match the components

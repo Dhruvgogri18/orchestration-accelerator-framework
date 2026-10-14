@@ -81,8 +81,16 @@ common source of invalid ASL
   "ErrorEquals", "IntervalSeconds" (from interval_seconds), \
   "MaxAttempts" (from max_attempts), "BackoffRate" (from backoff_rate).
 - "Catch": map each spec catcher 1:1 to an ASL Catch entry with \
-  "ErrorEquals", "Next" (from next_step), and "ResultPath" only if the \
-  spec catcher gives one.
+  "ErrorEquals", "Next" (from next_step). NEVER emit "ResultPath", \
+  "OutputPath", or "InputPath" on Catch (or anywhere) -- those are \
+  JSONPath-only and invalid under QueryLanguage=JSONata. To expose the \
+  error to the catch target, use Assign instead:
+    "Assign": { "<key>": "{% $states.errorOutput %}" }
+  where <key> is derived from the catcher's result_path if present \
+  (e.g. "$.errorInfo" → "errorInfo"), otherwise default to "errorInfo". \
+  Downstream failure notifiers must read that workflow variable as \
+  "{% $errorInfo %}" (or "{% $string($errorInfo) %}"), NOT \
+  "$states.input.errorInfo" -- Assign does not write into state input.
 - "TimeoutSeconds": copy from the spec step's timeout_seconds if \
   present.
 - Transition via "Next" (from next_step) or "End": true (from end).
