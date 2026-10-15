@@ -298,6 +298,10 @@ def approve_plan(session_id: str, overrides: dict[str, str] | None = None) -> Ap
         )
 
     overrides = overrides or {}
+    if (session.locked_spec or {}).get("asl_first"):
+        # ASL-first sessions have no enrichment/spec stages to run through
+        # the graph -- the legacy service owns that flow.
+        return _legacy.approve_plan(session_id, overrides)
     start_request(session_id=session_id)
     graph = _get_graph()
     config = _config(session_id)
@@ -341,6 +345,8 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
         raise NoEnrichmentQuestionError(
             "No enrichment clarification pending for this session."
         )
+    if locked.get("asl_first"):
+        return _legacy.answer_enrichment_question(session_id, answer)
 
     start_request(session_id=session_id)
     graph = _get_graph()

@@ -149,6 +149,15 @@ def run_extraction_turn(session_id: str, session: Session, message: str) -> Mess
     an intermediate component list a non-developer user would have no
     way to judge.
     """
+    # PIPELINE_MODE=asl_first: draft ASL straight from the prompt, show a
+    # plan derived from it (see services/asl_first).
+    from orchestrator.api.config.settings import get_api_settings
+
+    if get_api_settings().pipeline_mode == "asl_first":
+        from orchestrator.api.services.asl_first import service as _asl_first
+
+        return _asl_first.run_extraction_turn(session_id, session, message)
+
     session_store.append_message(session_id, "user", message)
     start_request(session_id=session_id, user_message=message)
 
@@ -473,6 +482,11 @@ def approve_plan(session_id: str, overrides: dict[str, str]) -> ApproveResponse:
             "No approvable plan yet -- conversation still needs clarification."
         )
 
+    if (session.locked_spec or {}).get("asl_first"):
+        from orchestrator.api.services.asl_first import service as _asl_first
+
+        return _asl_first.approve(session_id, overrides)
+
     resolved_plan, remaining = apply_overrides(session.latest_plan, overrides)
 
     workflow_spec: dict | None = None
@@ -556,6 +570,10 @@ def answer_enrichment_question(session_id: str, answer: str) -> ApproveResponse:
     pending = locked.get("enrichment_pending")
     if not pending:
         raise NoEnrichmentQuestionError("No enrichment clarification pending for this session.")
+    if locked.get("asl_first"):
+        from orchestrator.api.services.asl_first import service as _asl_first
+
+        return _asl_first.answer_question(session_id, answer)
 
     plan = Plan.model_validate(locked["resolved_plan"])
     workflow_spec: dict | None = None
@@ -641,6 +659,10 @@ def fill_spec_placeholders(session_id: str, overrides: dict[str, str]) -> Approv
     """
     session = get_session_or_raise(session_id)
     locked = session.locked_spec or {}
+    if locked.get("asl_first"):
+        from orchestrator.api.services.asl_first import service as _asl_first
+
+        return _asl_first.fill_placeholders(session_id, overrides)
     workflow_spec = locked.get("workflow_spec")
     if not isinstance(workflow_spec, dict) or not workflow_spec:
         raise NoSpecPlaceholdersError(
@@ -735,6 +757,10 @@ def generate_asl_for_session(session_id: str) -> AslValidateResponse:
     """
     session = get_session_or_raise(session_id)
     locked = session.locked_spec or {}
+    if locked.get("asl_first"):
+        from orchestrator.api.services.asl_first import service as _asl_first
+
+        return _asl_first.regenerate(session_id)
     spec = locked.get("workflow_spec")
     if not spec:
         raise NoWorkflowSpecError(

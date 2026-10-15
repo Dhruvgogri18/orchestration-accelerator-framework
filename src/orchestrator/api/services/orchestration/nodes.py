@@ -594,6 +594,10 @@ def revise_plan_node(state: dict) -> dict:
     preserved = plan_history.preserve_history_on_clear(locked)
     if session.latest_plan is not None:
         preserved = plan_history.push_plan(preserved, session.latest_plan)
+    # ASL-first: keep the current ASL so the LLM revises it minimally.
+    from orchestrator.api.services.asl_first import service as _asl_first
+
+    preserved.update(_asl_first.carry_over(locked))
     session_store.set_locked_spec(session_id, preserved)
 
     if state.get("action") == "reject":
@@ -669,6 +673,14 @@ def patch_params_node(state: dict) -> dict:
             "error": f"Unknown session_id: {session_id}",
             "last_stage": "patch_params",
         }
+
+    # ASL-first sessions: no workflow_spec to patch -- patch the ASL itself;
+    # anything structural falls through to the revise path.
+    if (session.locked_spec or {}).get("asl_first"):
+        from orchestrator.api.services.asl_first import service as _asl_first
+
+        patched = _asl_first.patch_values_from_message(state)
+        return patched if patched is not None else revise_plan_node(state)
 
     plan = session.latest_plan
     locked = session.locked_spec if isinstance(session.locked_spec, dict) else {}
