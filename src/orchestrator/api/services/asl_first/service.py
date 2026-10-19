@@ -37,6 +37,7 @@ from orchestrator.api.services.asl_first.plan_view import asl_to_plan, humanize_
 from orchestrator.api.services.asl_first.prompts import (
     ANSWERS_INSTRUCTION,
     ASL_FIRST_SYSTEM_PROMPT,
+    REALIGN_SYSTEM_PROMPT,
 )
 from orchestrator.api.services.asl_service import (
     _find_key_for_token,
@@ -52,7 +53,8 @@ from orchestrator.api.services.asl_service import (
     validate_asl,
     validate_placeholder_value,
 )
-from orchestrator.api.services.llm_trace import end_request, llm_stage, start_request
+from orchestrator.api.services.llm_trace import end_request, llm_stage, log_event, start_request
+from orchestrator.api.services.plan.matching import match as match_plan
 from orchestrator.api.services.plan.render import (
     apply_overrides,
     render_plan_diagram,
@@ -289,7 +291,8 @@ def generate_draft(
             asl=candidate,
             name=str(data.get("name") or "").strip() or None,
             summary=str(data.get("summary") or "").strip() or None,
-            assumptions=_clean_list(data.get("assumptions")),
+            # Fidelity-first: never surface invented behaviour as assumptions.
+            assumptions=[],
             questions=_clean_list(data.get("questions"), MAX_QUESTIONS),
         )
 
@@ -402,6 +405,222 @@ def _topology(asl: Any) -> Any:
             node["b"] = [_topology(st.get("ItemProcessor") or st.get("Iterator") or {})]
         out[name] = node
     return out
+
+
+# ---------------------------------------------------------------------------
+# Structure locking (determinism without the full staged pipeline)
+# ---------------------------------------------------------------------------
+
+
+def _plan_topology_sig(plan: Plan) -> str:
+    """Compact structural signature of a Plan: step ids + wiring only.
+
+    Ignores description/service wording so paraphrase-stable role graphs
+    compare equal even when Comments differ slightly.
+    """
+    steps = sorted(plan.steps, key=lambda s: s.id or "")
+    parts: list[str] = []
+    for s in steps:
+        branches = sorted(
+            (f"{(b.condition or '').strip().lower()}->{b.next}" for b in (s.branches or [])),
+        )
+        fails = sorted(s.on_failure or [])
+        timeouts = sorted(s.on_timeout or [])
+        parts.append(
+            "|".join(
+                [
+                    s.id or "",
+                    s.next or "",
+                    ",".join(branches),
+                    ",".join(fails),
+                    ",".join(timeouts),
+                    "1" if s.branches else "0",
+                ]
+            )
+        )
+    return "\n".join(parts)
+
+
+def _locked_plan_from(plan: Plan) -> tuple[Plan, str, float]:
+    """Optionally snap *plan* for stability without inventing new steps.
+
+    ASL-first is fidelity-first: the user prompt is the sole source of
+    behaviour. We deliberately do NOT run canonicalize light-cleanup or
+    pattern rebuild here -- those rename notify ids (e.g. SendFailureAlert
+    -> AlertOperations) and inject pipeline family states, which forces a
+    needless realign and drifts from the draft the model just produced.
+
+    High-confidence template match is accepted only when it does not grow
+    the step set. Otherwise the plan derived from ASL is kept as-is.
+
+    Returns (locked_plan, tier, score). Matching uses the pure keyword
+    role tagger only -- no extra LLM or embedding calls.
+    """
+    match_result = match_plan(plan)
+    tier = match_result.tier
+    score = float(match_result.score or 0.0)
+    n = len(plan.steps)
+
+    if (
+        tier == "high"
+        and match_result.plan is not None
+        and len(match_result.plan.steps) <= n
+    ):
+        return match_result.plan, tier, score
+
+    return plan, tier, score
+
+
+def _realign_asl_to_plan(current_asl: dict, locked_plan: Plan) -> dict | None:
+    """One constrained LLM call: rewrite ASL control-flow to match locked_plan.
+
+    Returns a validated ASL dict, or None if realignment fails (caller keeps
+    the original draft). Temperature 0; same mechanical validate gate as
+    generate_draft (TODO_ tokens allowed).
+    """
+    plan_payload = {
+        "name": locked_plan.name,
+        "summary": locked_plan.summary,
+        "steps": [
+            {
+                "id": s.id,
+                "service": s.service,
+                "description": s.description,
+                "next": s.next,
+                "on_failure": list(s.on_failure or []),
+                "on_timeout": list(s.on_timeout or []),
+                "branches": [
+                    {"condition": b.condition, "next": b.next}
+                    for b in (s.branches or [])
+                ],
+                "component_type": s.component_type,
+            }
+            for s in locked_plan.steps
+        ],
+    }
+    user = (
+        "LOCKED PLAN (authoritative control-flow):\n"
+        + json.dumps(plan_payload, separators=(",", ":"))
+        + "\n\nCURRENT ASL (preserve TODO_ tokens and Task bodies where possible):\n"
+        + json.dumps(current_asl, separators=(",", ":"))
+    )
+    messages = [
+        {"role": "system", "content": REALIGN_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+    max_attempts = max(1, min(2, get_api_settings().asl_llm_max_attempts))
+    last_error = "unknown"
+
+    for _ in range(max_attempts):
+        raw = chat_completion(messages, temperature=0)
+        try:
+            data = json.loads(_strip_code_fences(raw))
+        except json.JSONDecodeError as exc:
+            last_error = f"not JSON: {exc}"
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"Error: {last_error}. Return only the JSON object with key \"asl\".",
+                }
+            )
+            continue
+        if not isinstance(data, dict):
+            last_error = "response must be a JSON object"
+            continue
+        asl = data.get("asl", data)
+        if isinstance(asl, str):
+            try:
+                asl = json.loads(asl)
+            except json.JSONDecodeError:
+                asl = None
+        if not isinstance(asl, dict) or "States" not in asl or "StartAt" not in asl:
+            last_error = "'asl' must be an object with StartAt and States"
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"Error: {last_error}. Return the complete corrected JSON object only.",
+                }
+            )
+            continue
+        candidate = sanitize_asl_literals(asl)
+        report = validate_asl(
+            candidate,
+            spec=None,
+            graph_dot=render_asl_graph(candidate),
+            include_aws_validate=False,
+        )
+        if not _draft_ok(report):
+            last_error = "ASL validation failed: " + _feedback(report)
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Error: {last_error}. Return the complete corrected JSON "
+                        "object only. TODO_ tokens must stay."
+                    ),
+                }
+            )
+            continue
+        return candidate
+
+    log_event("asl_first_realign_failed", error=last_error)
+    return None
+
+
+def lock_draft_structure(
+    asl: dict,
+    *,
+    name: str | None = None,
+    summary: str | None = None,
+) -> tuple[dict, Plan]:
+    """Derive plan, snap to stable structure, realign ASL only if topology drifted.
+
+    Keeps ASL as source of truth: when the locked plan differs structurally
+    from the free-form draft, one constrained realign call updates the ASL.
+    If realign fails, the original ASL and its asl_to_plan view are kept.
+    """
+    plan = asl_to_plan(asl, name=name, summary=summary)
+    locked_plan, tier, score = _locked_plan_from(plan)
+
+    log_event(
+        "asl_first_structure_lock",
+        tier=tier,
+        score=score,
+        sig_before=_plan_topology_sig(plan)[:200],
+        sig_after=_plan_topology_sig(locked_plan)[:200],
+        changed=_plan_topology_sig(plan) != _plan_topology_sig(locked_plan),
+    )
+
+    if _plan_topology_sig(plan) == _plan_topology_sig(locked_plan):
+        # Light cleanup may have renamed notify ids etc. Prefer locked labels
+        # when signatures match at the wiring level after canonicalize.
+        return asl, locked_plan
+
+    with llm_stage("asl_first_realign"):
+        realigned = _realign_asl_to_plan(asl, locked_plan)
+
+    if realigned is None:
+        return asl, plan
+
+    try:
+        # Source of truth stays ASL: re-derive plan from realigned document,
+        # then re-apply lock so display ids stay canonical when possible.
+        view = asl_to_plan(
+            realigned,
+            name=locked_plan.name or name,
+            summary=locked_plan.summary or summary,
+        )
+        final_plan, _, _ = _locked_plan_from(view)
+        # If realign preserved topology of locked_plan, prefer locked_plan
+        # for stable user-facing labels.
+        if _plan_topology_sig(view) == _plan_topology_sig(locked_plan):
+            final_plan = locked_plan
+        return realigned, final_plan
+    except ValueError:
+        return realigned, locked_plan
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +751,12 @@ def run_extraction_turn(session_id: str, session, message: str) -> MessageRespon
         )
 
     try:
-        plan = asl_to_plan(draft.asl, name=draft.name, summary=draft.summary)
+        # Snap free-form draft topology to match/canonicalize archetypes so
+        # paraphrases of the same intent yield the same Mermaid plan. At most
+        # one extra LLM call (realign) when structure actually drifts.
+        locked_asl, plan = lock_draft_structure(
+            draft.asl, name=draft.name, summary=draft.summary
+        )
     except ValueError as exc:
         raise ExtractionError(str(exc)) from exc
 
@@ -545,7 +769,7 @@ def run_extraction_turn(session_id: str, session, message: str) -> MessageRespon
     locked = _preserved_history(locked_old)
     locked.update(
         asl_first=True,
-        asl_draft=draft.asl,
+        asl_draft=locked_asl,
         asl_name=plan.name,
         asl_summary=plan.summary,
         asl_assumptions=draft.assumptions,
@@ -648,16 +872,19 @@ def answer_question(session_id: str, answer: str) -> ApproveResponse:
         end_request(status="error", error=str(exc))
         return _approve_response(locked, plan)
 
-    locked["asl_draft"] = result.asl
     locked["asl_assumptions"] = result.assumptions or locked.get("asl_assumptions", [])
     try:
-        locked["resolved_plan"] = asl_to_plan(
-            result.asl, name=result.name or plan.name, summary=result.summary or plan.summary
-        ).model_dump()
-        plan = Plan.model_validate(locked["resolved_plan"])
+        locked_asl, plan = lock_draft_structure(
+            result.asl,
+            name=result.name or plan.name,
+            summary=result.summary or plan.summary,
+        )
+        locked["asl_draft"] = locked_asl
+        locked["resolved_plan"] = plan.model_dump()
         session_store.set_latest_plan(session_id, plan)
     except ValueError:
-        pass  # keep the previous plan view
+        locked["asl_draft"] = result.asl
+        # keep the previous plan view
 
     try:
         if result.questions and rounds < get_api_settings().asl_first_max_clarification_rounds:

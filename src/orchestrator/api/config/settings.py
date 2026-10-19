@@ -143,18 +143,21 @@ class APISettings(BaseSettings):
     # "staged"    -> current flow: plan -> approve -> enrichment ->
     #                workflow_spec -> placeholders -> ASL. Default, so
     #                nothing changes unless PIPELINE_MODE is set.
-    # "asl_first" -> ASL-first flow:
+    # "asl_first" -> ASL-first flow (token/time efficient, structure-locked):
     #                1. LLM drafts the ASL straight from the prompt (the
     #                   draft is stored but NOT shown to the user).
-    #                2. The user is shown a plan derived mechanically
-    #                   from that draft and approves it.
-    #                3. On approve, the LLM's clarifying questions about
+    #                2. Plan is derived mechanically, then snapped via
+    #                   match + canonicalize; at most one constrained
+    #                   realign LLM call if topology drifted (paraphrase-
+    #                   stable Mermaid without the full staged pipeline).
+    #                3. User approves the locked plan.
+    #                4. On approve, the LLM's clarifying questions about
     #                   the draft are asked (reusing the enrichment
     #                   question/answer endpoint and phase).
-    #                4. Every remaining TODO_ placeholder is asked for
+    #                5. Every remaining TODO_ placeholder is asked for
     #                   (reusing /spec/placeholders) and patched into the
     #                   ASL in code -- no LLM call.
-    #                5. The final, validated ASL is shown.
+    #                6. The final, validated ASL is shown.
     pipeline_mode: Literal["staged", "asl_first"] = Field(
         default="asl_first",
         validation_alias="PIPELINE_MODE",
