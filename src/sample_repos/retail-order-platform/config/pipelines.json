@@ -1,0 +1,41 @@
+{
+  "pipelines": [
+    {
+      "name": "order-fulfillment",
+      "description": "Process a batch of orders concurrently; summarize when all are done.",
+      "trigger": "s3:ObjectCreated on retail-orders-raw-<env>/incoming/",
+      "per_order_steps": [
+        "retail-validate-order",
+        "retail-fraud-check (parallel, total > 1000)",
+        "retail-credit-check (parallel, total > 1000)",
+        "retail-reserve-inventory",
+        "retail-charge-payment",
+        "retail-ship-order"
+      ],
+      "on_payment_failure": {
+        "wait_seconds": 30,
+        "retries": 1,
+        "then": ["retail-release-inventory", "notify retail-ops-alerts-<env>"]
+      },
+      "after_all_orders": [
+        "retail-aggregate-report",
+        "publish retail-order-summary-<env>"
+      ]
+    },
+    {
+      "name": "daily-batch-etl",
+      "description": "Two Glue jobs in parallel, then quality check, then load.",
+      "schedule": "cron(0 2 * * ? *)",
+      "parallel": ["orders-etl-job", "inventory-etl-job"],
+      "then": ["retail-dq-check", "retail-load-curated"],
+      "on_failure": "notify retail-ops-alerts-<env>"
+    },
+    {
+      "name": "csv-ingest",
+      "description": "Load one CSV file from S3 into DynamoDB.",
+      "steps": ["csv-transform-and-load"],
+      "on_success": "publish retail-order-summary-<env>",
+      "on_failure": "notify retail-ops-alerts-<env>"
+    }
+  ]
+}

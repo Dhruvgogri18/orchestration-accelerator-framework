@@ -1,0 +1,41 @@
+environment: prod
+aws:
+  account_id: "210987654321"
+  region: us-east-1
+
+buckets:
+  raw_orders: retail-orders-raw-prod
+  curated: retail-orders-curated-prod
+  reports: retail-reports-prod
+
+tables:
+  orders: orders-prod
+  inventory_reservations: inventory-reservations-prod
+  order_outcomes: order-outcomes-prod
+
+sns_topics:
+  ops_alerts:
+    name: retail-ops-alerts-prod
+    arn: arn:aws:sns:us-east-1:210987654321:retail-ops-alerts-prod
+    purpose: Operational failure alerts for on-call engineers.
+  order_summary:
+    name: retail-order-summary-prod
+    arn: arn:aws:sns:us-east-1:210987654321:retail-order-summary-prod
+    purpose: Final order batch summary report for business stakeholders.
+
+lambdas:
+  validate_order: arn:aws:lambda:us-east-1:210987654321:function:retail-validate-order
+  fraud_check: arn:aws:lambda:us-east-1:210987654321:function:retail-fraud-check
+  credit_check: arn:aws:lambda:us-east-1:210987654321:function:retail-credit-check
+  reserve_inventory: arn:aws:lambda:us-east-1:210987654321:function:retail-reserve-inventory
+  charge_payment: arn:aws:lambda:us-east-1:210987654321:function:retail-charge-payment
+  release_inventory: arn:aws:lambda:us-east-1:210987654321:function:retail-release-inventory
+  ship_order: arn:aws:lambda:us-east-1:210987654321:function:retail-ship-order
+  aggregate_report: arn:aws:lambda:us-east-1:210987654321:function:retail-aggregate-report
+  dq_check: arn:aws:lambda:us-east-1:210987654321:function:retail-dq-check
+  load_curated: arn:aws:lambda:us-east-1:210987654321:function:retail-load-curated
+
+glue_jobs:
+  - csv-transform-and-load
+  - orders-etl-job
+  - inventory-etl-job

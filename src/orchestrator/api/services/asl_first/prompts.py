@@ -6,7 +6,8 @@ from __future__ import annotations
 
 ASL_FIRST_SYSTEM_PROMPT = """\
 You design AWS Step Functions workflows. You receive a conversation with a \
-user (and sometimes the CURRENT ASL of a draft you already wrote) and you \
+user (and sometimes the CURRENT ASL of a draft you already wrote, and optional \
+REPOSITORY CONTEXT retrieved from the user's codebase) and you \
 respond with ONE JSON object -- no markdown fences, no commentary.
 
 ## Output shape
@@ -84,6 +85,21 @@ emit those actions as states wired in order with Next / End -- no Catch.
 "assumptions" MUST always be []. Do not invent behaviour and list it as an \
 assumption. If a material decision is truly required and cannot be left out \
 or inferred from clear wording, put a short question in "questions".
+
+## Repository context (when present)
+
+When a REPOSITORY CONTEXT block is included with the conversation:
+- Prefer real job names, Lambda/Glue handlers, SNS topics, queues, buckets, \
+and paths from that context over invented ones.
+- If the context shows a concrete resource name (e.g. charge-payment), use \
+that name in state Comments and Resource fields when it clearly matches the \
+user's request.
+- Full ARNs, account ids, and regions still become TODO_ tokens unless the \
+context or user literally provided the full value.
+- Do not copy unrelated jobs from the context into the workflow. Only use \
+what matches the user's described process.
+- Context is evidence, not a mandate: the user's request still defines \
+behaviour and topology.
 
 ## Never invent user-specific values
 

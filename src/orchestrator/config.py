@@ -49,6 +49,15 @@ class Settings(BaseSettings):
     # --- Part B feature flag ---
     retrieval_enabled: bool = Field(False, alias="RETRIEVAL_ENABLED")
 
+    # --- Retrieval (query-time; only used when retrieval_enabled) ---
+    retrieval_dense_top_k: int = Field(10, ge=1, le=50, alias="RETRIEVAL_DENSE_TOP_K")
+    retrieval_structured_max: int = Field(20, ge=1, le=100, alias="RETRIEVAL_STRUCTURED_MAX")
+    retrieval_rerank_top_n: int = Field(12, ge=1, le=50, alias="RETRIEVAL_RERANK_TOP_N")
+    retrieval_min_score: float = Field(0.15, ge=0.0, le=1.0, alias="RETRIEVAL_MIN_SCORE")
+    retrieval_token_budget: int = Field(3000, ge=200, le=32000, alias="RETRIEVAL_TOKEN_BUDGET")
+    retrieval_alpha: float = Field(0.55, ge=0.0, le=1.0, alias="RETRIEVAL_ALPHA")
+    retrieval_beta: float = Field(0.35, ge=0.0, le=1.0, alias="RETRIEVAL_BETA")
+
     # --- AWS ---
     aws_region: str = Field("us-east-1", alias="AWS_REGION")
     aws_profile: str | None = Field(None, alias="AWS_PROFILE")

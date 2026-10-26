@@ -1,0 +1,190 @@
+version: 1
+owner: retail-data-platform
+
+jobs:
+  - name: csv-transform-and-load
+    type: glue
+    script: glue_jobs/csv_transform_and_load.py
+    entry_point: main
+    glue_version: "4.0"
+    worker_type: G.1X
+    number_of_workers: 2
+    arguments:
+      --source_s3_uri: s3://retail-orders-raw-dev/uploads/data.csv
+      --dynamodb_table: orders-dev
+    reads:
+      - s3://retail-orders-raw-dev/uploads/
+    writes:
+      - dynamodb:orders-dev
+    downstream:
+      - retail-ops-alerts-dev
+    description: Transform a CSV file from S3 and load the result into DynamoDB.
+
+  - name: orders-etl-job
+    type: glue
+    script: glue_jobs/orders_etl_job.py
+    entry_point: main
+    glue_version: "4.0"
+    worker_type: G.1X
+    number_of_workers: 4
+    arguments:
+      --input_path: s3://retail-orders-raw-dev/incoming/
+      --output_path: s3://retail-orders-curated-dev/orders/
+    reads:
+      - s3://retail-orders-raw-dev/incoming/
+    writes:
+      - s3://retail-orders-curated-dev/orders/
+    downstream:
+      - retail-dq-check
+    description: Clean and deduplicate raw orders and write curated Parquet.
+
+  - name: inventory-etl-job
+    type: glue
+    script: glue_jobs/inventory_etl_job.py
+    entry_point: main
+    glue_version: "4.0"
+    worker_type: G.1X
+    number_of_workers: 2
+    arguments:
+      --input_path: s3://retail-orders-raw-dev/inventory/
+      --output_path: s3://retail-orders-curated-dev/inventory/
+    reads:
+      - s3://retail-orders-raw-dev/inventory/
+    writes:
+      - s3://retail-orders-curated-dev/inventory/
+    downstream:
+      - retail-dq-check
+    description: Build the latest inventory snapshot and write curated Parquet.
+
+  - name: retail-validate-order
+    type: lambda
+    script: lambdas/validate_order/handler.py
+    entry_point: handler.lambda_handler
+    runtime: python3.11
+    environment:
+      REQUIRED_FIELDS: order_id,customer_id,total
+    downstream:
+      - retail-fraud-check
+      - retail-reserve-inventory
+    description: Validate an order's required fields and total.
+
+  - name: retail-fraud-check
+    type: lambda
+    script: lambdas/fraud_check/handler.py
+    entry_point: handler.lambda_handler
+    runtime: python3.11
+    environment:
+      FRAUD_SCORE_THRESHOLD: "0.8"
+    downstream:
+      - retail-reserve-inventory
+    description: Fraud lookup for high-value orders.
+
+  - name: retail-credit-check
+    type: lambda
+    script: lambdas/credit_check/handler.py
+    entry_point: handler.lambda_handler
+    runtime: python3.11
+    environment:
+      MIN_CREDIT_SCORE: "620"
+    downstream:
+      - retail-reserve-inventory
+    description: Credit lookup for high-value orders.
+
+  - name: retail-reserve-inventory
+    type: lambda
+    script: lambdas/reserve_inventory/handler.py
+    entry_point: handler.lambda_handler
+    runtime: python3.11
+    environment:
+      RESERVATIONS_TABLE: inventory-reservations-dev
+    writes:
+      - dynamodb:inventory-reservations-dev
+    downstream:
+      - retail-charge-payment
+    description: Reserve stock for an order before payment is charged.
+
+  - name: retail-charge-payment
+    type: lambda
+    script: lambdas/charge_payment/handler.py
+    entry_point: handler.lambda_handler
+    runtime: python3.11
+    environment:
+      PAYMENT_GATEWAY_SECRET_NAME: retail/payment-gateway
+    downstream:
+      - retail-ship-order
+      - retail-release-inventory
+    description: Charge the customer's payment method; returns success true or false.
+
+  - name: retail-release-inventory
+    type: lambda
+    script: lambdas/release_inventory/handler.py
+    entry_point: handler.lambda_handler
+    runtime: python3.11
+    environment:
+      RESERVATIONS_TABLE: inventory-reservations-dev
+      OPS_TOPIC_ARN: arn:aws:sns:us-east-1:123456789012:retail-ops-alerts-dev
+    writes:
+      - dynamodb:inventory-reservations-dev
+    downstream:
+      - retail-ops-alerts-dev
+    description: Release reserved stock after a payment failure and alert operations.
+
+  - name: retail-ship-order
+    type: lambda
+    script: lambdas/ship_order/handler.py
+    entry_point: handler.lambda_handler
+    runtime: python3.11
+    environment:
+      ORDERS_TABLE: orders-dev
+    writes:
+      - dynamodb:orders-dev
+    description: Create the shipment for a paid order.
+
+  - name: retail-aggregate-report
+    type: lambda
+    script: lambdas/aggregate_report/handler.py
+    entry_point: handler.lambda_handler
+    runtime: python3.11
+    environment:
+      REPORT_BUCKET: retail-reports-dev
+      SUMMARY_TOPIC_ARN: arn:aws:sns:us-east-1:123456789012:retail-order-summary-dev
+    writes:
+      - s3://retail-reports-dev/summaries/
+    downstream:
+      - retail-order-summary-dev
+    description: Aggregate all order outcomes into one summary report and publish it.
+
+  - name: retail-dq-check
+    type: lambda
+    script: lambdas/dq_check/handler.py
+    entry_point: handler.lambda_handler
+    runtime: python3.11
+    environment:
+      MAX_ROW_COUNT_DRIFT: "0.20"
+      MAX_NULL_RATE: "0.02"
+    downstream:
+      - retail-load-curated
+      - retail-ops-alerts-dev
+    description: Data quality gate between the Glue jobs and the load step.
+
+  - name: retail-load-curated
+    type: lambda
+    script: lambdas/load_curated/handler.py
+    entry_point: handler.lambda_handler
+    runtime: python3.11
+    environment:
+      ORDERS_TABLE: orders-dev
+      CURATED_BUCKET: retail-orders-curated-dev
+    writes:
+      - dynamodb:orders-dev
+    description: Load curated order rows from S3 into DynamoDB.
+
+  - name: retail-legacy-notifier
+    type: lambda
+    status: deprecated
+    script: lambdas/legacy_notifier/handler.py
+    entry_point: handler.lambda_handler
+    runtime: python3.9
+    environment:
+      TOPIC_ARN: arn:aws:sns:us-east-1:123456789012:retail-ops-alerts-legacy
+    description: Deprecated notifier. Replaced by the retail-ops-alerts topic.

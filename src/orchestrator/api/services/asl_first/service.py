@@ -194,6 +194,77 @@ def _clean_list(value: Any, cap: int | None = None) -> list[str]:
     return out[:cap] if cap else out
 
 
+
+def _latest_user_text(history: list[dict]) -> str:
+    """Most recent user utterance — used as the retrieval query."""
+    for m in reversed(history or []):
+        if m.get("role") == "user" and (m.get("content") or "").strip():
+            return str(m["content"]).strip()
+    return ""
+
+
+def _fetch_repo_context(query: str) -> tuple[str, dict]:
+    """Retrieve repo context for the LLM. Never raises; empty on failure/disabled.
+
+    Returns (context_markdown, stats_dict).
+    """
+    stats: dict = {"enabled": False, "hits": 0, "error": None}
+    q = (query or "").strip()
+    if not q:
+        return "", stats
+    try:
+        from orchestrator.config import get_settings
+        from orchestrator.indexing.pipeline import default_repo_id
+        from orchestrator.retrieval import retrieve
+
+        settings = get_settings()
+        # Accept either orchestrator.config or API settings flag (same env var).
+        api_on = False
+        try:
+            from orchestrator.api.config.settings import get_api_settings
+
+            api_on = bool(get_api_settings().retrieval_enabled)
+        except Exception:  # noqa: BLE001
+            api_on = False
+        if not (settings.retrieval_enabled or api_on):
+            return "", stats
+        repo_id = default_repo_id(settings.repo_path)
+        result = retrieve(
+            q,
+            repo_id=repo_id,
+            enabled=True,
+        )
+        stats.update(
+            enabled=True,
+            hits=len(result.hits),
+            dense_count=result.dense_count,
+            structured_count=result.structured_count,
+            truncated=result.truncated,
+            repo_id=repo_id,
+        )
+        if result.context:
+            try:
+                log_event(
+                    "asl_first_retrieval",
+                    query=q[:200],
+                    hits=len(result.hits),
+                    dense_count=result.dense_count,
+                    structured_count=result.structured_count,
+                    truncated=result.truncated,
+                    repo_id=repo_id,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return result.context or "", stats
+    except Exception as exc:  # noqa: BLE001 - retrieval must never block drafting
+        stats["error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            log_event("asl_first_retrieval_error", error=stats["error"], query=q[:200])
+        except Exception:  # noqa: BLE001
+            pass
+        return "", stats
+
+
 # ---------------------------------------------------------------------------
 # LLM: draft / revise
 # ---------------------------------------------------------------------------
@@ -215,6 +286,11 @@ def generate_draft(
     max_attempts = max(1, get_api_settings().asl_llm_max_attempts)
 
     user = "CONVERSATION:\n" + _transcript(history)
+    # Dual retrieval (dense + structured) → re-rank → inject as REPOSITORY CONTEXT.
+    # Gated by RETRIEVAL_ENABLED; failures are swallowed so drafting still works.
+    repo_ctx, _retrieval_stats = _fetch_repo_context(_latest_user_text(history))
+    if repo_ctx:
+        user += "\n\nREPOSITORY CONTEXT:\n" + repo_ctx
     if current_asl:
         user += "\n\nCURRENT ASL:\n" + json.dumps(current_asl, separators=(",", ":"))
     if extra:
