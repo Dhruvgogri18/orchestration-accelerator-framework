@@ -518,7 +518,7 @@ def route_turn_node(state: dict) -> dict:
 
 
 def extract_node(state: dict) -> dict:
-    """New or continuing workflow design — full pipeline analysis turn."""
+    """New or continuing workflow design — enterprise RAG+tools plan graph."""
     from orchestrator.api.repositories import session_repository as session_store
     from orchestrator.api.services.pipeline_analysis import session_service as legacy
 

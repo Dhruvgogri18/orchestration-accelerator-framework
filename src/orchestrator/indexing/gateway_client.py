@@ -130,8 +130,13 @@ def chat_completion(
         extra={k: v for k, v in kwargs.items() if k != "messages"},
     )
     try:
-        response = client.chat.completions.create(**create_kwargs)
-        content = response.choices[0].message.content or ""
+        from orchestrator.observability.otel import trace_llm_call
+    except Exception:  # noqa: BLE001
+        from contextlib import nullcontext as trace_llm_call  # type: ignore
+    try:
+        with trace_llm_call(model=chat_model, stage="chat_completion"):
+            response = client.chat.completions.create(**create_kwargs)
+            content = response.choices[0].message.content or ""
         log_llm_response(t0=t0, content=content, model=chat_model)
         return content
     except Exception as exc:

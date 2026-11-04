@@ -39,12 +39,21 @@ def _db_path() -> str:
 
 @contextmanager
 def _connection():
+    """SQLite connection safe for concurrent multi-chat API workers.
+
+    WAL + busy_timeout lets parallel sessions (different session_ids)
+    commit without 'database is locked' under moderate concurrency.
+    check_same_thread=False allows FastAPI/thread-pool access patterns.
+    """
     path = _db_path()
     dirname = os.path.dirname(path)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30.0, check_same_thread=False)
     try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,

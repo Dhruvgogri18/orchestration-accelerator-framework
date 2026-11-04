@@ -135,22 +135,12 @@ def get_session_or_raise(session_id: str) -> Session:
 
 
 def run_extraction_turn(session_id: str, session: Session, message: str) -> MessageResponse:
-    """Shared by /message and /reject -- both are "add a user message,
-    run extraction again, return the result" with identical rendering
-    behavior. /reject is not a different code path, just a different
-    HTTP entry point into the same conversation loop.
+    """Enterprise Phase-1 extraction: RAG + tools + LangGraph plan synthesis.
 
-    Uses analyze_pipeline() -- the paper-aligned Stage 1 Pipeline
-    Analysis chain (pipeline_analysis/service.py: environment inference
-    -> component identification -> flow structure analysis -> parameter
-    extraction -> integration analysis). There is no user-facing pause
-    between its five sub-stages: the only human checkpoint in this
-    product is plan review below (plain-language approve/reject), not
-    an intermediate component list a non-developer user would have no
-    way to judge.
+    Uses conversation history so mid-chat revisions ("change step 2 to …")
+    continue the same session instead of restarting from a blank slate.
+    Parallel chats use different session_ids and do not share plan state.
     """
-    # PIPELINE_MODE=asl_first: draft ASL straight from the prompt, show a
-    # plan derived from it (see services/asl_first).
     from orchestrator.api.config.settings import get_api_settings
 
     if get_api_settings().pipeline_mode == "asl_first":
@@ -158,123 +148,134 @@ def run_extraction_turn(session_id: str, session: Session, message: str) -> Mess
 
         return _asl_first.run_extraction_turn(session_id, session, message)
 
-    session_store.append_message(session_id, "user", message)
-    start_request(session_id=session_id, user_message=message)
+    from orchestrator.api.services.session_lock import session_lock
 
-    # session.history was fetched before the append above -- the
-    # SQLite-backed store returns a snapshot, not a live reference, so
-    # it would NOT include the message we just wrote. Build the
-    # history actually sent to the LLM locally instead of trusting the
-    # pre-fetched snapshot.
-    current_history = [*session.history, {"role": "user", "content": message}]
+    with session_lock(session_id):
+        session_store.append_message(session_id, "user", message)
+        start_request(session_id=session_id, user_message=message)
 
-    try:
-        with llm_stage("pipeline_analysis"):
-            result = analyze_pipeline(current_history)
-    except ExtractionError as _ext_err:
-        end_request(status="error", error=str(_ext_err))
-        # Don't record a broken assistant turn into history -- next
-        # retry should see the same clean state, not a garbage reply
-        # baked into the conversation. Re-raise for the router to map
-        # to HTTP 502 (same as before).
-        raise
+        current_history = [*session.history, {"role": "user", "content": message}]
 
-    # Record the assistant's turn as JSON text, matching what the LLM
-    # actually said -- keeps history faithful to the real conversation
-    # for the next call's context.
-    end_request(status=result.status)
+        # When a plan already exists, inject it so the model revises rather
+        # than inventing a brand-new workflow from zero context.
+        if session.latest_plan is not None:
+            try:
+                plan_dump = (
+                    session.latest_plan.model_dump()
+                    if hasattr(session.latest_plan, "model_dump")
+                    else dict(session.latest_plan)
+                )
+                import json as _json
 
-    # Plan matching / canonicalize still run on every ready turn -- match_plan
-    # emits the plan_match telemetry event below and (for low/none tiers)
-    # writes the curation-queue entry inside match_plan itself via
-    # log_unmatched, and canonicalize_plan's output is compared against the
-    # raw plan purely to log when it *would* have rewritten the topology.
-    # NEITHER is allowed to reassign result.plan any more: what we render
-    # (summary_markdown, diagram_dot), return to the client, and persist as
-    # `latest_plan` for /approve + downstream ASL generation must always be
-    # exactly what flow_structure_analysis produced -- never a template
-    # projection (tier == "high"/"medium") and never a regex-heuristic
-    # topology rebuild (canonicalize_plan Layer B). See plan/canonicalize.py
-    # and plan/matching/matcher.py docstrings for what each would otherwise
-    # have done.
-    if result.status == "ready" and result.plan is not None:
-        match_result = match_plan(
-            result.plan,
-            session_id=session_id,
-            user_message=message,
-        )
-        log_event(
-            "plan_match",
-            tier=match_result.tier,
-            archetype=getattr(match_result, "archetype", None)
-            or getattr(match_result, "template_name", None),
-            score=match_result.score,
-            signature_hash=getattr(match_result, "signature_hash", None),
-        )
+                current_history = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "CURRENT WORKFLOW PLAN (revise in place when the user "
+                            "asks for changes; keep unchanged steps stable):\n"
+                            + _json.dumps(plan_dump, ensure_ascii=False)[:6000]
+                        ),
+                    },
+                    *current_history,
+                ]
+            except Exception:
+                pass
 
-        # Diagnostic only, from here down -- `diagnostic_plan` is never
-        # assigned back to result.plan. It exists so curation can see when
-        # the template/heuristic path disagrees with the raw LLM output,
-        # without that disagreement ever reaching the user.
-        if match_result.tier in ("high", "medium") and match_result.plan is not None:
-            diagnostic_plan = (
-                match_result.plan
-                if match_result.tier == "high"
-                else canonicalize_plan(match_result.plan)
+        try:
+            with llm_stage("enterprise_plan_graph"):
+                from orchestrator.runtime import nl_to_plan
+
+                pkg = nl_to_plan(
+                    message,
+                    history=current_history,
+                    session_id=session_id,
+                )
+        except Exception as exc:
+            end_request(status="error", error=str(exc))
+            raise ExtractionError(str(exc)) from exc
+
+        status = pkg.get("status") or "error"
+        end_request(status=status)
+
+        plan_obj = None
+        if status == "ready" and pkg.get("plan"):
+            try:
+                plan_obj = Plan.model_validate(pkg["plan"])
+            except Exception as exc:
+                end_request(status="error", error=str(exc))
+                raise ExtractionError(f"Invalid plan shape: {exc}") from exc
+
+            # Diagnostic match telemetry only — do not replace the plan.
+            try:
+                match_result = match_plan(
+                    plan_obj,
+                    session_id=session_id,
+                    user_message=message,
+                )
+                log_event(
+                    "plan_match",
+                    tier=match_result.tier,
+                    archetype=getattr(match_result, "archetype", None)
+                    or getattr(match_result, "template_name", None),
+                    score=match_result.score,
+                    signature_hash=getattr(match_result, "signature_hash", None),
+                )
+            except Exception:
+                pass
+
+        # Persist assistant turn + latest plan for /approve and multi-turn.
+        if status == "ready" and plan_obj is not None:
+            payload = {
+                "status": "ready",
+                "plan": plan_obj.model_dump(),
+                "summary_markdown": pkg.get("summary_markdown"),
+                "diagram_dot": pkg.get("diagram_dot"),
+                "placeholders": pkg.get("placeholders") or [],
+                "pipeline_analysis": pkg.get("analysis"),
+                "grounding": pkg.get("grounding"),
+                "stages": pkg.get("stages"),
+            }
+            session_store.append_message(
+                session_id, "assistant", _json_dumps(payload)
             )
-        else:
-            diagnostic_plan = canonicalize_plan(result.plan)
-
-        if diagnostic_plan.model_dump() != result.plan.model_dump():
-            log_event(
-                "plan_canonicalize_would_have_changed",
-                tier=match_result.tier,
-                archetype=getattr(match_result, "archetype", None)
-                or getattr(match_result, "template_name", None),
-                signature_hash=getattr(match_result, "signature_hash", None),
+            session_store.set_latest_plan(session_id, plan_obj)
+            return MessageResponse(
+                status="ready",
+                plan=plan_obj,
+                summary_markdown=pkg.get("summary_markdown")
+                or render_plan_summary(plan_obj),
+                diagram_dot=pkg.get("diagram_dot") or render_plan_diagram(plan_obj),
+                placeholders=pkg.get("placeholders") or find_placeholders(plan_obj),
+                pipeline_analysis=pkg.get("analysis"),
             )
 
-    session_store.append_message(session_id, "assistant", result.model_dump_json())
-
-    # Persist the latest ready plan -- /approve needs to know "is there
-    # actually something approvable right now". Cleared (None)
-    # whenever the conversation is still clarifying, so a stale plan
-    # can't be approved after the user changes something (including a
-    # /reject that reopens clarification).
-    session_store.set_latest_plan(
-        session_id, result.plan if result.status == "ready" else None
-    )
-
-    if result.status == "ready":
-        return MessageResponse(
-            status="ready",
-            plan=result.plan,
-            summary_markdown=render_plan_summary(result.plan),
-            diagram_dot=render_plan_diagram(result.plan),
-            placeholders=find_placeholders(result.plan),
-            # Full Stage 1 Pipeline Analysis artifact (environment,
-            # components, flow, parameters, integrations) -- see
-            # schemas/pipeline_analysis.py:PipelineAnalysis. `result.plan`
-            # above is derived from `analysis["flow"]` for everything
-            # downstream that only understands the Plan shape; this field
-            # is purely for client-side transparency/audit, matching the
-            # paper's "human-readable report and comprehensive JSON
-            # artifact" deliverable for Pipeline Analysis.
-            pipeline_analysis=result.analysis,
-        )
-    if result.status == "out_of_scope":
-        return MessageResponse(
-            status="out_of_scope",
-            message=result.message
-            or (
+        if status == "out_of_scope":
+            msg = pkg.get("message") or (
                 "This assistant is only designed to help you build AWS Step "
                 "Functions workflows. Please describe a workflow to orchestrate."
-            ),
-        )
-    return MessageResponse(
-        status="needs_clarification",
-        question=result.clarifying_question,
-    )
+            )
+            session_store.append_message(session_id, "assistant", msg)
+            session_store.set_latest_plan(session_id, None)
+            return MessageResponse(status="out_of_scope", message=msg)
+
+        if status == "needs_clarification":
+            q = pkg.get("clarifying_question") or pkg.get("message") or (
+                "Could you clarify the workflow steps you need?"
+            )
+            session_store.append_message(session_id, "assistant", q)
+            session_store.set_latest_plan(session_id, None)
+            return MessageResponse(status="needs_clarification", question=q)
+
+        err = pkg.get("error") or pkg.get("message") or "Plan synthesis failed."
+        session_store.set_latest_plan(session_id, None)
+        raise ExtractionError(err)
+
+
+def _json_dumps(obj) -> str:
+    import json
+
+    return json.dumps(obj, ensure_ascii=False)
+
 
 
 def send_message(session_id: str, message: str) -> MessageResponse:

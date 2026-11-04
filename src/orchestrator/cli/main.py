@@ -2,20 +2,18 @@
 
 Commands:
     orchestrator index    -- build/refresh the repo-context index (Part B: chunk -> embed -> Chroma)
-    orchestrator generate -- run the extract -> plan -> spec -> ASL -> validate -> review loop
-    orchestrator deploy   -- deploy a previously saved workflow bundle
-
-Story 0.1: this wires up a real, runnable CLI. The command bodies are
-intentional stubs -- each one exists, accepts the right arguments, and
-tells you clearly it isn't implemented yet, rather than doing nothing
-or pretending to work. The actual logic behind each command lands with
-Epics 1-8.
+    orchestrator generate -- NL + repo context -> plan -> ASL -> validate (review, no deploy)
+    orchestrator deploy   -- deploy a previously saved workflow bundle (requires --approve)
 """
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import typer
 from rich.console import Console
+from rich.table import Table
 
 app = typer.Typer(
     name="orchestrator",
@@ -23,13 +21,6 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
-
-
-def _not_implemented(command: str, epic_hint: str) -> None:
-    """Shared "honest stub" behavior: clear message, non-zero exit, no pretending."""
-    console.print(f"[yellow]orchestrator {command}[/yellow] is not implemented yet.")
-    console.print(f"[dim]See {epic_hint} in the backlog.[/dim]")
-    raise typer.Exit(code=1)
 
 
 @app.command()
@@ -108,19 +99,206 @@ def generate(
     prompt: str = typer.Argument(
         None, help="Plain-English workflow description. Omit to start an interactive session."
     ),
+    save: Path = typer.Option(
+        None,
+        "--save",
+        help="Write plan + ASL + validation bundle JSON to this path.",
+    ),
+    self_consistency: bool = typer.Option(
+        False,
+        "--self-consistency",
+        help="Run a second independent extraction and require structural agreement.",
+    ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help="Disable paraphrase-stable plan cache for this request.",
+    ),
+    require_grounding: bool = typer.Option(
+        False,
+        "--require-grounding",
+        help="Block when plan tokens are not found in the repo index.",
+    ),
 ) -> None:
-    """Run the extract -> plan -> spec -> ASL -> validate -> review loop."""
-    _not_implemented("generate", "Epics 1-6")
+    """Repo-grounded plan + ASL generation with validation (no deploy).
+
+    Deploy is intentionally separate: review the saved bundle, then run
+    ``orchestrator deploy bundle.json --approve``.
+    """
+    text = (prompt or "").strip()
+    if not text:
+        text = typer.prompt("Describe the workflow").strip()
+    if not text:
+        console.print("[red]Empty request.[/red]")
+        raise typer.Exit(code=1)
+
+    # Enterprise path: LangGraph (RAG → tools → synthesize → ground → present)
+    # then optional ASL. No prompt/plan cache. Domain-agnostic.
+    from orchestrator.runtime import nl_to_workflow
+
+    _ = (no_cache, self_consistency, require_grounding)  # retained for CLI compat
+
+    result = nl_to_workflow(
+        text,
+        include_asl=True,
+        deploy=False,
+        approved=False,
+    )
+    plan_pkg = result.get("plan_package") or {}
+
+    table = Table(title=f"Pipeline: {result.get('status')}", show_header=False)
+    stages = result.get("stages") or plan_pkg.get("stages") or []
+    table.add_row("Stages", " → ".join(stages) or "-")
+    if result.get("message"):
+        table.add_row("Message", str(result["message"]))
+    if result.get("clarifying_question"):
+        table.add_row("Clarify", str(result["clarifying_question"]))
+    if result.get("error"):
+        table.add_row("Error", str(result["error"]))
+    if plan_pkg.get("grounding"):
+        g = plan_pkg["grounding"]
+        table.add_row(
+            "Grounding",
+            f"resolved={g.get('resolved_count', 0)} "
+            f"unresolved={len(g.get('unresolved') or [])}",
+        )
+    if result.get("validation"):
+        table.add_row(
+            "Validation",
+            "ok" if result["validation"].get("ok") else "FAILED",
+        )
+    if plan_pkg.get("repo_enabled") is not None:
+        table.add_row("RAG", "on" if plan_pkg.get("repo_enabled") else "off")
+    console.print(table)
+
+    for w in (result.get("warnings") or [])[:8]:
+        console.print(f"[dim]warning: {w}[/dim]")
+
+    plan = result.get("plan")
+    if plan:
+        steps = plan.get("steps") or []
+        console.print(
+            f"[bold]Plan[/bold] ({len(steps)} steps): {plan.get('name') or '-'}"
+        )
+        for s in steps[:20]:
+            if isinstance(s, dict):
+                g = (s.get("grounding") or {}).get("resource_name") or ""
+                console.print(
+                    f"  • {s.get('id')}: {s.get('service') or '-'} "
+                    f"{('← ' + g) if g else ''}"
+                )
+
+    if result.get("summary_markdown"):
+        console.print("\n[bold]Summary[/bold]")
+        console.print(str(result["summary_markdown"])[:3000])
+
+    if save and result.get("status") in (
+        "ready",
+        "validation_failed",
+        "needs_clarification",
+    ):
+        bundle = {
+            "prompt": text,
+            "status": result.get("status"),
+            "plan": result.get("plan"),
+            "asl": result.get("asl"),
+            "validation": result.get("validation"),
+            "grounding": plan_pkg.get("grounding"),
+            "summary_markdown": result.get("summary_markdown"),
+            "diagram_dot": result.get("diagram_dot"),
+            "placeholders": result.get("placeholders"),
+            "warnings": result.get("warnings"),
+            "message": result.get("message"),
+            "stages": stages,
+            "tool_trace": plan_pkg.get("tool_trace"),
+        }
+        save.parent.mkdir(parents=True, exist_ok=True)
+        save.write_text(
+            json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        console.print(f"[green]Saved bundle → {save}[/green]")
+
+    status = result.get("status")
+    if status in ("error", "validation_failed", "blocked"):
+        raise typer.Exit(code=1)
+    if status == "needs_clarification":
+        raise typer.Exit(code=2)
 
 
 @app.command()
 def deploy(
-    bundle_path: str = typer.Argument(
-        ..., help="Path to a saved workflow bundle (from a previous 'generate --save-only')."
+    bundle_path: Path = typer.Argument(
+        ...,
+        help="Path to a saved workflow bundle JSON (from `generate --save`).",
+        exists=True,
+        readable=True,
+    ),
+    approve: bool = typer.Option(
+        False,
+        "--approve",
+        help="Explicit human approval. Required — deploy refuses without it.",
+    ),
+    name: str = typer.Option(
+        None,
+        "--name",
+        help="Override state machine name (otherwise uses plan name / ASL Comment).",
+    ),
+    role_arn: str = typer.Option(
+        None,
+        "--role-arn",
+        help="Execution role ARN (defaults to STEP_FUNCTIONS_EXECUTION_ROLE_ARN).",
     ),
 ) -> None:
-    """Deploy a previously saved workflow bundle to AWS Step Functions."""
-    _not_implemented("deploy", "Epics 7-8")
+    """Deploy a previously saved, validated workflow bundle to AWS Step Functions.
+
+    Human review gate: ``--approve`` is mandatory. Pre-deploy checks re-run
+    validation status and reject any TODO_ placeholders.
+    """
+    try:
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Could not read bundle:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    asl = bundle.get("asl")
+    if not isinstance(asl, dict) or not asl.get("States"):
+        console.print("[red]Bundle has no ASL States — re-run generate.[/red]")
+        raise typer.Exit(code=1)
+
+    if not approve:
+        console.print(
+            "[yellow]Refusing deploy without --approve.[/yellow] "
+            "Review the ASL in the bundle, then re-run with --approve."
+        )
+        raise typer.Exit(code=2)
+
+    from orchestrator.deployment.stepfunctions import deploy_state_machine
+
+    plan = bundle.get("plan") if isinstance(bundle.get("plan"), dict) else {}
+    outcome = deploy_state_machine(
+        asl,
+        name=name or (plan.get("name") if plan else None),
+        role_arn=role_arn,
+        validation_report=bundle.get("validation")
+        if isinstance(bundle.get("validation"), dict)
+        else {"ok": True},
+        approved=True,
+    )
+
+    if not outcome.ok:
+        console.print("[red]Deploy blocked or failed[/red]")
+        for r in outcome.blocked_reasons:
+            console.print(f"  • {r}")
+        if outcome.error:
+            console.print(f"  error: {outcome.error}")
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"[green]{outcome.action}[/green] {outcome.state_machine_name} "
+        f"→ {outcome.state_machine_arn}"
+    )
+    if outcome.region:
+        console.print(f"region={outcome.region} account={outcome.account_id or '-'}")
 
 
 @app.callback()

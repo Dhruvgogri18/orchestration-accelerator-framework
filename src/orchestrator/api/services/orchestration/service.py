@@ -196,18 +196,26 @@ def send_message(session_id: str, message: str) -> MessageResponse:
     Value-only edits after a plan/ASL exists take the cheap patch path
     (one small LLM + mechanical ASL regen). Structural changes re-run
     pipeline analysis. Brand-new designs use extract.
+
+    Per-session lock allows many chats in parallel while serialising
+    concurrent requests *within* the same session_id.
     """
     get_session_or_raise(session_id)
-    start_request(session_id=session_id, user_message=message)
-    try:
-        from .graph import run_message_turn
+    from orchestrator.api.services.session_lock import session_lock
 
-        state = run_message_turn(session_id, message)
-        end_request(status=state.get("extraction_status") or state.get("last_stage") or "ok")
-        return _message_response_from_turn_state(state)
-    except Exception as exc:  # noqa: BLE001
-        end_request(status="error", error=str(exc))
-        raise
+    with session_lock(session_id):
+        start_request(session_id=session_id, user_message=message)
+        try:
+            from .graph import run_message_turn
+
+            state = run_message_turn(session_id, message)
+            end_request(
+                status=state.get("extraction_status") or state.get("last_stage") or "ok"
+            )
+            return _message_response_from_turn_state(state)
+        except Exception as exc:  # noqa: BLE001
+            end_request(status="error", error=str(exc))
+            raise
 
 
 def reject_plan(session_id: str, feedback: str) -> MessageResponse:
