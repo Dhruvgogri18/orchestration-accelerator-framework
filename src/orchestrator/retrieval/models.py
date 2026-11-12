@@ -48,3 +48,4 @@ class RetrievalResult:
     structured_count: int = 0
     truncated: bool = False  # True if token budget cut the list short
     disabled: bool = False  # True when RETRIEVAL_ENABLED is false
+    environment: str | None = None  # environment the results were scoped to, if any

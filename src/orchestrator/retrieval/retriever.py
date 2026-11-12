@@ -18,7 +18,13 @@ from orchestrator.retrieval.format import format_context
 from orchestrator.retrieval.merge import merge_hits
 from orchestrator.retrieval.models import RetrievalResult, ScoredHit
 from orchestrator.retrieval.rerank import rerank
-from orchestrator.retrieval.structured import retrieve_structured
+from orchestrator.retrieval.structured import (
+    extract_environment,
+    extract_type_groups,
+    filter_by_environment,
+    hit_types,
+    retrieve_structured,
+)
 
 # Defaults (overridable via kwargs; settings used when callers omit them)
 DEFAULT_DENSE_TOP_K = 10
@@ -59,6 +65,56 @@ def _defaults_from_settings() -> dict[str, Any]:
     }
 
 
+def ensure_type_coverage(
+    ranked: list[ScoredHit],
+    pool: list[ScoredHit],
+    groups: list[tuple[str, ...]],
+    *,
+    top_n: int,
+) -> list[ScoredHit]:
+    """Make sure every resource type the user named is represented in ``ranked``.
+
+    Re-ranking is a single global top-N, so a kind of resource with one good chunk
+    (the one SNS topic) can lose to ten mediocre chunks of another kind. For each
+    type group in the query that has no hit in ``ranked``, bring in the best-scored
+    chunk of that type from ``pool`` (all merged, scored hits), evicting the lowest
+    scored hit that is not the only representative of some group. At most one chunk
+    per group, so noise stays bounded.
+    """
+    if not groups or not ranked:
+        return ranked
+    kept = list(ranked)
+    kept_ids = {h.id for h in kept}
+
+    def covers(h: ScoredHit, group: tuple[str, ...]) -> bool:
+        return bool(hit_types(h.metadata) & set(group))
+
+    for group in groups:
+        if any(covers(h, group) for h in kept):
+            continue
+        candidates = [h for h in pool if h.id not in kept_ids and covers(h, group)]
+        if not candidates:
+            continue
+        best = max(candidates, key=lambda h: (h.final_score, h.exact_score, h.dense_score))
+        if len(kept) >= top_n:
+            evictable = [
+                h
+                for h in kept
+                if not any(
+                    covers(h, g) and sum(1 for k in kept if covers(k, g)) == 1 for g in groups
+                )
+            ]
+            if not evictable:
+                continue
+            victim = min(evictable, key=lambda h: (h.final_score, h.dense_score, h.exact_score))
+            kept.remove(victim)
+            kept_ids.discard(victim.id)
+        kept.append(best)
+        kept_ids.add(best.id)
+    kept.sort(key=lambda h: (h.final_score, h.dense_score, h.exact_score), reverse=True)
+    return kept
+
+
 def _open_collection(
     *,
     collection: Any | None = None,
@@ -95,12 +151,17 @@ def retrieve(
     collection_name: str | None = None,
     embed: Callable[[list[str]], list[list[float]]] | None = None,
     enabled: bool | None = None,
+    environment: str | None = None,
 ) -> RetrievalResult:
     """Run dense + structured retrieval, merge, re-rank, and format context.
 
     When retrieval is disabled (RETRIEVAL_ENABLED=false and ``enabled`` is not
     forced True), returns an empty result with ``disabled=True`` and no
     embedding / Chroma calls.
+
+    ``environment`` scopes results to one environment (``"dev"``, ``"prod"``...).
+    When omitted it is inferred from the query if exactly one environment is named.
+    Chunks of other environments are dropped; environment-neutral chunks are kept.
     """
     query = (query or "").strip()
     is_enabled = _retrieval_enabled() if enabled is None else bool(enabled)
@@ -137,18 +198,24 @@ def retrieve(
     if repo_id and "repo_id" not in dense_filters:
         dense_filters["repo_id"] = repo_id
 
+    env = (environment or extract_environment(query) or "").lower() or None
+
+    # When an environment is requested, over-fetch so the other environment's
+    # near-duplicate chunks cannot use up the dense slots, then trim back.
     dense_hits = retrieve_dense(
         query,
         collection=coll,
-        n_results=dense_top_k,
+        n_results=dense_top_k * 2 if env else dense_top_k,
         filters=dense_filters or None,
         embed=embed,
     )
+    dense_hits = filter_by_environment(dense_hits, env)[:dense_top_k]
     structured_hits = retrieve_structured(
         query,
         collection=coll,
         repo_id=repo_id,
         max_hits=structured_max,
+        environment=env,
     )
 
     merged = merge_hits(dense_hits, structured_hits)
@@ -158,6 +225,9 @@ def retrieve(
         beta=beta,
         min_score=min_score,
         top_n=rerank_top_n,
+    )
+    ranked = ensure_type_coverage(
+        ranked, merged, extract_type_groups(query), top_n=rerank_top_n
     )
     context, included, truncated = format_context(
         ranked,
@@ -171,6 +241,7 @@ def retrieve(
         structured_count=len(structured_hits),
         truncated=truncated,
         disabled=False,
+        environment=env,
     )
 
 
