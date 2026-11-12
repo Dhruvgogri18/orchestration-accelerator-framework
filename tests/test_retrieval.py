@@ -43,8 +43,8 @@ def _chunk(
 
 
 @pytest.fixture
-def seeded_collection(chroma_collection, fake_embedder):
-    """Small index with three distinct resources."""
+def seeded_collection(pg_collection, fake_embedder):
+    """Small index with three distinct resources (pgvector)."""
     chunks = [
         _chunk(
             "demo::config/jobs.yaml::jobs:charge-payment",
@@ -80,8 +80,8 @@ def seeded_collection(chroma_collection, fake_embedder):
         ),
     ]
     vectors = fake_embedder([c.text for c in chunks])
-    vectorstore.upsert_chunks(chroma_collection, chunks, vectors)
-    return chroma_collection
+    vectorstore.upsert_chunks(pg_collection, chunks, vectors)
+    return pg_collection
 
 
 # ---------------------------------------------------------------------------

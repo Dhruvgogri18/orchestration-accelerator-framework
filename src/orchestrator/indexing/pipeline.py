@@ -83,11 +83,15 @@ def index_repository(
     """Build or refresh the index for one repository.
 
     Every argument defaults to the matching setting (REPO_PATH, INCLUDE_GLOBS,
-    CHROMA_PERSIST_DIR, ...), so tests and callers can pass explicit values and
-    never touch the real configuration or gateway.
+    VECTOR_COLLECTION_NAME, ...), so tests and callers can pass explicit values
+    and never touch the real configuration or gateway.
+
+    ``persist_dir`` is accepted for call-site compatibility with the old Chroma
+    API and is ignored — storage is Postgres + pgvector (see PGVECTOR_DSN).
     """
     t0 = time.perf_counter()
     settings = None
+    _ = persist_dir  # legacy Chroma path; ignored under pgvector
 
     def cfg():
         nonlocal settings
@@ -103,6 +107,11 @@ def index_repository(
     repo_id = repo_id or default_repo_id(repo_path)
     embedding_model = embedding_model or (None if dry_run else cfg().gateway_embedding_model)
     embedding_dim = embedding_dim or (None if dry_run else cfg().embedding_dimensions)
+    if collection_name is None:
+        try:
+            collection_name = cfg().vector_collection_name
+        except Exception:  # noqa: BLE001
+            collection_name = None
 
     sources, skipped = load_repository(repo_path, include_globs, exclude_globs)
     if not sources:
@@ -133,15 +142,12 @@ def index_repository(
     )
 
     client = None
+    collection = None
     try:
-        store_path = Path(persist_dir) if persist_dir else Path(cfg().chroma_persist_dir)
-    except Exception:  # noqa: BLE001 - a dry run must work without any setup
+        client = vectorstore.get_client()
+    except Exception:  # noqa: BLE001 - dry runs must work without a live DB
         if not dry_run:
             raise
-        store_path = None
-    if store_path is not None and not (dry_run and not store_path.exists()):
-        client = vectorstore.get_client(store_path)  # a dry run never creates the store
-    collection = None
     if client is not None:
         collection = vectorstore.get_collection(
             client=client,

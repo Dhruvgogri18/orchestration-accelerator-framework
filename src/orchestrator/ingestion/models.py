@@ -1,10 +1,10 @@
 """Data model shared by the loader, chunker and vector store.
 
-Chunk text and metadata are deliberately plain: Chroma metadata values may be
-str / int / float / bool or a non-empty, single-typed list of those (arrays
-need chromadb >= 1.5.0). Everything here is deterministic -- the same source
-text always yields byte-identical chunks, ids and hashes -- so re-indexing an
-unchanged repo costs zero embedding calls.
+Chunk text and metadata are deliberately plain JSON-friendly values:
+str / int / float / bool or a non-empty list of str (stored as JSONB in
+Postgres). Everything here is deterministic -- the same source text always
+yields byte-identical chunks, ids and hashes -- so re-indexing an unchanged
+repo costs zero embedding calls.
 """
 
 from __future__ import annotations

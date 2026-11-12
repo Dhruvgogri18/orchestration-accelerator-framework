@@ -1,7 +1,7 @@
 """CLI entrypoint.
 
 Commands:
-    orchestrator index    -- build/refresh the repo-context index (Part B: chunk -> embed -> Chroma)
+    orchestrator index    -- build/refresh the repo-context index (Part B: chunk -> embed -> pgvector)
     orchestrator generate -- NL + repo context -> plan -> ASL -> validate (review, no deploy)
     orchestrator deploy   -- deploy a previously saved workflow bundle (requires --approve)
 """
@@ -38,7 +38,7 @@ def index(
         False, "--dry-run", help="Show what would change; embeds and writes nothing."
     ),
 ) -> None:
-    """Build or refresh the repo-context index (chunk -> embed -> Chroma).
+    """Build or refresh the repo-context index (chunk -> embed -> pgvector).
 
     Incremental: unchanged chunks are skipped, so re-running costs nothing, and
     an interrupted run is finished by running it again.

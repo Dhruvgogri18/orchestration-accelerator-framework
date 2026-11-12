@@ -138,13 +138,21 @@ def test_use_fake_embeddings_patches_gateway_client(use_fake_embeddings):
     assert gateway_client.embed_texts is use_fake_embeddings
 
 
-def test_chroma_collection_fixture_ranks_with_fake_embedder(chroma_collection, fake_embedder):
+def test_pg_collection_ranks_with_fake_embedder(pg_collection, fake_embedder):
+    from orchestrator.indexing import vectorstore
+    from orchestrator.ingestion.models import Chunk
+
     docs = {
         "d1": "glue job transforms csv from s3",
         "d2": "sns topic publishes failure alert",
         "d3": "dynamodb table stores leave requests",
     }
-    chroma_collection.add(ids=list(docs), documents=list(docs.values()),
-                          embeddings=fake_embedder(list(docs.values())))
-    result = chroma_collection.query(query_embeddings=fake_embedder(["glue csv job"]), n_results=1)
-    assert result["ids"][0][0] == "d1"
+    chunks = [
+        Chunk(id=i, text=t, metadata={"repo_id": "demo", "path": "p"})
+        for i, t in docs.items()
+    ]
+    vectorstore.upsert_chunks(pg_collection, chunks, fake_embedder(list(docs.values())))
+    hits = vectorstore.query(
+        "glue csv job", collection=pg_collection, n_results=1, embed=fake_embedder
+    )
+    assert hits[0].id == "d1"

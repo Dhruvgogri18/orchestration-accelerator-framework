@@ -77,9 +77,19 @@ class Settings(BaseSettings):
         "**/.venv/**,**/node_modules/**,**/.git/**", alias="EXCLUDE_GLOBS"
     )
 
-    # --- Vector store ---
-    chroma_persist_dir: str = Field("./data/chroma", alias="CHROMA_PERSIST_DIR")
-    chroma_collection_name: str = Field("repo_context", alias="CHROMA_COLLECTION_NAME")
+    # --- Vector store (Postgres + pgvector) ---
+    # DSN for the pgvector database. Falls back to docker-compose defaults
+    # in vectorstore.py when unset. Accepts DATABASE_URL as an alias.
+    pgvector_dsn: str | None = Field(
+        None,
+        validation_alias=AliasChoices("PGVECTOR_DSN", "DATABASE_URL"),
+    )
+    # Logical collection name inside Postgres (one table, partitioned by name).
+    # CHROMA_COLLECTION_NAME is accepted as a legacy alias.
+    vector_collection_name: str = Field(
+        "repo_context",
+        validation_alias=AliasChoices("VECTOR_COLLECTION_NAME", "CHROMA_COLLECTION_NAME"),
+    )
 
     # --- Chunking ---
     chunk_size_tokens: int = Field(800, alias="CHUNK_SIZE_TOKENS")
@@ -91,6 +101,7 @@ class Settings(BaseSettings):
         "embedding_dimensions",
         "aws_profile",
         "step_functions_execution_role_arn",
+        "pgvector_dsn",
         mode="before",
     )
     @classmethod

@@ -1,4 +1,4 @@
-"""Strategy A — dense (semantic) retrieval over Chroma."""
+"""Strategy A — dense (semantic) retrieval over pgvector."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from orchestrator.retrieval.models import ScoredHit
 
 
 def _distance_to_score(distance: float | None) -> float:
-    """Chroma cosine space returns distance in ~[0, 2]; map to similarity [0, 1]."""
+    """pgvector cosine distance (`<=>`) is in ~[0, 2]; map to similarity [0, 1]."""
     if distance is None:
         return 0.0
     # cosine distance 0 => identical; 1 => orthogonal; 2 => opposite
@@ -27,9 +27,9 @@ def retrieve_dense(
     """Embed ``query`` and return the top-N cosine hits as ScoredHits."""
     if not (query or "").strip():
         return []
-    from orchestrator.indexing.vectorstore import query as chroma_query
+    from orchestrator.indexing.vectorstore import query as vector_query
 
-    hits = chroma_query(
+    hits = vector_query(
         query.strip(),
         collection=collection,
         n_results=max(1, n_results),

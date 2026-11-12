@@ -1,17 +1,20 @@
-"""Part B: end-to-end indexing of the sample repo (real Chroma, fake embedder)."""
+"""Part B: end-to-end indexing of the sample repo (pgvector, fake embedder)."""
 
 import shutil
+import uuid
 from pathlib import Path
 
 import pytest
 
 from orchestrator.indexing import pipeline, vectorstore
 from orchestrator.indexing.pipeline import default_repo_id, index_repository
+from tests.conftest import FAKE_EMBEDDING_DIM
 
-SAMPLE = Path(__file__).resolve().parents[1] / "sample_repos" / "retail-order-platform"
+SAMPLE = Path(__file__).resolve().parents[1] / "src" / "sample_repos" / "retail-order-platform"
+if not SAMPLE.exists():
+    SAMPLE = Path(__file__).resolve().parents[1] / "sample_repos" / "retail-order-platform"
 INCLUDE = ["**/*.py", "**/*.yaml", "**/*.yml", "**/*.json", "**/*.md"]
 EXCLUDE = ["**/.venv/**", "**/node_modules/**", "**/.git/**"]
-NAME = "test_repo_context"
 MODEL = "fake-embed"
 TOTAL = 55
 
@@ -47,12 +50,20 @@ def embedder(fake_embedder):
     return CountingEmbedder(fake_embedder)
 
 
-def run(repo, store, embedder, **kw):
+@pytest.fixture
+def collection_name(pg_client):
+    """Unique collection per test; dropped on teardown."""
+    name = f"idx_{uuid.uuid4().hex[:12]}"
+    yield name
+    vectorstore.drop_collection(pg_client, name)
+
+
+def run(repo, collection_name, embedder, **kw):
     kw.setdefault("embedding_model", MODEL)
+    kw.setdefault("embedding_dim", FAKE_EMBEDDING_DIM)
     return index_repository(
         repo,
-        persist_dir=store,
-        collection_name=NAME,
+        collection_name=collection_name,
         include_globs=INCLUDE,
         exclude_globs=EXCLUDE,
         embed=embedder,
@@ -63,9 +74,12 @@ def run(repo, store, embedder, **kw):
     )
 
 
-def open_collection(store):
+def open_collection(collection_name):
     return vectorstore.get_collection(
-        client=vectorstore.get_client(store), name=NAME, embedding_model=MODEL
+        client=vectorstore.get_client(),
+        name=collection_name,
+        embedding_model=MODEL,
+        embedding_dim=FAKE_EMBEDDING_DIM,
     )
 
 
@@ -77,49 +91,51 @@ def test_default_repo_id_is_a_slug(tmp_path):
     assert default_repo_id(tmp_path / "My Repo_v2!") == "my-repo_v2"
 
 
-def test_first_run_embeds_and_stores_everything_once(repo, tmp_chroma_dir, embedder):
-    r = run(repo, tmp_chroma_dir, embedder)
+def test_first_run_embeds_and_stores_everything_once(repo, collection_name, embedder):
+    r = run(repo, collection_name, embedder)
     assert (r.repo_id, r.files_loaded, r.chunks_total) == ("retail-order-platform", 23, TOTAL)
     assert (r.added, r.updated, r.unchanged, r.deleted, r.embedded) == (TOTAL, 0, 0, 0, TOTAL)
     assert embedder.total == TOTAL
-    assert open_collection(tmp_chroma_dir).count() == TOTAL
+    assert open_collection(collection_name).count() == TOTAL
     assert r.redacted_chunks == 0 and r.embedding_model == MODEL
 
 
-def test_rerunning_an_unchanged_repo_makes_no_embedding_calls(repo, tmp_chroma_dir, embedder):
-    run(repo, tmp_chroma_dir, embedder)
+def test_rerunning_an_unchanged_repo_makes_no_embedding_calls(repo, collection_name, embedder):
+    run(repo, collection_name, embedder)
     before = list(embedder.batches)
-    r = run(repo, tmp_chroma_dir, embedder)
+    r = run(repo, collection_name, embedder)
     assert (r.added, r.updated, r.deleted, r.embedded, r.unchanged) == (0, 0, 0, 0, TOTAL)
     assert embedder.batches == before
 
 
-def test_editing_one_file_reembeds_only_its_chunk(repo, tmp_chroma_dir, embedder):
-    run(repo, tmp_chroma_dir, embedder)
+def test_editing_one_file_reembeds_only_its_chunk(repo, collection_name, embedder):
+    run(repo, collection_name, embedder)
     handler = repo / "lambdas" / "ship_order" / "handler.py"
     handler.write_text(handler.read_text().replace("ACME-FREIGHT", "GLOBEX-FREIGHT"))
-    r = run(repo, tmp_chroma_dir, embedder)
+    r = run(repo, collection_name, embedder)
     assert (r.added, r.updated, r.unchanged, r.embedded) == (0, 1, TOTAL - 1, 1)
-    stored = open_collection(tmp_chroma_dir).get(ids=[cid("lambdas/ship_order/handler.py", "file")])
+    stored = open_collection(collection_name).get(
+        ids=[cid("lambdas/ship_order/handler.py", "file")]
+    )
     assert (
         "GLOBEX-FREIGHT" in stored["documents"][0] and "ACME-FREIGHT" not in stored["documents"][0]
     )
 
 
-def test_a_removed_file_removes_its_chunks(repo, tmp_chroma_dir, embedder):
-    run(repo, tmp_chroma_dir, embedder)
+def test_a_removed_file_removes_its_chunks(repo, collection_name, embedder):
+    run(repo, collection_name, embedder)
     (repo / "lambdas" / "dq_check" / "handler.py").unlink()
-    r = run(repo, tmp_chroma_dir, embedder)
+    r = run(repo, collection_name, embedder)
     assert (r.deleted, r.added, r.updated, r.embedded) == (1, 0, 0, 0)
-    col = open_collection(tmp_chroma_dir)
+    col = open_collection(collection_name)
     assert col.count() == TOTAL - 1
     assert col.get(ids=[cid("lambdas/dq_check/handler.py", "file")])["ids"] == []
 
 
-def test_a_metadata_key_that_disappears_does_not_linger(repo, tmp_chroma_dir, embedder):
-    run(repo, tmp_chroma_dir, embedder)
+def test_a_metadata_key_that_disappears_does_not_linger(repo, collection_name, embedder):
+    run(repo, collection_name, embedder)
     unit = cid("config/jobs.yaml", "jobs:retail-validate-order")
-    col = open_collection(tmp_chroma_dir)
+    col = open_collection(collection_name)
     assert col.get(ids=[unit])["metadatas"][0]["downstream"] == [
         "retail-fraud-check",
         "retail-reserve-inventory",
@@ -132,104 +148,110 @@ def test_a_metadata_key_that_disappears_does_not_linger(repo, tmp_chroma_dir, em
             "    description: Validate an order's required fields and total.",
         )
     )
-    r = run(repo, tmp_chroma_dir, embedder)
+    r = run(repo, collection_name, embedder)
     assert r.updated >= 1
     assert "downstream" not in col.get(ids=[unit])["metadatas"][0]
 
 
-def test_rebuild_reembeds_everything(repo, tmp_chroma_dir, embedder):
-    run(repo, tmp_chroma_dir, embedder)
-    r = run(repo, tmp_chroma_dir, embedder, rebuild=True)
+def test_rebuild_reembeds_everything(repo, collection_name, embedder):
+    run(repo, collection_name, embedder)
+    r = run(repo, collection_name, embedder, rebuild=True)
     assert (r.added, r.embedded, r.rebuilt) == (TOTAL, TOTAL, True)
-    assert open_collection(tmp_chroma_dir).count() == TOTAL
+    assert open_collection(collection_name).count() == TOTAL
 
 
-def test_dry_run_reports_but_writes_nothing(repo, tmp_path, embedder):
-    store = tmp_path / "never_created"
-    r = run(repo, store, embedder, dry_run=True)
+def test_dry_run_reports_but_writes_nothing(repo, collection_name, embedder):
+    r = run(repo, collection_name, embedder, dry_run=True)
     assert (r.dry_run, r.added, r.embedded, r.chunks_total) == (True, TOTAL, 0, TOTAL)
-    assert embedder.batches == [] and not store.exists()
+    assert embedder.batches == []
+    # dry_run with create=False leaves no collection row
+    assert (
+        vectorstore.get_collection(
+            client=vectorstore.get_client(), name=collection_name, create=False
+        )
+        is None
+    )
 
 
-def test_dry_run_against_an_existing_index_reports_the_diff(repo, tmp_chroma_dir, embedder):
-    run(repo, tmp_chroma_dir, embedder)
+def test_dry_run_against_an_existing_index_reports_the_diff(repo, collection_name, embedder):
+    run(repo, collection_name, embedder)
     (repo / "README.md").write_text(
         (repo / "README.md").read_text() + "\n## Extra\n\n" + "more " * 30
     )
     before = list(embedder.batches)
-    r = run(repo, tmp_chroma_dir, embedder, dry_run=True)
+    r = run(repo, collection_name, embedder, dry_run=True)
     assert r.added + r.updated >= 1 and r.embedded == 0 and embedder.batches == before
-    assert open_collection(tmp_chroma_dir).count() == TOTAL
+    assert open_collection(collection_name).count() == TOTAL
 
 
-def test_an_empty_result_never_wipes_the_existing_index(repo, tmp_path, tmp_chroma_dir, embedder):
-    run(repo, tmp_chroma_dir, embedder)
+def test_an_empty_result_never_wipes_the_existing_index(repo, tmp_path, collection_name, embedder):
+    run(repo, collection_name, embedder)
     empty = tmp_path / "retail-order-platform-empty"
     empty.mkdir()
     with pytest.raises(ValueError, match="No indexable files"):
-        run(empty, tmp_chroma_dir, embedder, repo_id="retail-order-platform")
-    assert open_collection(tmp_chroma_dir).count() == TOTAL
+        run(empty, collection_name, embedder, repo_id="retail-order-platform")
+    assert open_collection(collection_name).count() == TOTAL
 
 
-def test_two_repos_share_one_collection_without_interfering(repo, tmp_chroma_dir, embedder):
-    run(repo, tmp_chroma_dir, embedder, repo_id="repo-a")
-    run(repo, tmp_chroma_dir, embedder, repo_id="repo-b")
-    col = open_collection(tmp_chroma_dir)
+def test_two_repos_share_one_collection_without_interfering(repo, collection_name, embedder):
+    run(repo, collection_name, embedder, repo_id="repo-a")
+    run(repo, collection_name, embedder, repo_id="repo-b")
+    col = open_collection(collection_name)
     assert col.count() == 2 * TOTAL
     (repo / "lambdas" / "dq_check" / "handler.py").unlink()
-    run(repo, tmp_chroma_dir, embedder, repo_id="repo-a", rebuild=True)
+    run(repo, collection_name, embedder, repo_id="repo-a", rebuild=True)
     assert len(vectorstore.existing_hashes(col, "repo-a")) == TOTAL - 1
     assert len(vectorstore.existing_hashes(col, "repo-b")) == TOTAL  # untouched
 
 
 def test_an_interrupted_run_resumes_without_redoing_finished_work(
-    repo, tmp_chroma_dir, fake_embedder, monkeypatch
+    repo, collection_name, fake_embedder, monkeypatch
 ):
     monkeypatch.setattr(pipeline, "EMBED_GROUP_SIZE", 10)
     flaky = CountingEmbedder(fake_embedder, fail_on_call=3)
     with pytest.raises(RuntimeError, match="gateway down"):
-        run(repo, tmp_chroma_dir, flaky)
-    assert open_collection(tmp_chroma_dir).count() == 20  # two groups were saved
+        run(repo, collection_name, flaky)
+    assert open_collection(collection_name).count() == 20  # two groups were saved
 
     good = CountingEmbedder(fake_embedder)
-    r = run(repo, tmp_chroma_dir, good)
+    r = run(repo, collection_name, good)
     assert (r.unchanged, r.added, good.total) == (20, TOTAL - 20, TOTAL - 20)
-    assert open_collection(tmp_chroma_dir).count() == TOTAL
+    assert open_collection(collection_name).count() == TOTAL
 
 
 def test_stale_chunks_survive_a_run_that_fails_before_the_new_ones_are_saved(
-    repo, tmp_chroma_dir, embedder, fake_embedder
+    repo, collection_name, embedder, fake_embedder
 ):
-    run(repo, tmp_chroma_dir, embedder)
+    run(repo, collection_name, embedder)
     stale_id = cid("lambdas/dq_check/handler.py", "file")
     (repo / "lambdas" / "dq_check" / "handler.py").unlink()  # its chunk is now stale
     (repo / "README.md").write_text(
         (repo / "README.md").read_text() + "\n## More\n\n" + "text " * 40
     )
     with pytest.raises(RuntimeError, match="gateway down"):
-        run(repo, tmp_chroma_dir, CountingEmbedder(fake_embedder, fail_on_call=1))
+        run(repo, collection_name, CountingEmbedder(fake_embedder, fail_on_call=1))
     # Nothing was lost: the old chunk is only removed once the new ones are written.
-    assert open_collection(tmp_chroma_dir).get(ids=[stale_id])["ids"] == [stale_id]
-    r = run(repo, tmp_chroma_dir, embedder)  # a clean re-run finishes the job
-    assert r.deleted == 1 and open_collection(tmp_chroma_dir).get(ids=[stale_id])["ids"] == []
+    assert open_collection(collection_name).get(ids=[stale_id])["ids"] == [stale_id]
+    r = run(repo, collection_name, embedder)  # a clean re-run finishes the job
+    assert r.deleted == 1 and open_collection(collection_name).get(ids=[stale_id])["ids"] == []
 
 
-def test_a_different_embedding_model_cannot_be_mixed_in(repo, tmp_chroma_dir, embedder):
-    run(repo, tmp_chroma_dir, embedder)
+def test_a_different_embedding_model_cannot_be_mixed_in(repo, collection_name, embedder):
+    run(repo, collection_name, embedder)
     with pytest.raises(vectorstore.IndexMismatchError):
-        run(repo, tmp_chroma_dir, embedder, embedding_model="some-other-model")
+        run(repo, collection_name, embedder, embedding_model="some-other-model")
 
 
-def test_a_misbehaving_embedder_is_caught(repo, tmp_chroma_dir):
+def test_a_misbehaving_embedder_is_caught(repo, collection_name):
     with pytest.raises(RuntimeError, match="vectors for"):
-        run(repo, tmp_chroma_dir, lambda texts: [[1.0, 0.0]] * (len(texts) - 1))
+        run(repo, collection_name, lambda texts: [[1.0] * FAKE_EMBEDDING_DIM] * (len(texts) - 1))
 
 
 # ---------------------------------------------------------------- what the index lets you ask
 @pytest.fixture
-def indexed(repo, tmp_chroma_dir, embedder):
-    run(repo, tmp_chroma_dir, embedder)
-    return open_collection(tmp_chroma_dir)
+def indexed(repo, collection_name, embedder):
+    run(repo, collection_name, embedder)
+    return open_collection(collection_name)
 
 
 def test_exact_lookup_gives_the_prod_arn_of_a_function(indexed):
@@ -273,7 +295,7 @@ def test_deprecated_resources_can_be_filtered_out_or_found(indexed):
 def test_retrieval_smoke_with_the_fake_embedder(
     indexed, fake_embedder, question, filters, resource_name
 ):
-    """Wiring check only (the fake embedder is bag-of-words). Real relevance is Week 9."""
+    """Wiring check only (the fake embedder is bag-of-words)."""
     hits = vectorstore.query(
         question, collection=indexed, n_results=5, filters=filters, embed=fake_embedder
     )

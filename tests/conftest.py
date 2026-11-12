@@ -6,21 +6,22 @@ single test. This alone is NOT enough: orchestrator.api.config.settings
 once at import time (before any test's monkeypatch.setenv runs) --
 so without clearing that cache, every test after the first would
 silently keep reusing the FIRST cached settings object (and its db
-path), regardless of the env var this fixture sets. Confirmed this was
-happening: running the suite without the cache_clear() below wrote 7
-sessions / 14 messages directly into the real dev data/sessions.db.
+path), regardless of the env var this fixture sets.
 
-Part B fixtures (Story B-02):
+Part B fixtures:
   gateway_env          - dummy gateway settings; never touches the real .env/gateway
   fake_embedder        - deterministic, similarity-preserving embedder (1024-dim,
                          matching Titan Text Embeddings V2's default)
   use_fake_embeddings  - routes gateway_client.embed_texts() to the fake embedder
-  tmp_chroma_dir       - empty directory for a throwaway Chroma store
-  chroma_collection    - persistent Chroma collection (cosine) in tmp_chroma_dir
+  pg_client            - live pgvector client (skips if Postgres is unreachable)
+  pg_collection        - unique throwaway collection on pg_client (cleaned up)
 """
+from __future__ import annotations
+
 import hashlib
 import math
 import re
+import uuid
 
 import pytest
 
@@ -28,6 +29,7 @@ from orchestrator.api.config.settings import get_api_settings
 from orchestrator.config import get_settings
 
 FAKE_EMBEDDING_DIM = 1024  # Titan Text Embeddings V2 default output size
+DEFAULT_PG_DSN = "postgresql://oaf:oaf_secret@127.0.0.1:5433/oaf_vectors"
 
 
 def clean_settings_env(monkeypatch):
@@ -38,7 +40,7 @@ def clean_settings_env(monkeypatch):
     would silently pick up real values."""
     from orchestrator.config import Settings
 
-    names = {"RETRIEVAL_ENABLED", "ORCHESTRATOR_DB_PATH"}
+    names = {"RETRIEVAL_ENABLED", "ORCHESTRATOR_DB_PATH", "CHROMA_PERSIST_DIR", "CHROMA_COLLECTION_NAME"}
     for field in Settings.model_fields.values():
         if field.alias:
             names.add(field.alias)
@@ -118,17 +120,73 @@ def use_fake_embeddings(monkeypatch, fake_embedder):
     return fake_embedder
 
 
+def _can_connect_pg(dsn: str) -> bool:
+    try:
+        import psycopg
+
+        with psycopg.connect(dsn, connect_timeout=2) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+@pytest.fixture
+def pg_dsn(monkeypatch):
+    """Resolve PGVECTOR_DSN and skip the test if Postgres is unreachable.
+
+    Start the DB with: docker compose -f docker/docker-compose.yaml up -d
+    """
+    dsn = (
+        __import__("os").environ.get("PGVECTOR_DSN")
+        or __import__("os").environ.get("DATABASE_URL")
+        or DEFAULT_PG_DSN
+    )
+    if not _can_connect_pg(dsn):
+        pytest.skip(
+            f"Postgres/pgvector not reachable at {dsn}. "
+            "Run: docker compose -f docker/docker-compose.yaml up -d"
+        )
+    monkeypatch.setenv("PGVECTOR_DSN", dsn)
+    _clear_caches()
+    return dsn
+
+
+@pytest.fixture
+def pg_client(pg_dsn):
+    from orchestrator.indexing import vectorstore as vs
+
+    return vs.get_client()
+
+
+@pytest.fixture
+def pg_collection(pg_client):
+    """Unique throwaway collection; dropped after the test."""
+    from orchestrator.indexing import vectorstore as vs
+
+    name = f"test_{uuid.uuid4().hex[:12]}"
+    col = vs.get_collection(
+        client=pg_client,
+        name=name,
+        embedding_model="fake-embed",
+        embedding_dim=FAKE_EMBEDDING_DIM,
+        create=True,
+    )
+    yield col
+    vs.drop_collection(pg_client, name)
+
+
+# Backwards-compatible aliases used by older test names
 @pytest.fixture
 def tmp_chroma_dir(tmp_path):
-    path = tmp_path / "chroma"
+    """Legacy name: no filesystem store under pgvector; returns a temp path only."""
+    path = tmp_path / "pgvector_placeholder"
     path.mkdir()
     return path
 
 
 @pytest.fixture
-def chroma_collection(tmp_chroma_dir):
-    chromadb = pytest.importorskip("chromadb")
-    client = chromadb.PersistentClient(path=str(tmp_chroma_dir))
-    return client.get_or_create_collection(
-        name="test_repo_context", metadata={"hnsw:space": "cosine"}
-    )
+def chroma_collection(pg_collection):
+    """Legacy name: returns a pgvector collection."""
+    return pg_collection
